@@ -32,60 +32,6 @@ pip install -e .
 pip install jorg[gpu]
 ```
 
-### Basic Usage
-
-```python
-import jorg
-import numpy as np
-
-# Define wavelength grid
-wavelengths = np.linspace(5000, 6000, 1000)  # Angstroms
-
-# Synthesize a solar spectrum
-wl, flux, continuum = jorg.synth(
-    wavelengths, 
-    temperature=5778,    # K
-    log_g=4.44,         # log(cm/s²)
-    metallicity=0.0,    # [M/H]
-)
-
-# Plot the result
-import matplotlib.pyplot as plt
-plt.plot(wl, flux)
-plt.xlabel('Wavelength (Å)')
-plt.ylabel('Normalized Flux')
-plt.show()
-```
-
-### Batch Processing
-
-```python
-# Synthesize spectra for multiple stars
-temperatures = np.array([5500, 5778, 6000])
-log_gs = np.array([4.0, 4.44, 4.5])
-metallicities = np.array([-0.5, 0.0, 0.3])
-
-wavelengths, fluxes = jorg.batch_synth(
-    wavelengths, temperatures, log_gs, metallicities
-)
-# fluxes.shape = (3, 1000)  # 3 stars, 1000 wavelengths
-```
-
-### Gradient-Based Fitting
-
-```python
-import jax
-
-# Define a loss function
-def loss_fn(params, observed_flux):
-    T, log_g, mh = params
-    _, synthetic_flux, _ = jorg.synth(wavelengths, T, log_g, mh)
-    return jax.numpy.sum((synthetic_flux - observed_flux)**2)
-
-# Get gradients
-grad_fn = jax.grad(loss_fn)
-gradients = grad_fn([5778, 4.44, 0.0], observed_flux)
-```
 
 ## 📁 Project Structure
 
