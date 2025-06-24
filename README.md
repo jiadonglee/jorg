@@ -1,6 +1,6 @@
 # Jorg
 
-A JAX-based Python package for stellar spectral synthesis calculations.
+A JAX-based Python package for stellar spectral synthesis calculations, translated from [Korg.jl](https://github.com/ajwheeler/Korg.jl).
 
 ## Current Implementation
 
@@ -103,6 +103,10 @@ src/jorg/
 - JAX (for JIT compilation and automatic differentiation)
 - NumPy
 - SciPy (for special functions)
+
+## Acknowledgments
+
+Jorg is translated from the excellent [Korg.jl](https://github.com/ajwheeler/Korg.jl) package. We acknowledge the Korg.jl development team for their foundational work in stellar spectral synthesis.
 
 ## License
 
