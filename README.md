@@ -1,207 +1,109 @@
-# Jorg: JAX-based Stellar Spectral Synthesis
+# Jorg
 
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-![JAX](https://img.shields.io/badge/JAX-0.4%2B-orange)
-![License](https://img.shields.io/badge/license-MIT-green)
+A JAX-based Python package for stellar spectral synthesis calculations.
 
-Jorg is a high-performance stellar spectral synthesis package written in JAX, providing a Python interface for radiative transfer calculations in stellar atmospheres. It is designed as a modern, GPU-accelerated alternative to traditional stellar synthesis codes, with particular emphasis on gradient-based optimization and parameter fitting.
+## Current Implementation
 
-## ⚡ Key Features
+Jorg provides JAX-optimized implementations of key stellar physics components:
 
-- **🚀 High Performance**: JAX-based implementation with JIT compilation and GPU acceleration
-- **🔄 Automatic Differentiation**: Built-in gradients for all synthesis functions enable efficient parameter fitting
-- **⚡ Vectorization**: Native support for batch processing multiple stellar parameters
-- **🎯 Korg.jl Compatible**: Designed to match the accuracy and interface of the Julia-based Korg.jl package
-- **🐍 Pure Python**: Easy installation and integration with the Python scientific ecosystem
-- **🧪 Well Tested**: Comprehensive test suite with validation against reference implementations
+### Statistical Mechanics
+- Equation of state calculations
+- Gas and electron pressure computations
+- Basic atmospheric structure utilities
 
-## 🚀 Quick Start
+### Continuum Absorption
+- H I bound-free absorption
+- H⁻ bound-free and free-free absorption (McLaughlin 2017 data)
+- Thomson scattering
+- Rayleigh scattering
+- He⁻ free-free absorption
 
-### Installation
+### Line Absorption  
+- Voigt line profiles with exact Hjerting function
+- Doppler, Stark, and van der Waals broadening
+- Basic linelist management
+- Species identification and parsing
+
+### Utilities
+- Physical constants (CGS units)
+- Wavelength conversions (air/vacuum)
+- Mathematical utility functions
+
+## Installation
 
 ```bash
-# Install from PyPI (when available)
-pip install jorg
-
-# Or install from source
-git clone https://github.com/jorg-project/jorg.git
+git clone https://github.com/jiadonglee/jorg.git
 cd jorg
 pip install -e .
-
-# For GPU support
-pip install jorg[gpu]
 ```
 
-### Basic Usage
+## Basic Usage
 
 ```python
-import jorg
-import numpy as np
+import jax.numpy as jnp
+from jorg.statmech.eos import gas_pressure, electron_pressure
+from jorg.lines.profiles import line_profile
+from jorg.continuum.hydrogen import h_minus_bf_absorption
 
-# Define wavelength grid
-wavelengths = np.linspace(5000, 6000, 1000)  # Angstroms
+# Example: Calculate gas pressure
+T = 5777.0  # K
+n_total = 1e16  # cm^-3
+P_gas = gas_pressure(n_total, T)
 
-# Synthesize a solar spectrum
-wl, flux, continuum = jorg.synth(
-    wavelengths, 
-    temperature=5778,    # K
-    log_g=4.44,         # log(cm/s²)
-    metallicity=0.0,    # [M/H]
-)
-
-# Plot the result
-import matplotlib.pyplot as plt
-plt.plot(wl, flux)
-plt.xlabel('Wavelength (Å)')
-plt.ylabel('Normalized Flux')
-plt.show()
+# Example: Calculate Voigt profile
+wavelength = jnp.linspace(5889.0, 5897.0, 100)
+profile = line_profile(wavelength, 5889.95, 0.1, 0.05)
 ```
 
-### Batch Processing
+## Current Limitations
 
-```python
-# Synthesize spectra for multiple stars
-temperatures = np.array([5500, 5778, 6000])
-log_gs = np.array([4.0, 4.44, 4.5])
-metallicities = np.array([-0.5, 0.0, 0.3])
+- Main synthesis functions (`synth`, `synthesize`) are placeholder implementations
+- No radiative transfer solver
+- No MARCS atmosphere interpolation
+- Limited linelist format support
+- No fitting or analysis tools
 
-wavelengths, fluxes = jorg.batch_synth(
-    wavelengths, temperatures, log_gs, metallicities
-)
-# fluxes.shape = (3, 1000)  # 3 stars, 1000 wavelengths
-```
+## Development Status
 
-### Gradient-Based Fitting
+**Implemented and Validated:**
+- Statistical mechanics (EOS calculations validated against Korg.jl with <1e-7 relative error)
+- Line profiles (exact mathematical agreement with Korg.jl)
+- Basic continuum absorption components
 
-```python
-import jax
+**In Development:**
+- Complete synthesis pipeline
+- Radiative transfer equation solver
+- Atmosphere model interpolation
 
-# Define a loss function
-def loss_fn(params, observed_flux):
-    T, log_g, mh = params
-    _, synthetic_flux, _ = jorg.synth(wavelengths, T, log_g, mh)
-    return jax.numpy.sum((synthetic_flux - observed_flux)**2)
+**Not Implemented:**
+- Full spectral synthesis
+- Parameter fitting
+- Multi-format linelist readers
+- Analysis tools
 
-# Get gradients
-grad_fn = jax.grad(loss_fn)
-gradients = grad_fn([5778, 4.44, 0.0], observed_flux)
-```
-
-## 📁 Project Structure
-
-```
-jorg/
-├── src/jorg/              # Main package source code
-│   ├── synthesis.py       # High-level synthesis interface
-│   ├── constants.py       # Physical constants
-│   ├── continuum/         # Continuum absorption calculations
-│   ├── lines/             # Line absorption calculations  
-│   └── utils/             # Utility functions and math
-├── tests/                 # Test suite
-│   ├── unit/              # Unit tests by module
-│   ├── integration/       # Integration and accuracy tests
-│   └── fixtures/          # Test data and references
-├── examples/              # Usage examples and tutorials
-├── benchmarks/            # Performance benchmarking
-├── docs/                  # Documentation source
-└── scripts/               # Development and utility scripts
-```
-
-## 🔧 Development
-
-### Setup Development Environment
+## Testing
 
 ```bash
-# Clone the repository
-git clone https://github.com/jorg-project/jorg.git
-cd jorg
-
-# Install in development mode with all dependencies
-pip install -e ".[dev,docs,gpu]"
-
-# Install pre-commit hooks
-pre-commit install
+pytest tests/
 ```
 
-### Running Tests
+## Package Structure
 
-```bash
-# Run all tests
-pytest
-
-# Run only unit tests
-pytest tests/unit/
-
-# Run with coverage
-pytest --cov=jorg tests/
-
-# Run slow tests (benchmarks, integration)
-pytest -m "slow"
+```
+src/jorg/
+├── constants.py           # Physical constants
+├── statmech/             # Statistical mechanics and EOS
+├── continuum/            # Continuum absorption
+├── lines/                # Line absorption and profiles
+└── utils/                # Utility functions
 ```
 
-### Building Documentation
+## Dependencies
 
-```bash
-# Build HTML documentation
-cd docs/
-make html
+- JAX (for JIT compilation and automatic differentiation)
+- NumPy
+- SciPy (for special functions)
 
-# Serve locally
-python -m http.server -d _build/html
-```
+## License
 
-## 📊 Performance
-
-Jorg is designed for high performance:
-
-- **🚀 ~100× faster** than traditional synthesis codes for parameter studies
-- **💾 GPU memory efficient** batch processing
-- **⚡ JIT compilation** eliminates Python overhead
-- **📈 Scales linearly** with number of parameters/wavelengths
-
-See the [benchmarks/](benchmarks/) directory for detailed performance comparisons.
-
-## 🎯 Accuracy
-
-Jorg has been validated against established synthesis codes:
-
-- **✅ Korg.jl compatibility**: <0.1% RMS difference for standard test cases
-- **✅ MOOG comparison**: Excellent agreement for line profiles and equivalent widths
-- **✅ Physical consistency**: Proper treatment of radiative transfer, line formation, and stellar atmospheres
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-- 🐛 **Bug reports**: Use the [issue tracker](https://github.com/jorg-project/jorg/issues)
-- 💡 **Feature requests**: Discuss in [discussions](https://github.com/jorg-project/jorg/discussions)
-- 🔧 **Pull requests**: Follow our coding standards and include tests
-
-## 📄 License
-
-Jorg is released under the MIT License. See [LICENSE](LICENSE) for details.
-
-## 🙏 Acknowledgments
-
-- **Korg.jl**: Jorg is heavily inspired by the excellent [Korg.jl](https://github.com/ajwheeler/Korg.jl) package
-- **JAX**: Built on the powerful [JAX](https://jax.readthedocs.io/) framework
-- **Stellar Community**: Thanks to the stellar spectroscopy community for their foundational work
-
-## 📚 Citation
-
-If you use Jorg in your research, please cite:
-
-```bibtex
-@software{jorg,
-  title={Jorg: JAX-based Stellar Spectral Synthesis},
-  author={Jorg Development Team},
-  year={2024},
-  url={https://github.com/jorg-project/jorg}
-}
-```
-
----
-
-**Status**: 🚧 Alpha - Active development, APIs may change
-
-For questions, support, or collaboration opportunities, please reach out through our [GitHub discussions](https://github.com/jorg-project/jorg/discussions).
+MIT License
