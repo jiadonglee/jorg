@@ -1,0 +1,19 @@
+{
+  "log_temperature": 8.661812881026181,
+  "exact_values": {
+    "U_He_I": 1.0,
+    "U_H_II": 1.0,
+    "U_H_I": 2.000000011513405
+  },
+  "approximations": {
+    "U_He_I": 1.0,
+    "U_H_II": 1.0,
+    "U_H_I": 2.0
+  },
+  "errors_percent": {
+    "H_I": 5.756702414927962e-7,
+    "H_II": 0.0,
+    "He_I": 0.0
+  },
+  "temperature": 5778.0
+}
