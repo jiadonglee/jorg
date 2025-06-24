@@ -1,0 +1,24 @@
+{
+  "korg_components": {
+    "h_minus_ff": 1.5871951412873404e-8,
+    "h_minus_bf": 3.367908716278641e-7,
+    "thomson": 6.65246e-10,
+    "total_sum": 3.533491883304543e-7,
+    "total_function": 3.534079579610381e-7,
+    "h_i_bf": 2.111928971683862e-11
+  },
+  "partition_functions": {
+    "U_H_I": 2.000000011513405
+  },
+  "component_fractions": {
+    "h_minus_ff": 4.491860159030523,
+    "h_minus_bf": 95.31389423000323,
+    "thomson": 0.18826872169799863,
+    "h_i_bf": 0.005976889268269023
+  },
+  "wavelength": 5500.0,
+  "h_i_density": 1.0e16,
+  "frequency": 5.450771963636364e14,
+  "electron_density": 1.0e15,
+  "temperature": 5778.0
+}
