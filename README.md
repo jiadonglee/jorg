@@ -1,22 +1,109 @@
-# Jorg: JAX-based Stellar Spectral Synthesis
+# Jorg
 
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-![JAX](https://img.shields.io/badge/JAX-0.4%2B-orange)
-![License](https://img.shields.io/badge/license-MIT-green)
+A JAX-based Python package for stellar spectral synthesis calculations.
 
-Jorg is a high-performance stellar spectral synthesis package written in JAX based on [Korg.jl](https://github.com/ajwheeler/Korg.jl), providing a Python interface for radiative transfer calculations in stellar atmospheres. It is designed as a modern, GPU-accelerated alternative to traditional stellar synthesis codes, with particular emphasis on gradient-based optimization and parameter fitting.
+## Current Implementation
 
-## ⚡ Key Features
+Jorg provides JAX-optimized implementations of key stellar physics components:
 
-- **🚀 High Performance**: JAX-based implementation with JIT compilation and GPU acceleration
-- **🔄 Automatic Differentiation**: Built-in gradients for all synthesis functions enable efficient parameter fitting
-- **⚡ Vectorization**: Native support for batch processing multiple stellar parameters
-- **🎯 Korg.jl Compatible**: Designed to match the accuracy and interface of the Julia-based Korg.jl package
-- **🐍 Pure Python**: Easy installation and integration with the Python scientific ecosystem
-- **🧪 Well Tested**: Comprehensive test suite with validation against reference implementations
+### Statistical Mechanics
+- Equation of state calculations
+- Gas and electron pressure computations
+- Basic atmospheric structure utilities
 
----
+### Continuum Absorption
+- H I bound-free absorption
+- H⁻ bound-free and free-free absorption (McLaughlin 2017 data)
+- Thomson scattering
+- Rayleigh scattering
+- He⁻ free-free absorption
 
-**Status**: 🚧 Alpha - Active development, APIs may change
+### Line Absorption  
+- Voigt line profiles with exact Hjerting function
+- Doppler, Stark, and van der Waals broadening
+- Basic linelist management
+- Species identification and parsing
 
-For questions, support, or collaboration opportunities, please reach out through our [GitHub discussions](https://github.com/jorg-project/jorg/discussions).
+### Utilities
+- Physical constants (CGS units)
+- Wavelength conversions (air/vacuum)
+- Mathematical utility functions
+
+## Installation
+
+```bash
+git clone https://github.com/jiadonglee/jorg.git
+cd jorg
+pip install -e .
+```
+
+## Basic Usage
+
+```python
+import jax.numpy as jnp
+from jorg.statmech.eos import gas_pressure, electron_pressure
+from jorg.lines.profiles import line_profile
+from jorg.continuum.hydrogen import h_minus_bf_absorption
+
+# Example: Calculate gas pressure
+T = 5777.0  # K
+n_total = 1e16  # cm^-3
+P_gas = gas_pressure(n_total, T)
+
+# Example: Calculate Voigt profile
+wavelength = jnp.linspace(5889.0, 5897.0, 100)
+profile = line_profile(wavelength, 5889.95, 0.1, 0.05)
+```
+
+## Current Limitations
+
+- Main synthesis functions (`synth`, `synthesize`) are placeholder implementations
+- No radiative transfer solver
+- No MARCS atmosphere interpolation
+- Limited linelist format support
+- No fitting or analysis tools
+
+## Development Status
+
+**Implemented and Validated:**
+- Statistical mechanics (EOS calculations validated against Korg.jl with <1e-7 relative error)
+- Line profiles (exact mathematical agreement with Korg.jl)
+- Basic continuum absorption components
+
+**In Development:**
+- Complete synthesis pipeline
+- Radiative transfer equation solver
+- Atmosphere model interpolation
+
+**Not Implemented:**
+- Full spectral synthesis
+- Parameter fitting
+- Multi-format linelist readers
+- Analysis tools
+
+## Testing
+
+```bash
+pytest tests/
+```
+
+## Package Structure
+
+```
+src/jorg/
+├── constants.py           # Physical constants
+├── statmech/             # Statistical mechanics and EOS
+├── continuum/            # Continuum absorption
+├── lines/                # Line absorption and profiles
+└── utils/                # Utility functions
+```
+
+## Dependencies
+
+- JAX (for JIT compilation and automatic differentiation)
+- NumPy
+- SciPy (for special functions)
+
+## License
+
+MIT License

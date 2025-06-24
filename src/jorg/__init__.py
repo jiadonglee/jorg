@@ -14,11 +14,12 @@ from . import continuum
 from . import lines
 from . import utils
 from . import constants
+# from . import statmech  # Temporarily disabled due to circular import
 
 # Export main API
 __all__ = [
     # High-level synthesis functions
     "synth", "synthesize", "SynthesisResult", "batch_synth",
     # Modules
-    "continuum", "lines", "utils", "constants"
+    "continuum", "lines", "utils", "constants"  # , "statmech"
 ]
