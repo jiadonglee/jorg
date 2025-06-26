@@ -296,3 +296,33 @@ def lorentzian_profile(lambda_0: float,
     normalization = amplitude / (pi * gamma)
     
     return normalization / (1.0 + (delta_lambda / gamma)**2)
+
+
+@jax.jit
+def voigt_profile(wavelengths: jnp.ndarray, 
+                 line_center: float, 
+                 doppler_width: float, 
+                 lorentz_width: float) -> jnp.ndarray:
+    """
+    Compute a normalized Voigt profile.
+    
+    This function provides the interface expected by core.py.
+    
+    Parameters
+    ----------
+    wavelengths : jnp.ndarray
+        Array of wavelengths at which to evaluate the profile
+    line_center : float
+        Central wavelength of the line
+    doppler_width : float
+        Doppler broadening width (standard deviation)
+    lorentz_width : float
+        Lorentz broadening parameter (HWHM)
+        
+    Returns
+    -------
+    jnp.ndarray
+        Normalized profile values
+    """
+    # Use amplitude=1 for normalized profile
+    return line_profile(line_center, doppler_width, lorentz_width, 1.0, wavelengths)

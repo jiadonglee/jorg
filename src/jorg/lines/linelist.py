@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Union, Tuple
 from pathlib import Path
 import warnings
 
-from .core import LineData, create_line_data
+from .datatypes import LineData
 from .species import parse_species, Species
 from ..utils.wavelength_utils import air_to_vacuum, vacuum_to_air, detect_wavelength_unit
 

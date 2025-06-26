@@ -9,13 +9,14 @@ import jax
 import jax.numpy as jnp
 from typing import List, Dict, Optional, Union
 
-from .linelist import LineList, LineData
+from .datatypes import LineData
+from .linelist import LineList
 from .opacity import calculate_line_opacity_korg_method
 from .profiles import voigt_profile
-from .broadening import thermal_doppler_width, van_der_waals_broadening
+from .broadening import doppler_width, scaled_vdw
 from ..constants import SPEED_OF_LIGHT, BOLTZMANN_K, ATOMIC_MASS_UNIT
 
-__all__ = ['total_line_absorption', 'line_absorption', 'calculate_line_profile']
+__all__ = ['total_line_absorption', 'line_absorption', 'calculate_line_profile', 'LineData', 'create_line_data']
 
 
 def total_line_absorption(wavelengths: jnp.ndarray,
@@ -162,7 +163,7 @@ def line_absorption(wavelength_grid: jnp.ndarray,
         Line absorption coefficient in cm^-1
     """
     # Calculate Doppler width
-    doppler_width = thermal_doppler_width(
+    doppler_width_value = doppler_width(
         line_center, temperature, atomic_mass, microturbulence
     )
     
@@ -170,7 +171,7 @@ def line_absorption(wavelength_grid: jnp.ndarray,
     lorentz_width = gamma_rad + gamma_vdw + gamma_stark
     
     # Calculate line profile
-    profile = voigt_profile(wavelength_grid, line_center, doppler_width, lorentz_width)
+    profile = voigt_profile(wavelength_grid, line_center, doppler_width_value, lorentz_width)
     
     # Calculate line strength (simplified)
     line_strength = oscillator_strength * number_density
@@ -245,3 +246,50 @@ def _get_atomic_mass(element_id: int) -> float:
     }
     
     return masses.get(element_id, 55.845)  # Default to Fe mass
+
+
+def create_line_data(wavelength: float,
+                    species: int,
+                    log_gf: float,
+                    E_lower: float,
+                    gamma_rad: float = 0.0,
+                    gamma_stark: float = 0.0,
+                    vdw_param1: float = 0.0,
+                    vdw_param2: float = 0.0) -> LineData:
+    """
+    Create a LineData object.
+    
+    Parameters
+    ----------
+    wavelength : float
+        Line wavelength
+    species : int
+        Species ID
+    log_gf : float
+        Logarithm of oscillator strength
+    E_lower : float
+        Lower energy level
+    gamma_rad : float, optional
+        Radiative broadening parameter
+    gamma_stark : float, optional
+        Stark broadening parameter
+    vdw_param1 : float, optional
+        Van der Waals parameter 1
+    vdw_param2 : float, optional
+        Van der Waals parameter 2
+        
+    Returns
+    -------
+    LineData
+        Line data object
+    """
+    return LineData(
+        wavelength=wavelength,
+        species=species,
+        log_gf=log_gf,
+        E_lower=E_lower,
+        gamma_rad=gamma_rad,
+        gamma_stark=gamma_stark,
+        vdw_param1=vdw_param1,
+        vdw_param2=vdw_param2
+    )
