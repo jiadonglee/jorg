@@ -7,13 +7,18 @@ line profiles, broadening mechanisms, and opacity calculations.
 
 import jax
 import jax.numpy as jnp
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 
 from .datatypes import LineData
 from .linelist import LineList
 from .opacity import calculate_line_opacity_korg_method
 from .profiles import voigt_profile
 from .broadening import doppler_width, scaled_vdw
+from .molecular_cross_sections import (
+    MolecularCrossSection, 
+    interpolate_molecular_cross_sections,
+    is_molecular_species
+)
 from ..constants import SPEED_OF_LIGHT, BOLTZMANN_K, ATOMIC_MASS_UNIT
 
 __all__ = ['total_line_absorption', 'line_absorption', 'calculate_line_profile', 'LineData', 'create_line_data']
@@ -86,7 +91,7 @@ def total_line_absorption(wavelengths: jnp.ndarray,
         if hasattr(line, 'wavelength'):
             line_wl = line.wavelength
             species_id = line.species
-            excitation_potential = line.excitation_potential
+            excitation_potential = line.E_lower
             log_gf = line.log_gf
         else:
             # Handle dictionary format
@@ -293,3 +298,265 @@ def create_line_data(wavelength: float,
         vdw_param1=vdw_param1,
         vdw_param2=vdw_param2
     )
+
+
+# Molecular Line Synthesis Integration
+
+def total_line_absorption_with_molecules(
+    wavelengths: jnp.ndarray,
+    linelist: Union[List[LineData], LineList],
+    temperature: Union[float, jnp.ndarray],
+    log_g: float,
+    abundances: Optional[Dict[int, float]] = None,
+    electron_density: Union[float, jnp.ndarray] = 1e14,
+    hydrogen_density: Union[float, jnp.ndarray] = 1e16,
+    microturbulence: float = 0.0,
+    molecular_cross_sections: Optional[Dict[int, MolecularCrossSection]] = None,
+    molecular_number_densities: Optional[Dict[int, jnp.ndarray]] = None,
+    **kwargs
+) -> jnp.ndarray:
+    """
+    Calculate total line absorption including molecular lines.
+    
+    This function extends the basic line absorption to include precomputed
+    molecular cross-sections, matching Korg.jl's approach for efficient
+    molecular line synthesis.
+    
+    Parameters
+    ----------
+    wavelengths : jnp.ndarray
+        Wavelength grid in cm
+    linelist : List[LineData] or LineList
+        Atomic and molecular line data
+    temperature : float or jnp.ndarray
+        Temperature in K (can be array for atmospheric layers)
+    log_g : float
+        Surface gravity (log cm/s²)
+    abundances : Dict[int, float], optional
+        Element abundances
+    electron_density : float or jnp.ndarray
+        Electron density in cm^-3
+    hydrogen_density : float or jnp.ndarray
+        Hydrogen density in cm^-3
+    microturbulence : float
+        Microturbulent velocity in cm/s
+    molecular_cross_sections : Dict[int, MolecularCrossSection], optional
+        Precomputed molecular cross-sections by species ID
+    molecular_number_densities : Dict[int, jnp.ndarray], optional
+        Molecular number densities by species ID in cm^-3
+        
+    Returns
+    -------
+    jnp.ndarray
+        Total line absorption coefficient in cm^-1
+    """
+    
+    # Separate atomic and molecular lines
+    atomic_lines = []
+    molecular_lines = []
+    
+    for line in linelist:
+        if is_molecular_species_id(line.species):
+            molecular_lines.append(line)
+        else:
+            atomic_lines.append(line)
+    
+    # Calculate atomic line absorption (existing method)
+    alpha_atomic = jnp.zeros_like(wavelengths)
+    if atomic_lines:
+        alpha_atomic = total_line_absorption(
+            wavelengths, atomic_lines, temperature, log_g,
+            abundances, electron_density, hydrogen_density,
+            microturbulence, **kwargs
+        )
+    
+    # Calculate molecular line absorption
+    alpha_molecular = jnp.zeros_like(wavelengths)
+    
+    # Method 1: Use precomputed cross-sections (fast)
+    if molecular_cross_sections is not None and molecular_number_densities is not None:
+        alpha_molecular += interpolate_molecular_cross_sections(
+            wavelengths, 
+            temperature if jnp.isscalar(temperature) else temperature,
+            microturbulence,
+            molecular_cross_sections,
+            molecular_number_densities
+        )
+    
+    # Method 2: Line-by-line calculation for molecules (slower, more accurate)
+    elif molecular_lines:
+        alpha_molecular = calculate_molecular_line_absorption(
+            wavelengths, molecular_lines, temperature, 
+            microturbulence, molecular_number_densities or {}
+        )
+    
+    return alpha_atomic + alpha_molecular
+
+
+def calculate_molecular_line_absorption(
+    wavelengths: jnp.ndarray,
+    molecular_lines: List[LineData],
+    temperature: Union[float, jnp.ndarray],
+    microturbulence: float,
+    number_densities: Dict[int, jnp.ndarray]
+) -> jnp.ndarray:
+    """
+    Calculate molecular line absorption using line-by-line method.
+    
+    Molecular lines have simplified broadening (no Stark or vdW broadening).
+    
+    Parameters
+    ----------
+    wavelengths : jnp.ndarray
+        Wavelength grid in cm
+    molecular_lines : List[LineData]
+        List of molecular lines
+    temperature : float or jnp.ndarray
+        Temperature in K
+    microturbulence : float
+        Microturbulent velocity in cm/s
+    number_densities : Dict[int, jnp.ndarray]
+        Number densities by species ID
+        
+    Returns
+    -------
+    jnp.ndarray
+        Molecular line absorption coefficient in cm^-1
+    """
+    from .profiles import line_profile
+    from .broadening import doppler_width
+    
+    alpha_total = jnp.zeros_like(wavelengths)
+    
+    for line in molecular_lines:
+        if line.species not in number_densities:
+            continue
+            
+        # Get molecular mass
+        molecular_mass = get_molecular_mass_from_id(line.species)
+        
+        # Calculate Doppler width
+        sigma = doppler_width(line.wavelength, temperature, molecular_mass, microturbulence)
+        
+        # Only radiative damping for molecules
+        gamma_total = line.gamma_rad
+        
+        # Convert to wavelength units (simplified)
+        gamma_wl = gamma_total * line.wavelength**2 / (2.998e10 * 4 * jnp.pi)
+        
+        # Calculate line strength
+        line_strength = 10**line.log_gf * number_densities[line.species]
+        
+        # Calculate line profile
+        alpha_line = line_profile(
+            line.wavelength, sigma, gamma_wl, line_strength, wavelengths
+        )
+        
+        alpha_total += alpha_line
+    
+    return alpha_total
+
+
+def separate_atomic_molecular_lines(linelist: Union[List[LineData], LineList]) -> Tuple[List[LineData], List[LineData]]:
+    """
+    Separate linelist into atomic and molecular components.
+    
+    Parameters
+    ----------
+    linelist : List[LineData] or LineList
+        Input linelist
+        
+    Returns
+    -------
+    Tuple[List[LineData], List[LineData]]
+        (atomic_lines, molecular_lines)
+    """
+    atomic_lines = []
+    molecular_lines = []
+    
+    for line in linelist:
+        if is_molecular_species_id(line.species):
+            molecular_lines.append(line)
+        else:
+            atomic_lines.append(line)
+    
+    return atomic_lines, molecular_lines
+
+
+def is_molecular_species_id(species_id: int) -> bool:
+    """
+    Check if species ID corresponds to a molecule.
+    
+    Uses convention: molecules have species_id > 100 and specific patterns.
+    
+    Parameters
+    ----------
+    species_id : int
+        Species identifier
+        
+    Returns
+    -------
+    bool
+        True if molecular species
+    """
+    # Common molecular species ID ranges
+    molecular_ranges = [
+        (101, 199),   # Diatomic molecules (H2, etc.)
+        (601, 699),   # Carbon compounds (CH, CN, CO, etc.)
+        (701, 799),   # Nitrogen compounds (NH, etc.)
+        (801, 899),   # Oxygen compounds (OH, H2O, etc.)
+        (1201, 1299), # Mg compounds (MgH, etc.)
+        (1301, 1399), # Al compounds (AlH, etc.)
+        (1401, 1499), # Si compounds (SiH, SiO, etc.)
+        (2001, 2099), # Ca compounds (CaH, etc.)
+        (2201, 2299), # Ti compounds (TiO, etc.)
+        (2301, 2399), # V compounds (VO, etc.)
+        (2601, 2699), # Fe compounds (FeH, etc.)
+    ]
+    
+    # Check if species_id falls in molecular ranges
+    for min_id, max_id in molecular_ranges:
+        if min_id <= species_id <= max_id:
+            return True
+    
+    return False
+
+
+def get_molecular_mass_from_id(species_id: int) -> float:
+    """
+    Get molecular mass in grams from species ID.
+    
+    Parameters
+    ----------
+    species_id : int
+        Molecular species ID
+        
+    Returns
+    -------
+    float
+        Molecular mass in grams
+    """
+    # Simplified molecular mass lookup
+    molecular_masses = {
+        101: 2.016,    # H2
+        108: 17.007,   # OH  
+        601: 13.019,   # CH
+        606: 24.022,   # C2
+        607: 26.018,   # CN
+        608: 28.014,   # CO
+        701: 15.015,   # NH
+        707: 28.014,   # N2
+        801: 18.015,   # H2O
+        808: 31.998,   # O2
+        1201: 25.313,  # MgH
+        1301: 27.990,  # AlH
+        1401: 29.093,  # SiH
+        1408: 44.085,  # SiO
+        2001: 41.086,  # CaH
+        2208: 63.866,  # TiO
+        2308: 66.941,  # VO
+        2601: 56.853,  # FeH
+    }
+    
+    mass_amu = molecular_masses.get(species_id, 18.015)  # Default to H2O
+    return mass_amu * 1.66054e-24  # Convert amu to grams

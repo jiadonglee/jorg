@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Union, Tuple
 from pathlib import Path
 import warnings
 
-from .datatypes import LineData
+from .datatypes import LineData, create_line_data
 from .species import parse_species, Species
 from ..utils.wavelength_utils import air_to_vacuum, vacuum_to_air, detect_wavelength_unit
 
@@ -98,7 +98,7 @@ def read_linelist(filename: Union[str, Path],
     filename : str or Path
         Path to linelist file
     format : str
-        Format type: "auto", "vald", "kurucz", "moog", "turbospectrum", "korg"
+        Format type: "auto", "vald", "kurucz", "moog", "turbospectrum", "korg", "exomol"
     wavelength_unit : str  
         "auto", "angstrom", "cm", "air", "vacuum"
     isotopic_abundances : dict, optional
@@ -131,6 +131,8 @@ def read_linelist(filename: Union[str, Path],
         return parse_turbospectrum_linelist(filename, wavelength_unit)
     elif format == "korg":
         return load_korg_linelist(filename)
+    elif format == "exomol":
+        raise ValueError("ExoMol format requires separate states and transitions files. Use load_exomol_linelist() directly.")
     else:
         raise ValueError(f"Unsupported format: {format}")
 
@@ -313,10 +315,10 @@ def parse_vald_line(line_text: str,
             vdw_param1 = approximate_vdw_gamma(species_id)
         
         return create_line_data(
-            wavelength_cm=wavelength_cm,
+            wavelength=wavelength_cm,
+            species=species_id,
             log_gf=log_gf,
-            E_lower_eV=E_lower,
-            species_id=species_id,
+            E_lower=E_lower,
             gamma_rad=gamma_rad,
             gamma_stark=gamma_stark,
             vdw_param1=vdw_param1,
@@ -396,10 +398,10 @@ def parse_kurucz_line(line_text: str, wavelength_unit: str) -> Optional[LineData
         vdw_param1 = approximate_vdw_gamma(species_id)
         
         return create_line_data(
-            wavelength_cm=wavelength_cm,
+            wavelength=wavelength_cm,
+            species=species_id,
             log_gf=log_gf,
-            E_lower_eV=E_lower_eV,
-            species_id=species_id,
+            E_lower=E_lower_eV,
             gamma_rad=gamma_rad,
             gamma_stark=gamma_stark,
             vdw_param1=vdw_param1,
@@ -486,10 +488,10 @@ def parse_moog_line(line_text: str, wavelength_unit: str) -> Optional[LineData]:
         gamma_stark = approximate_stark_gamma(species_id)
         
         return create_line_data(
-            wavelength_cm=wavelength_cm,
+            wavelength=wavelength_cm,
+            species=species_id,
             log_gf=log_gf,
-            E_lower_eV=E_lower_eV,
-            species_id=species_id,
+            E_lower=E_lower_eV,
             gamma_rad=gamma_rad,
             gamma_stark=gamma_stark,
             vdw_param1=vdw_param1,
@@ -585,10 +587,10 @@ def parse_turbospectrum_line(line_text: str, wavelength_unit: str) -> Optional[L
             vdw_param1 = approximate_vdw_gamma(species_id)
         
         return create_line_data(
-            wavelength_cm=wavelength_cm,
+            wavelength=wavelength_cm,
+            species=species_id,
             log_gf=log_gf,
-            E_lower_eV=E_lower_eV,
-            species_id=species_id,
+            E_lower=E_lower_eV,
             gamma_rad=gamma_rad,
             gamma_stark=gamma_stark,
             vdw_param1=vdw_param1,
@@ -618,10 +620,10 @@ def load_korg_linelist(filename: Path) -> LineList:
         # Create LineData objects
         for i in range(len(wavelengths)):
             line = create_line_data(
-                wavelength_cm=wavelengths[i],
+                wavelength=wavelengths[i],
+                species=species_ids[i],
                 log_gf=log_gfs[i],
-                E_lower_eV=E_lowers[i],
-                species_id=species_ids[i],
+                E_lower=E_lowers[i],
                 gamma_rad=gamma_rads[i],
                 gamma_stark=gamma_starks[i],
                 vdw_param1=vdw_param1s[i],
@@ -730,3 +732,260 @@ def approximate_vdw_gamma(species_id: int) -> float:
         return 1e-7
     else:  # Heavy elements
         return 2e-7
+
+
+# ExoMol Linelist Parsing
+
+def load_exomol_linelist(
+    species_name: str,
+    states_file: Union[str, Path],
+    transitions_file: Union[str, Path], 
+    lower_level: int,
+    upper_level: int,
+    line_strength_cutoff: float = -15.0,
+    temperature_line_strength: float = 3500.0,
+    wavelength_range: Optional[Tuple[float, float]] = None
+) -> LineList:
+    """
+    Load ExoMol format molecular linelist.
+    
+    This function matches Korg.jl's load_ExoMol_linelist functionality,
+    parsing ExoMol states and transitions files to create a molecular linelist.
+    
+    Parameters
+    ----------
+    species_name : str
+        Molecular species name (e.g., 'H2O', 'TiO', 'CaH')
+    states_file : Path
+        Path to ExoMol .states file
+    transitions_file : Path
+        Path to ExoMol .trans file
+    lower_level : int
+        Lower electronic state
+    upper_level : int
+        Upper electronic state  
+    line_strength_cutoff : float
+        Minimum log10(line strength) threshold (default: -15)
+    temperature_line_strength : float
+        Temperature for line strength evaluation in K (default: 3500K)
+    wavelength_range : Tuple[float, float], optional
+        Wavelength range in Angstroms (min, max)
+        
+    Returns
+    -------
+    LineList
+        Parsed molecular linelist
+    """
+    print(f"🔬 Loading ExoMol linelist for {species_name}")
+    print(f"   States file: {states_file}")
+    print(f"   Transitions file: {transitions_file}")
+    
+    # Load states data
+    print("   Loading states...")
+    states_df = pd.read_csv(
+        states_file,
+        delim_whitespace=True,
+        names=['state_id', 'energy', 'degeneracy', 'J', 'uncertainty', 'lifetime'],
+        comment='#'
+    )
+    
+    # Load transitions data
+    print("   Loading transitions...")
+    transitions_df = pd.read_csv(
+        transitions_file,
+        delim_whitespace=True,
+        names=['upper_state', 'lower_state', 'A_ul', 'uncertainty'],
+        comment='#'
+    )
+    
+    print(f"   Found {len(states_df)} states and {len(transitions_df)} transitions")
+    
+    # Join transitions with state information
+    print("   Joining transitions with states...")
+    
+    # Get upper state info
+    transitions_df = transitions_df.merge(
+        states_df[['state_id', 'energy', 'degeneracy', 'J']],
+        left_on='upper_state',
+        right_on='state_id',
+        suffixes=('', '_upper')
+    )
+    
+    # Get lower state info
+    transitions_df = transitions_df.merge(
+        states_df[['state_id', 'energy', 'degeneracy', 'J']],
+        left_on='lower_state', 
+        right_on='state_id',
+        suffixes=('_upper', '_lower')
+    )
+    
+    # Calculate transition properties
+    print("   Calculating transition properties...")
+    
+    # Energy difference in cm^-1
+    wavenumber = transitions_df['energy_upper'] - transitions_df['energy_lower']
+    
+    # Convert to wavelengths in Angstroms (vacuum)
+    wavelength_angstrom = 1e8 / wavenumber  # cm^-1 to Å
+    wavelength_cm = wavelength_angstrom * 1e-8
+    
+    # Calculate oscillator strength using Gray equation 11.12
+    # f_ul = (8π²me c) / (3h e² λ) * (g_l/g_u) * A_ul
+    import scipy.constants as const
+    
+    # Physical constants in CGS
+    me_cgs = const.m_e * 1000  # g
+    c_cgs = const.c * 100      # cm/s
+    h_cgs = const.h * 1e7      # erg⋅s
+    e_cgs = const.e * const.c * 10  # statcoulomb
+    
+    # Calculate f-values
+    wavelength_m = wavelength_angstrom * 1e-10
+    prefactor = (8 * np.pi**2 * me_cgs * c_cgs) / (3 * h_cgs * e_cgs**2)
+    
+    g_ratio = transitions_df['degeneracy_lower'] / transitions_df['degeneracy_upper']
+    f_values = prefactor * wavelength_m * g_ratio * transitions_df['A_ul']
+    log_gf = np.log10(transitions_df['degeneracy_lower'] * f_values)
+    
+    # Apply isotopic correction for most abundant isotopologue
+    # (This is simplified - would need actual isotopic data)
+    isotopic_correction = 1.0
+    log_gf += np.log10(isotopic_correction)
+    
+    # Calculate lower level energy in eV
+    hc_eV_cm = const.h * const.c / const.eV * 100  # eV⋅cm
+    E_lower_eV = transitions_df['energy_lower'] * hc_eV_cm
+    
+    # Approximate line strength for filtering
+    # S(T) ≈ gf * exp(-E_lower/kT) for simple estimate
+    kT_eV = const.k * temperature_line_strength / const.eV
+    line_strength_approx = f_values * np.exp(-E_lower_eV / kT_eV)
+    log_line_strength = np.log10(line_strength_approx)
+    
+    # Apply filters
+    print("   Applying filters...")
+    mask = np.ones(len(transitions_df), dtype=bool)
+    
+    # Line strength cutoff
+    mask &= (log_line_strength >= line_strength_cutoff)
+    
+    # Wavelength range filter
+    if wavelength_range is not None:
+        wl_min, wl_max = wavelength_range
+        mask &= (wavelength_angstrom >= wl_min) & (wavelength_angstrom <= wl_max)
+    
+    # Positive wavelengths only
+    mask &= (wavelength_angstrom > 0)
+    
+    print(f"   After filtering: {mask.sum()} lines remain")
+    
+    # Create molecular species identifier
+    molecular_species = get_molecular_species_id(species_name)
+    
+    # Create LineData objects
+    lines = []
+    for i in np.where(mask)[0]:
+        # Molecular lines have only radiative damping
+        gamma_rad = approximate_radiative_gamma(log_gf[i], wavelength_cm[i])
+        
+        line = create_line_data(
+            wavelength=wavelength_cm[i],
+            species=molecular_species,
+            log_gf=log_gf[i],
+            E_lower=E_lower_eV[i],
+            gamma_rad=gamma_rad,
+            gamma_stark=0.0,  # No Stark broadening for molecules
+            vdw_param1=0.0,  # No vdW broadening for molecules
+            vdw_param2=0.0
+        )
+        lines.append(line)
+    
+    # Create metadata
+    metadata = {
+        'format': 'exomol',
+        'species': species_name,
+        'states_file': str(states_file),
+        'transitions_file': str(transitions_file), 
+        'lower_level': lower_level,
+        'upper_level': upper_level,
+        'line_strength_cutoff': line_strength_cutoff,
+        'temperature_line_strength': temperature_line_strength,
+        'n_lines_total': len(transitions_df),
+        'n_lines_filtered': len(lines)
+    }
+    
+    print(f"   ✅ Successfully loaded {len(lines)} ExoMol lines")
+    
+    return LineList(lines, metadata).sort_by_wavelength()
+
+
+def get_molecular_species_id(species_name: str) -> int:
+    """
+    Get species ID for common molecules.
+    
+    This maps molecular names to species codes compatible with Korg.jl.
+    
+    Parameters
+    ----------
+    species_name : str
+        Molecular species name
+        
+    Returns
+    -------
+    int
+        Species identifier
+    """
+    molecular_ids = {
+        'H2O': 801,    # Water
+        'TiO': 2208,   # Titanium oxide
+        'VO': 2308,    # Vanadium oxide
+        'OH': 108,     # Hydroxyl
+        'CH': 601,     # Methylidyne  
+        'CN': 607,     # Cyanogen
+        'CO': 608,     # Carbon monoxide
+        'NH': 701,     # Imidogen
+        'SiO': 1408,   # Silicon monoxide
+        'CaH': 2001,   # Calcium hydride
+        'FeH': 2601,   # Iron hydride
+        'MgH': 1201,   # Magnesium hydride
+        'AlH': 1301,   # Aluminum hydride
+        'SiH': 1401,   # Silicon hydride
+        'H2': 101,     # Molecular hydrogen
+        'C2': 606,     # Diatomic carbon
+        'N2': 707,     # Molecular nitrogen
+        'O2': 808,     # Molecular oxygen
+    }
+    
+    return molecular_ids.get(species_name, 99999)  # Default unknown molecule
+
+
+def approximate_line_strength(
+    log_gf: float,
+    E_lower_eV: float, 
+    temperature: float = 3500.0
+) -> float:
+    """
+    Approximate line strength at given temperature.
+    
+    Uses simplified Boltzmann factor for quick filtering.
+    
+    Parameters
+    ----------
+    log_gf : float
+        Log oscillator strength
+    E_lower_eV : float
+        Lower level energy in eV
+    temperature : float
+        Temperature in K
+        
+    Returns
+    -------
+    float
+        Log line strength estimate
+    """
+    import scipy.constants as const
+    
+    kT_eV = const.k * temperature / const.eV
+    boltzmann_factor = -E_lower_eV / kT_eV
+    
+    return log_gf + boltzmann_factor / np.log(10)

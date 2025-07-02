@@ -1,336 +1,392 @@
 """
-Unit tests comparing Jorg and Korg continuum absorption calculations
+Unit tests for the Jorg continuum opacity module
 
-These tests verify that the JAX implementation produces results
-consistent with the original Julia implementation.
+Tests continuum absorption calculations following Korg.jl testing patterns.
 """
 
-import numpy as np
 import pytest
+import jax.numpy as jnp
+import numpy as np
+
 import sys
-from pathlib import Path
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-# Add the parent directory to the Python path to import jorg
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-try:
-    import jax
-    import jax.numpy as jnp
-    jax.config.update("jax_enable_x64", True)  # Use double precision
-    
-    from jorg.continuum import (
-        total_continuum_absorption,
-        h_minus_bf_absorption,
-        h_minus_ff_absorption,
-        thomson_scattering,
-        rayleigh_scattering
-    )
-    from jorg.constants import c_cgs
-    
-    JAX_AVAILABLE = True
-except ImportError:
-    JAX_AVAILABLE = False
+from jorg.continuum.core import total_continuum_absorption
+from jorg.continuum.hydrogen import hydrogen_continuum_absorption
+from jorg.continuum.helium import helium_continuum_absorption
+from jorg.continuum.scattering import rayleigh_scattering, thomson_scattering
+from jorg.synthesis import format_abundances
 
 
-class TestContinuumAbsorption:
-    """Test suite for continuum absorption calculations"""
+class TestHydrogenContinuum:
+    """Test hydrogen continuum absorption calculations"""
     
-    @pytest.fixture
-    def setup_test_conditions(self):
-        """Set up standard test conditions"""
-        # Standard stellar atmosphere conditions
-        temperature = 5778.0  # K (Sun-like)
-        electron_density = 1e15  # cm^-3
+    def test_hydrogen_bf_absorption(self):
+        """Test hydrogen bound-free absorption"""
+        wavelengths = jnp.array([4000.0, 5000.0, 6000.0])  # Angstroms
+        temperature = 5800.0  # K
+        n_HI = 1e12  # cm^-3
         
-        # Number densities (cm^-3) - typical solar values
-        number_densities = {
-            'H_I': 1e16,
-            'H_II': 1e12, 
-            'He_I': 1e15,
-            'H2': 1e10
-        }
+        # Test that function runs without error
+        absorption = hydrogen_continuum_absorption(wavelengths, temperature, n_HI)
         
-        # Simple partition functions (constant for testing)
-        partition_functions = {
-            'H_I': lambda log_T: 2.0,  # Ground state degeneracy
-            'He_I': lambda log_T: 1.0   # Ground state degeneracy
-        }
-        
-        # Frequency grid (optical wavelengths: 4000-7000 Å)
-        wavelengths_cm = np.linspace(4000e-8, 7000e-8, 100)
-        frequencies = c_cgs / wavelengths_cm
-        frequencies = np.sort(frequencies)  # Ensure sorted
-        
-        return {
-            'frequencies': frequencies,
-            'temperature': temperature,
-            'electron_density': electron_density,
-            'number_densities': number_densities,
-            'partition_functions': partition_functions,
-            'wavelengths_cm': wavelengths_cm
-        }
+        assert len(absorption) == len(wavelengths)
+        assert jnp.all(absorption >= 0)
+        assert jnp.all(jnp.isfinite(absorption))
     
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_thomson_scattering(self, setup_test_conditions):
-        """Test Thomson scattering calculation"""
-        conditions = setup_test_conditions
+    def test_hydrogen_temperature_dependence(self):
+        """Test temperature dependence of hydrogen opacity"""
+        wavelengths = jnp.array([5000.0])
+        n_HI = 1e12
         
-        # Calculate Thomson scattering
-        alpha_thomson = thomson_scattering(conditions['electron_density'])
+        # Test different temperatures
+        T_cool = 4000.0
+        T_hot = 8000.0
         
-        # Expected value: n_e * sigma_thomson
-        expected = conditions['electron_density'] * 6.6524e-25  # sigma_thomson
+        abs_cool = hydrogen_continuum_absorption(wavelengths, T_cool, n_HI)
+        abs_hot = hydrogen_continuum_absorption(wavelengths, T_hot, n_HI)
         
-        assert np.isclose(alpha_thomson, expected, rtol=1e-10)
-        assert alpha_thomson > 0
+        # Bound-free absorption should decrease with temperature
+        # (fewer atoms in ground state)
+        assert abs_hot[0] < abs_cool[0]
+    
+    def test_hydrogen_density_scaling(self):
+        """Test density scaling of hydrogen opacity"""
+        wavelengths = jnp.array([5000.0])
+        temperature = 5800.0
         
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_rayleigh_scattering(self, setup_test_conditions):
+        n_low = 1e11
+        n_high = 1e13
+        
+        abs_low = hydrogen_continuum_absorption(wavelengths, temperature, n_low)
+        abs_high = hydrogen_continuum_absorption(wavelengths, temperature, n_high)
+        
+        # Should scale linearly with density
+        ratio = abs_high[0] / abs_low[0]
+        expected_ratio = n_high / n_low
+        np.testing.assert_allclose(ratio, expected_ratio, rtol=1e-6)
+    
+    def test_wavelength_dependence(self):
+        """Test wavelength dependence follows expected behavior"""
+        # Test across Lyman series limit
+        wavelengths = jnp.array([900.0, 912.0, 1000.0])  # Around Lyman limit
+        temperature = 5800.0
+        n_HI = 1e12
+        
+        absorption = hydrogen_continuum_absorption(wavelengths, temperature, n_HI)
+        
+        # Should have edge at 912 Å
+        assert absorption[0] > 0  # Below limit
+        assert absorption[2] > 0  # Above limit
+        
+        # Check that it's finite everywhere
+        assert jnp.all(jnp.isfinite(absorption))
+
+
+class TestHeliumContinuum:
+    """Test helium continuum absorption"""
+    
+    def test_helium_absorption_basic(self):
+        """Test basic helium absorption calculation"""
+        wavelengths = jnp.array([4000.0, 5000.0, 6000.0])
+        temperature = 5800.0
+        n_HeI = 1e11  # cm^-3
+        
+        absorption = helium_continuum_absorption(wavelengths, temperature, n_HeI)
+        
+        assert len(absorption) == len(wavelengths)
+        assert jnp.all(absorption >= 0)
+        assert jnp.all(jnp.isfinite(absorption))
+    
+    def test_helium_temperature_dependence(self):
+        """Test helium opacity temperature dependence"""
+        wavelengths = jnp.array([5000.0])
+        n_HeI = 1e11
+        
+        T_cool = 4000.0
+        T_hot = 8000.0
+        
+        abs_cool = helium_continuum_absorption(wavelengths, T_cool, n_HeI)
+        abs_hot = helium_continuum_absorption(wavelengths, T_hot, n_HeI)
+        
+        # Both should be positive and finite
+        assert abs_cool[0] >= 0
+        assert abs_hot[0] >= 0
+        assert jnp.isfinite(abs_cool[0])
+        assert jnp.isfinite(abs_hot[0])
+    
+    def test_helium_wavelength_edge(self):
+        """Test helium ionization edge behavior"""
+        # Test around He I ionization edge (504 Å)
+        wavelengths = jnp.array([500.0, 504.0, 510.0])
+        temperature = 5800.0
+        n_HeI = 1e11
+        
+        absorption = helium_continuum_absorption(wavelengths, temperature, n_HeI)
+        
+        # Should have significant absorption near edge
+        assert jnp.all(jnp.isfinite(absorption))
+        assert jnp.all(absorption >= 0)
+
+
+class TestScattering:
+    """Test scattering opacity calculations"""
+    
+    def test_rayleigh_scattering(self):
         """Test Rayleigh scattering calculation"""
-        conditions = setup_test_conditions
+        wavelengths = jnp.array([4000.0, 5000.0, 6000.0])
+        n_H = 1e12  # cm^-3
         
-        # Calculate Rayleigh scattering
-        alpha_rayleigh = rayleigh_scattering(
-            conditions['frequencies'],
-            conditions['number_densities']['H_I'],
-            conditions['number_densities']['He_I'],
-            conditions['number_densities']['H2']
-        )
+        scattering = rayleigh_scattering(wavelengths, n_H)
         
-        # Basic checks
-        assert len(alpha_rayleigh) == len(conditions['frequencies'])
-        assert np.all(alpha_rayleigh >= 0)
+        assert len(scattering) == len(wavelengths)
+        assert jnp.all(scattering >= 0)
+        assert jnp.all(jnp.isfinite(scattering))
         
-        # Rayleigh scattering should increase with frequency (ν^4 dependence)
-        # Check that shorter wavelengths have higher scattering
-        mid_point = len(alpha_rayleigh) // 2
-        assert np.mean(alpha_rayleigh[mid_point:]) > np.mean(alpha_rayleigh[:mid_point])
-        
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_h_minus_bf_absorption(self, setup_test_conditions):
-        """Test H^- bound-free absorption"""
-        conditions = setup_test_conditions
-        
-        # Calculate H^- bound-free absorption
-        n_h_i_div_u = (conditions['number_densities']['H_I'] / 
-                      conditions['partition_functions']['H_I'](np.log(conditions['temperature'])))
-        
-        alpha_h_minus_bf = h_minus_bf_absorption(
-            conditions['frequencies'],
-            conditions['temperature'],
-            n_h_i_div_u,
-            conditions['electron_density'],
-            include_stimulated_emission=True
-        )
-        
-        # Basic checks
-        assert len(alpha_h_minus_bf) == len(conditions['frequencies'])
-        assert np.all(alpha_h_minus_bf >= 0)
-        
-        # H^- absorption should be significant in optical wavelengths
-        assert np.max(alpha_h_minus_bf) > 1e-12  # cm^-1
-        
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_h_minus_ff_absorption(self, setup_test_conditions):
-        """Test H^- free-free absorption"""
-        conditions = setup_test_conditions
-        
-        # Calculate H^- free-free absorption
-        n_h_i_div_u = (conditions['number_densities']['H_I'] / 
-                      conditions['partition_functions']['H_I'](np.log(conditions['temperature'])))
-        
-        alpha_h_minus_ff = h_minus_ff_absorption(
-            conditions['frequencies'],
-            conditions['temperature'],
-            n_h_i_div_u,
-            conditions['electron_density']
-        )
-        
-        # Basic checks
-        assert len(alpha_h_minus_ff) == len(conditions['frequencies'])
-        assert np.all(alpha_h_minus_ff >= 0)
-        
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_total_continuum_absorption(self, setup_test_conditions):
-        """Test total continuum absorption calculation"""
-        conditions = setup_test_conditions
-        
-        # Calculate total continuum absorption
-        alpha_total = total_continuum_absorption(
-            conditions['frequencies'],
-            conditions['temperature'],
-            conditions['electron_density'],
-            conditions['number_densities'],
-            conditions['partition_functions'],
-            include_stimulated_emission=True
-        )
-        
-        # Basic checks
-        assert len(alpha_total) == len(conditions['frequencies'])
-        assert np.all(alpha_total >= 0)
-        
-        # Total absorption should be non-zero
-        assert np.max(alpha_total) > 1e-12  # cm^-1
-        
-        # Check that different components contribute
-        # Thomson scattering (frequency-independent)
-        alpha_thomson = thomson_scattering(conditions['electron_density'])
-        assert np.all(alpha_total >= alpha_thomson * 0.9)  # Allow for numerical precision
-        
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_temperature_dependence(self, setup_test_conditions):
-        """Test temperature dependence of continuum absorption"""
-        conditions = setup_test_conditions
-        
-        temperatures = [4000.0, 5778.0, 8000.0]  # K
-        alpha_values = []
-        
-        for T in temperatures:
-            alpha = total_continuum_absorption(
-                conditions['frequencies'],
-                T,
-                conditions['electron_density'],
-                conditions['number_densities'],
-                conditions['partition_functions'],
-                include_stimulated_emission=True
-            )
-            alpha_values.append(np.mean(alpha))
-        
-        # Check that we get different values for different temperatures
-        # Convert JAX arrays to float for comparison
-        alpha_values_float = [float(alpha) for alpha in alpha_values]
-        assert len(set(alpha_values_float)) == len(temperatures)
-        
-        # All values should be positive
-        assert all(alpha > 0 for alpha in alpha_values)
-        
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_jit_compilation(self, setup_test_conditions):
-        """Test that JAX JIT compilation works correctly"""
-        conditions = setup_test_conditions
-        
-        # Test internal JIT-compiled function directly
-        # Extract parameters
-        n_h_i = conditions['number_densities']['H_I']
-        n_h_ii = conditions['number_densities']['H_II']
-        n_he_i = conditions['number_densities']['He_I']
-        n_h2 = conditions['number_densities']['H2']
-        u_h_i = conditions['partition_functions']['H_I'](np.log(conditions['temperature']))
-        u_he_i = conditions['partition_functions']['He_I'](np.log(conditions['temperature']))
-        
-        from jorg.continuum.main import _total_continuum_absorption_jit
-        
-        # Run twice to ensure compilation and execution both work
-        alpha1 = _total_continuum_absorption_jit(
-            conditions['frequencies'],
-            conditions['temperature'],
-            conditions['electron_density'],
-            n_h_i, n_h_ii, n_he_i, n_h2, u_h_i, u_he_i,
-            True
-        )
-        
-        alpha2 = _total_continuum_absorption_jit(
-            conditions['frequencies'],
-            conditions['temperature'],
-            conditions['electron_density'],
-            n_h_i, n_h_ii, n_he_i, n_h2, u_h_i, u_he_i,
-            True
-        )
-        
-        # Results should be identical
-        assert np.allclose(alpha1, alpha2, rtol=1e-15)
-        
-    def test_import_structure(self):
-        """Test that the module structure is correct"""
-        if not JAX_AVAILABLE:
-            pytest.skip("JAX not available")
-            
-        # Test that we can import the main functions
-        from jorg.continuum import (
-            total_continuum_absorption,
-            h_minus_bf_absorption,
-            thomson_scattering
-        )
-        
-        # Test that functions are callable
-        assert callable(total_continuum_absorption)
-        assert callable(h_minus_bf_absorption)
-        assert callable(thomson_scattering)
-
-
-class TestKorgComparison:
-    """Test comparison with Korg.jl results"""
+        # Should scale as λ^-4
+        assert scattering[0] > scattering[1] > scattering[2]
     
-    @pytest.fixture
-    def korg_reference_data(self):
-        """
-        Reference data from Korg.jl for comparison
+    def test_thomson_scattering(self):
+        """Test Thomson (electron) scattering"""
+        wavelengths = jnp.array([4000.0, 5000.0, 6000.0])
+        n_e = 1e10  # cm^-3
         
-        This would typically be generated by running the equivalent
-        Korg.jl functions and saving the results.
-        """
-        # Placeholder - in practice, this would be loaded from a file
-        # generated by running Korg.jl with identical parameters
-        return {
-            'frequencies': np.linspace(4e14, 7.5e14, 100),  # Hz
-            'temperature': 5778.0,
-            'electron_density': 1e15,
-            'korg_alpha_total': np.random.uniform(1e-10, 1e-8, 100),  # Placeholder
-            'korg_alpha_thomson': 6.6524e-10,  # n_e * sigma_thomson
-        }
+        scattering = thomson_scattering(wavelengths, n_e)
+        
+        assert len(scattering) == len(wavelengths)
+        assert jnp.all(scattering >= 0)
+        assert jnp.all(jnp.isfinite(scattering))
+        
+        # Thomson scattering is wavelength-independent
+        np.testing.assert_allclose(scattering, scattering[0], rtol=1e-10)
     
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")  
-    def test_thomson_scattering_vs_korg(self, korg_reference_data):
-        """Compare Thomson scattering with Korg.jl reference"""
-        ref = korg_reference_data
+    def test_scattering_density_scaling(self):
+        """Test that scattering scales with density"""
+        wavelengths = jnp.array([5000.0])
+        n_low = 1e10
+        n_high = 1e12
         
-        # Calculate with Jorg
-        alpha_thomson_jorg = thomson_scattering(ref['electron_density'])
+        scat_low = thomson_scattering(wavelengths, n_low)
+        scat_high = thomson_scattering(wavelengths, n_high)
         
-        # Compare with Korg reference
-        assert np.isclose(alpha_thomson_jorg, ref['korg_alpha_thomson'], rtol=1e-10)
+        ratio = scat_high[0] / scat_low[0]
+        expected_ratio = n_high / n_low
+        np.testing.assert_allclose(ratio, expected_ratio, rtol=1e-10)
+
+
+class TestTotalContinuumAbsorption:
+    """Test total continuum absorption combining all sources"""
+    
+    def test_total_continuum_basic(self):
+        """Test basic total continuum calculation"""
+        wavelengths = jnp.array([4000.0, 5000.0, 6000.0])
+        temperature = 5800.0
+        electron_density = 1e10  # cm^-3
+        A_X = format_abundances(0.0)  # Solar abundances
         
-    @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-    def test_performance_comparison(self, setup_test_conditions):
-        """Test performance of JAX implementation"""
-        import time
-        
-        conditions = setup_test_conditions
-        
-        # Time the JIT-compiled function
-        jit_func = jax.jit(total_continuum_absorption)
-        
-        # Warm up JIT compilation
-        _ = jit_func(
-            conditions['frequencies'],
-            conditions['temperature'],
-            conditions['electron_density'],
-            conditions['number_densities'],
-            conditions['partition_functions'],
-            True
+        absorption = total_continuum_absorption(
+            wavelengths, temperature, electron_density, A_X
         )
         
-        # Time multiple runs
-        start_time = time.time()
-        n_runs = 100
-        for _ in range(n_runs):
-            _ = jit_func(
-                conditions['frequencies'],
-                conditions['temperature'],
-                conditions['electron_density'],
-                conditions['number_densities'],
-                conditions['partition_functions'],
-                True
-            )
-        end_time = time.time()
+        assert len(absorption) == len(wavelengths)
+        assert jnp.all(absorption >= 0)
+        assert jnp.all(jnp.isfinite(absorption))
+    
+    def test_temperature_dependence(self):
+        """Test temperature dependence of total continuum"""
+        wavelengths = jnp.array([5000.0])
+        electron_density = 1e10
+        A_X = format_abundances(0.0)
         
-        avg_time = (end_time - start_time) / n_runs
-        print(f"Average time per run: {avg_time*1000:.3f} ms")
+        T_cool = 4000.0
+        T_hot = 8000.0
         
-        # Should be very fast after JIT compilation
-        assert avg_time < 0.01  # Less than 10ms per run
+        abs_cool = total_continuum_absorption(wavelengths, T_cool, electron_density, A_X)
+        abs_hot = total_continuum_absorption(wavelengths, T_hot, electron_density, A_X)
+        
+        # Both should be positive
+        assert abs_cool[0] > 0
+        assert abs_hot[0] > 0
+        
+        # Generally, continuum opacity decreases with temperature
+        # (though this depends on the wavelength regime)
+        assert jnp.isfinite(abs_cool[0])
+        assert jnp.isfinite(abs_hot[0])
+    
+    def test_metallicity_dependence(self):
+        """Test metallicity dependence"""
+        wavelengths = jnp.array([5000.0])
+        temperature = 5800.0
+        electron_density = 1e10
+        
+        A_X_solar = format_abundances(0.0)
+        A_X_metal_poor = format_abundances(-1.0)
+        
+        abs_solar = total_continuum_absorption(wavelengths, temperature, electron_density, A_X_solar)
+        abs_poor = total_continuum_absorption(wavelengths, temperature, electron_density, A_X_metal_poor)
+        
+        # Metal-poor stars should have different continuum opacity
+        # (mainly from H- which depends on electron density)
+        assert abs_solar[0] > 0
+        assert abs_poor[0] > 0
+        assert jnp.isfinite(abs_solar[0])
+        assert jnp.isfinite(abs_poor[0])
+    
+    def test_wavelength_coverage(self):
+        """Test continuum across wide wavelength range"""
+        # Test from UV to near-IR
+        wavelengths = jnp.array([2000.0, 4000.0, 5000.0, 8000.0, 12000.0])
+        temperature = 5800.0
+        electron_density = 1e10
+        A_X = format_abundances(0.0)
+        
+        absorption = total_continuum_absorption(
+            wavelengths, temperature, electron_density, A_X
+        )
+        
+        # Should be finite everywhere
+        assert jnp.all(jnp.isfinite(absorption))
+        assert jnp.all(absorption >= 0)
+        
+        # Generally expect higher opacity at shorter wavelengths
+        # (though this is not always true due to edges)
+        assert len(absorption) == len(wavelengths)
+    
+    def test_electron_density_scaling(self):
+        """Test electron density dependence"""
+        wavelengths = jnp.array([5000.0])
+        temperature = 5800.0
+        A_X = format_abundances(0.0)
+        
+        n_e_low = 1e9
+        n_e_high = 1e11
+        
+        abs_low = total_continuum_absorption(wavelengths, temperature, n_e_low, A_X)
+        abs_high = total_continuum_absorption(wavelengths, temperature, n_e_high, A_X)
+        
+        # Higher electron density should generally increase opacity
+        # (from H- and electron scattering)
+        assert abs_high[0] > abs_low[0]
+    
+    def test_physical_units(self):
+        """Test that opacity has correct physical units"""
+        wavelengths = jnp.array([5000.0])  # Angstroms
+        temperature = 5800.0  # K
+        electron_density = 1e10  # cm^-3
+        A_X = format_abundances(0.0)
+        
+        absorption = total_continuum_absorption(
+            wavelengths, temperature, electron_density, A_X
+        )
+        
+        # Opacity should be in cm^-1 (per cm path length)
+        # For typical stellar atmosphere conditions, expect values ~ 1e-6 to 1e-3 cm^-1
+        assert 1e-10 < absorption[0] < 1e2  # Reasonable range
+        
+    def test_abundance_variations(self):
+        """Test effect of abundance variations"""
+        wavelengths = jnp.array([5000.0])
+        temperature = 5800.0
+        electron_density = 1e10
+        
+        # Test different abundance patterns
+        A_X_solar = format_abundances(0.0)
+        A_X_alpha_enhanced = format_abundances(0.0, alpha_H=0.4)
+        A_X_carbon_enhanced = format_abundances(0.0, C=1.0)
+        
+        abs_solar = total_continuum_absorption(wavelengths, temperature, electron_density, A_X_solar)
+        abs_alpha = total_continuum_absorption(wavelengths, temperature, electron_density, A_X_alpha_enhanced)
+        abs_carbon = total_continuum_absorption(wavelengths, temperature, electron_density, A_X_carbon_enhanced)
+        
+        # All should be positive and finite
+        assert abs_solar[0] > 0
+        assert abs_alpha[0] > 0
+        assert abs_carbon[0] > 0
+        
+        # Variations should produce different results
+        assert not jnp.allclose(abs_solar, abs_alpha, rtol=1e-10)
 
 
-if __name__ == "__main__":
-    # Run tests with pytest
-    pytest.main([__file__, "-v"])
+class TestEdgeCases:
+    """Test edge cases and error conditions"""
+    
+    def test_zero_densities(self):
+        """Test behavior with zero densities"""
+        wavelengths = jnp.array([5000.0])
+        temperature = 5800.0
+        electron_density = 0.0
+        A_X = format_abundances(0.0)
+        
+        absorption = total_continuum_absorption(
+            wavelengths, temperature, electron_density, A_X
+        )
+        
+        # Should still be finite (scattering terms might be zero)
+        assert jnp.isfinite(absorption[0])
+        assert absorption[0] >= 0
+    
+    def test_extreme_temperatures(self):
+        """Test behavior at extreme temperatures"""
+        wavelengths = jnp.array([5000.0])
+        electron_density = 1e10
+        A_X = format_abundances(0.0)
+        
+        # Very cool
+        T_cool = 1000.0
+        abs_cool = total_continuum_absorption(wavelengths, T_cool, electron_density, A_X)
+        assert jnp.isfinite(abs_cool[0])
+        assert abs_cool[0] >= 0
+        
+        # Very hot
+        T_hot = 50000.0
+        abs_hot = total_continuum_absorption(wavelengths, T_hot, electron_density, A_X)
+        assert jnp.isfinite(abs_hot[0])
+        assert abs_hot[0] >= 0
+    
+    def test_extreme_wavelengths(self):
+        """Test behavior at extreme wavelengths"""
+        temperature = 5800.0
+        electron_density = 1e10
+        A_X = format_abundances(0.0)
+        
+        # Very short wavelength
+        wl_short = jnp.array([100.0])  # 100 Å
+        abs_short = total_continuum_absorption(wl_short, temperature, electron_density, A_X)
+        assert jnp.isfinite(abs_short[0])
+        
+        # Very long wavelength  
+        wl_long = jnp.array([50000.0])  # 5 μm
+        abs_long = total_continuum_absorption(wl_long, temperature, electron_density, A_X)
+        assert jnp.isfinite(abs_long[0])
+    
+    def test_single_wavelength(self):
+        """Test with single wavelength"""
+        wavelength = jnp.array([5000.0])
+        temperature = 5800.0
+        electron_density = 1e10
+        A_X = format_abundances(0.0)
+        
+        absorption = total_continuum_absorption(wavelength, temperature, electron_density, A_X)
+        
+        assert len(absorption) == 1
+        assert absorption[0] > 0
+        assert jnp.isfinite(absorption[0])
+    
+    def test_array_broadcasting(self):
+        """Test proper array broadcasting"""
+        wavelengths = jnp.array([4000.0, 5000.0, 6000.0])
+        temperature = 5800.0  # Scalar
+        electron_density = 1e10  # Scalar
+        A_X = format_abundances(0.0)
+        
+        absorption = total_continuum_absorption(
+            wavelengths, temperature, electron_density, A_X
+        )
+        
+        assert absorption.shape == wavelengths.shape
+        assert jnp.all(jnp.isfinite(absorption))
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

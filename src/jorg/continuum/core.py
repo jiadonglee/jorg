@@ -14,6 +14,7 @@ from .hydrogen import (
 )
 from .helium import he_minus_ff_absorption
 from .scattering import thomson_scattering, rayleigh_scattering
+from .metals_bf import metal_bf_absorption
 from ..constants import SPEED_OF_LIGHT
 
 
@@ -23,7 +24,8 @@ def total_continuum_absorption(
     electron_density: float,
     number_densities: Dict[str, float],
     partition_functions: Dict[str, Any],
-    include_stimulated_emission: bool = True
+    include_stimulated_emission: bool = True,
+    include_metals: bool = True
 ) -> jnp.ndarray:
     """
     Calculate total continuum absorption coefficient at given frequencies
@@ -46,6 +48,8 @@ def total_continuum_absorption(
         Expected keys: 'H_I', 'He_I'
     include_stimulated_emission : bool, optional
         Whether to include stimulated emission correction (default: True)
+    include_metals : bool, optional
+        Whether to include metal bound-free absorption (default: True)
         
     Returns
     -------
@@ -60,6 +64,7 @@ def total_continuum_absorption(
     - H^- bound-free and free-free absorption  
     - H2^+ bound-free and free-free absorption
     - He^- free-free absorption
+    - Metal bound-free absorption (TOPBase/NORAD data)
     - Thomson scattering by free electrons
     - Rayleigh scattering by H I, He I, and H2
     """
@@ -80,6 +85,27 @@ def total_continuum_absorption(
         n_h_i, n_h_ii, n_he_i, n_h2, u_h_i, u_he_i,
         include_stimulated_emission
     )
+    
+    # Add metal bound-free absorption (handled separately due to Species dict)
+    if include_metals:
+        # Convert string-based number_densities to Species-based for metals
+        from ..statmech.species import Species
+        metal_number_densities = {}
+        
+        # Map common metal species from string to Species objects
+        metal_species_map = {
+            'Al_I': 'Al I', 'C_I': 'C I', 'Ca_I': 'Ca I', 'Fe_I': 'Fe I',
+            'Mg_I': 'Mg I', 'Na_I': 'Na I', 'S_I': 'S I', 'Si_I': 'Si I'
+        }
+        
+        for str_key, species_str in metal_species_map.items():
+            if str_key in number_densities:
+                species = Species.from_string(species_str)
+                metal_number_densities[species] = number_densities[str_key]
+        
+        # Add metal absorption
+        alpha_metals = metal_bf_absorption(frequencies, temperature, metal_number_densities)
+        alpha_total += alpha_metals
     
     return alpha_total
 

@@ -3,6 +3,12 @@ Line absorption calculations for stellar spectral synthesis
 
 This module implements atomic and molecular line opacity calculations
 in JAX for high-performance stellar spectral synthesis.
+
+Key Features:
+- Sophisticated hydrogen line treatment with MHD formalism
+- ABO van der Waals broadening for Balmer lines
+- Griem Stark broadening for Brackett lines
+- Complete pressure ionization physics
 """
 
 from .core import line_absorption, LineData, create_line_data
@@ -38,6 +44,16 @@ from ..utils.wavelength_utils import (
     angstrom_to_cm,
     cm_to_angstrom
 )
+
+# Hydrogen lines - sophisticated treatment
+try:
+    from .hydrogen_lines_simple import (
+        hydrogen_line_absorption_balmer,
+        hummer_mihalas_w
+    )
+    _hydrogen_available = True
+except ImportError:
+    _hydrogen_available = False
 
 __all__ = [
     # Core line absorption
@@ -75,3 +91,10 @@ __all__ = [
     "angstrom_to_cm",
     "cm_to_angstrom"
 ]
+
+# Add hydrogen lines to exports if available
+if _hydrogen_available:
+    __all__.extend([
+        "hydrogen_line_absorption_balmer",
+        "hummer_mihalas_w"
+    ])

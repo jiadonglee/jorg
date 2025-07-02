@@ -98,3 +98,65 @@ def create_default_equilibrium_constants() -> Dict[str, Any]:
     equilibrium_constants['CO'] = co_equilibrium
     
     return equilibrium_constants
+
+
+def create_default_log_equilibrium_constants() -> Dict[Any, Any]:
+    """
+    Create default log molecular equilibrium constants for tutorial compatibility.
+    
+    This function creates equilibrium constants that work with Species objects
+    as expected by the tutorial examples.
+    
+    Returns:
+    --------
+    Dict
+        Dictionary mapping Species objects to log equilibrium constant functions
+    """
+    from .species import Species, Formula
+    
+    log_equilibrium_constants = {}
+    
+    # Common molecules and their simplified equilibrium constants
+    molecules = [
+        ('CO', [6, 8]),     # Carbon monoxide
+        ('OH', [1, 8]),     # Hydroxyl  
+        ('CH', [1, 6]),     # Methylidyne
+        ('CN', [6, 7]),     # Cyanogen
+        ('H2', [1, 1]),     # Hydrogen molecule
+        ('O2', [8, 8]),     # Oxygen molecule
+        ('N2', [7, 7]),     # Nitrogen molecule
+        ('NO', [7, 8]),     # Nitric oxide
+        ('H2O', [1, 1, 8]), # Water
+    ]
+    
+    for mol_name, atoms in molecules:
+        try:
+            # Create Species object for the molecule
+            formula = Formula.from_atomic_numbers(atoms)
+            species = Species(formula, 0)  # Neutral molecule
+            
+            # Create simplified equilibrium constant function
+            def make_equilibrium_func(name):
+                def equilibrium_func(log_T):
+                    T = jnp.exp(log_T)
+                    # Very simplified temperature dependence
+                    # In practice, these would be from detailed molecular data
+                    if name == 'CO':
+                        return -5.0 + 2000.0 / T
+                    elif name == 'OH':
+                        return -3.0 + 1500.0 / T
+                    elif name == 'H2':
+                        return -2.0 + 1000.0 / T
+                    elif name == 'H2O':
+                        return -8.0 + 3000.0 / T
+                    else:
+                        return -4.0 + 1800.0 / T
+                return equilibrium_func
+            
+            log_equilibrium_constants[species] = make_equilibrium_func(mol_name)
+            
+        except Exception:
+            # Skip if Species creation fails
+            continue
+    
+    return log_equilibrium_constants

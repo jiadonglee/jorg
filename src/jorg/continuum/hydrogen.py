@@ -284,7 +284,97 @@ def h_minus_bf_absorption(
     return alpha
 
 
-# Simplified H^- free-free absorption using Bell & Berrington (1987) approximation
+# Bell & Berrington (1987) H^- free-free absorption data
+# Table from https://doi.org/10.1088/0022-3700/20/4/019
+_BELL_BERRINGTON_THETA = jnp.array([0.5, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.8, 3.6])
+
+_BELL_BERRINGTON_LAMBDA = jnp.array([
+    1823, 2278, 2604, 3038, 3645, 4557, 5063, 5696, 6510, 7595, 9113,
+    10126, 11392, 13019, 15189, 18227, 22784, 30378, 45567, 91134,
+    113918, 151890
+])
+
+# K values in units of 10^-26 cm^4/dyn 
+# Table organized as [wavelength_index, theta_index] exactly matching Korg.jl
+_BELL_BERRINGTON_K = jnp.array([
+    [0.0178, 0.0222, 0.0308, 0.0402, 0.0498, 0.0596, 0.0695, 0.0795, 0.0896, 0.131, 0.172],  # 1823 Å
+    [0.0228, 0.0280, 0.0388, 0.0499, 0.0614, 0.0732, 0.0851, 0.0972, 0.110, 0.160, 0.211],   # 2278 Å
+    [0.0277, 0.0342, 0.0476, 0.0615, 0.0760, 0.0908, 0.105, 0.121, 0.136, 0.199, 0.262],    # 2604 Å
+    [0.0364, 0.0447, 0.0616, 0.0789, 0.0966, 0.114, 0.132, 0.150, 0.169, 0.243, 0.318],     # 3038 Å
+    [0.0520, 0.0633, 0.0859, 0.108, 0.131, 0.154, 0.178, 0.201, 0.225, 0.321, 0.418],       # 3645 Å
+    [0.0791, 0.0959, 0.129, 0.161, 0.194, 0.227, 0.260, 0.293, 0.327, 0.463, 0.602],        # 4557 Å
+    [0.0965, 0.117, 0.157, 0.195, 0.234, 0.272, 0.311, 0.351, 0.390, 0.549, 0.711],         # 5063 Å
+    [0.121, 0.146, 0.195, 0.241, 0.288, 0.334, 0.381, 0.428, 0.475, 0.667, 0.861],          # 5696 Å
+    [0.154, 0.188, 0.249, 0.309, 0.367, 0.424, 0.482, 0.539, 0.597, 0.830, 1.07],           # 6510 Å
+    [0.208, 0.250, 0.332, 0.409, 0.484, 0.557, 0.630, 0.702, 0.774, 1.06, 1.36],            # 7595 Å
+    [0.293, 0.354, 0.468, 0.576, 0.677, 0.777, 0.874, 0.969, 1.06, 1.45, 1.83],             # 9113 Å
+    [0.358, 0.432, 0.572, 0.702, 0.825, 0.943, 1.06, 1.17, 1.28, 1.73, 2.17],               # 10126 Å
+    [0.448, 0.539, 0.711, 0.871, 1.02, 1.16, 1.29, 1.43, 1.57, 2.09, 2.60],                 # 11392 Å
+    [0.579, 0.699, 0.924, 1.13, 1.33, 1.51, 1.69, 1.86, 2.02, 2.67, 3.31],                  # 13019 Å
+    [0.781, 0.940, 1.24, 1.52, 1.78, 2.02, 2.26, 2.48, 2.69, 3.52, 4.31],                   # 15189 Å
+    [1.11, 1.34, 1.77, 2.17, 2.53, 2.87, 3.20, 3.51, 3.80, 4.92, 5.97],                     # 18227 Å
+    [1.73, 2.08, 2.74, 3.37, 3.90, 4.50, 5.01, 5.50, 5.95, 7.59, 9.06],                     # 22784 Å
+    [3.04, 3.65, 4.80, 5.86, 6.86, 7.79, 8.67, 9.50, 10.3, 13.2, 15.6],                     # 30378 Å
+    [6.79, 8.16, 10.7, 13.1, 15.3, 17.4, 19.4, 21.2, 23.0, 29.5, 35.0],                     # 45567 Å
+    [27.0, 32.4, 42.6, 51.9, 60.7, 68.9, 76.8, 84.2, 91.4, 117.0, 140.0],                   # 91134 Å
+    [42.3, 50.6, 66.4, 80.8, 94.5, 107.0, 120.0, 131.0, 142.0, 183.0, 219.0],               # 113918 Å
+    [75.1, 90.0, 118.0, 144.0, 168.0, 191.0, 212.0, 234.0, 253.0, 325.0, 388.0]            # 151890 Å
+])
+
+
+@jax.jit  
+def _interpolate_bell_berrington(wavelength_angstrom: float, theta: float) -> float:
+    """
+    Interpolate Bell & Berrington (1987) H^- free-free absorption table
+    
+    This implements the exact same 2D linear interpolation as Korg.jl
+    
+    Parameters
+    ----------
+    wavelength_angstrom : float
+        Wavelength in Angstroms
+    theta : float
+        Temperature parameter θ = 5040/T
+        
+    Returns
+    -------
+    float
+        Interpolated K value in units of 10^-26 cm^4/dyn
+    """
+    # Clamp to table bounds
+    lambda_min, lambda_max = _BELL_BERRINGTON_LAMBDA[0], _BELL_BERRINGTON_LAMBDA[-1]
+    theta_min, theta_max = _BELL_BERRINGTON_THETA[0], _BELL_BERRINGTON_THETA[-1]
+    
+    wl_clamped = jnp.clip(wavelength_angstrom, lambda_min, lambda_max)
+    theta_clamped = jnp.clip(theta, theta_min, theta_max)
+    
+    # Find interpolation indices
+    lambda_idx = jnp.searchsorted(_BELL_BERRINGTON_LAMBDA, wl_clamped) - 1
+    lambda_idx = jnp.clip(lambda_idx, 0, len(_BELL_BERRINGTON_LAMBDA) - 2)
+    
+    theta_idx = jnp.searchsorted(_BELL_BERRINGTON_THETA, theta_clamped) - 1
+    theta_idx = jnp.clip(theta_idx, 0, len(_BELL_BERRINGTON_THETA) - 2)
+    
+    # Get interpolation fractions
+    lambda_frac = ((wl_clamped - _BELL_BERRINGTON_LAMBDA[lambda_idx]) /
+                   (_BELL_BERRINGTON_LAMBDA[lambda_idx + 1] - _BELL_BERRINGTON_LAMBDA[lambda_idx]))
+    theta_frac = ((theta_clamped - _BELL_BERRINGTON_THETA[theta_idx]) /
+                  (_BELL_BERRINGTON_THETA[theta_idx + 1] - _BELL_BERRINGTON_THETA[theta_idx]))
+    
+    # Bilinear interpolation
+    k00 = _BELL_BERRINGTON_K[lambda_idx, theta_idx]
+    k01 = _BELL_BERRINGTON_K[lambda_idx, theta_idx + 1]
+    k10 = _BELL_BERRINGTON_K[lambda_idx + 1, theta_idx]
+    k11 = _BELL_BERRINGTON_K[lambda_idx + 1, theta_idx + 1]
+    
+    k_interp = (k00 * (1 - lambda_frac) * (1 - theta_frac) +
+                k01 * (1 - lambda_frac) * theta_frac +
+                k10 * lambda_frac * (1 - theta_frac) +
+                k11 * lambda_frac * theta_frac)
+    
+    return k_interp
+
+
 @jax.jit
 def h_minus_ff_absorption(
     frequencies: jnp.ndarray,
@@ -293,10 +383,10 @@ def h_minus_ff_absorption(
     electron_density: float
 ) -> jnp.ndarray:
     """
-    Calculate H^- free-free absorption coefficient
+    Calculate H^- free-free absorption coefficient exactly following Korg.jl implementation
     
-    This is a simplified implementation using a functional form
-    that approximates the Bell & Berrington (1987) tables.
+    This implements the exact Bell & Berrington (1987) table interpolation used in Korg.jl.
+    The reaction is: photon + e^- + H I -> e^- + H I
     
     Parameters
     ----------
@@ -313,31 +403,42 @@ def h_minus_ff_absorption(
     -------
     jnp.ndarray
         H^- free-free absorption coefficient in cm^-1
+        
+    Notes
+    -----
+    Based on Table 1 from Bell & Berrington (1987) which tabulates K values
+    in units of cm^4/dyn. Must be multiplied by electron pressure and 
+    ground-state H I density to get absorption coefficient.
+    
+    Valid ranges:
+    - Wavelength: 1823-151890 Å  
+    - Temperature: 1400-10080 K (θ = 0.5-3.6)
     """
-    # Convert to wavelength in Angstroms
+    # Convert frequency to wavelength in Angstroms
     wavelength_angstrom = c_cgs * 1e8 / frequencies
     
-    # Temperature parameter
+    # Temperature parameter θ = 5040/T (exactly as in Korg.jl)
     theta = 5040.0 / temperature
     
-    # Simplified fitting formula for Bell & Berrington table
-    # This is a rough approximation - the real implementation needs interpolation
-    lambda_ref = 10000.0  # Reference wavelength in Angstroms
-    theta_ref = 1.0       # Reference theta
+    # Vectorized interpolation over the Bell & Berrington table
+    def interpolate_single(wl):
+        return _interpolate_bell_berrington(wl, theta)
     
-    # Approximate K value (cm^4/dyn) with temperature and wavelength scaling
-    K_approx = 1e-26 * (wavelength_angstrom / lambda_ref)**1.5 * (theta / theta_ref)**0.5
+    # Apply interpolation to each wavelength
+    K_values = jax.vmap(interpolate_single)(wavelength_angstrom)
     
-    # Electron pressure
+    # K is in units of 10^-26 cm^4/dyn, so multiply by 1e-26
+    K = K_values * 1e-26
+    
+    # Electron pressure in dyn/cm^2 (cgs units)
     P_e = electron_density * kboltz_cgs * temperature
     
-    # Ground state H I density
-    n_h_i_ground = 2.0 * n_h_i_div_u
+    # Ground state H I density: n(H I, n=1) = 2 * n(H I)/U(T) 
+    # (degeneracy=2, Boltzmann factor=1 for ground state)
+    n_h_i_ground_state = 2.0 * n_h_i_div_u
     
-    # Apply Bell & Berrington correction to match Korg's table implementation
-    bell_berrington_correction = 0.522  # Empirical factor to match Korg at 5500 Å, 5778 K
-    
-    return K_approx * P_e * n_h_i_ground * bell_berrington_correction
+    # Final absorption coefficient: K * P_e * n(H I, ground state)
+    return K * P_e * n_h_i_ground_state
 
 
 @jax.jit

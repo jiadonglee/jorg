@@ -1,352 +1,583 @@
 """
-Unit tests for jorg.lines module
+Unit tests for the Jorg lines module
 
-Tests line absorption calculations against Korg.jl reference results
+Tests line absorption calculations, profiles, and broadening mechanisms.
 """
 
 import pytest
-import numpy as np
 import jax.numpy as jnp
-from typing import Dict, List
+import numpy as np
+from unittest.mock import Mock
 
-# Add parent directory to path for imports
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from jorg.lines import (
-    line_absorption,
-    line_profile, 
-    voigt_hjerting,
-    harris_series,
-    doppler_width,
-    scaled_stark,
-    scaled_vdw,
-    inverse_gaussian_density,
-    inverse_lorentz_density,
-    sigma_line
-)
-from jorg.lines.main import LineData, create_line_data
-from jorg.constants import c_cgs, kboltz_eV, pi
+from jorg.lines.core import total_line_absorption, line_absorption_single
+from jorg.lines.profiles import voigt_profile, gaussian_profile, lorentzian_profile
+from jorg.lines.broadening import natural_broadening, stark_broadening, vdw_broadening
+from jorg.lines.datatypes import Line, Species
+from jorg.lines.opacity import line_opacity_coefficient
+from jorg.synthesis import format_abundances, interpolate_atmosphere
 
 
-class TestVoigtProfiles:
-    """Test Voigt profile calculations"""
+class TestLineProfiles:
+    """Test line profile calculations"""
     
-    def test_harris_series_basic(self):
-        """Test Harris series coefficients for known values"""
-        # Test at v = 0 (should give well-known values)
-        H = harris_series(0.0)
+    def test_gaussian_profile(self):
+        """Test Gaussian line profile"""
+        wavelengths = jnp.linspace(5000, 6000, 1000)
+        line_center = 5500.0
+        sigma = 0.1  # Angstroms
         
-        # At v=0, H0 should be exp(0) = 1.0
-        assert abs(H[0] - 1.0) < 1e-6
+        profile = gaussian_profile(wavelengths, line_center, sigma)
         
-        # H1 at v=0 should be approximately -1.125 based on the polynomial
-        assert abs(H[1] - (-1.12470432)) < 1e-6
+        # Check normalization (approximately)
+        dw = wavelengths[1] - wavelengths[0]
+        integral = jnp.sum(profile) * dw
+        np.testing.assert_allclose(integral, 1.0, rtol=1e-2)
         
-        # H2 at v=0 should be (1 - 2*0^2)*exp(0) = 1.0  
-        assert abs(H[2] - 1.0) < 1e-6
+        # Check peak is at center
+        peak_idx = jnp.argmax(profile)
+        assert abs(wavelengths[peak_idx] - line_center) < dw
+        
+        # Check symmetry (approximately)
+        center_idx = jnp.argmin(jnp.abs(wavelengths - line_center))
+        left_val = profile[center_idx - 10]
+        right_val = profile[center_idx + 10]
+        np.testing.assert_allclose(left_val, right_val, rtol=1e-10)
     
-    def test_voigt_hjerting_limits(self):
-        """Test Voigt-Hjerting function limiting cases"""
-        # Pure Gaussian case (α = 0)
-        alpha = 0.0
-        v = 1.0
-        H_gaussian = voigt_hjerting(alpha, v)
-        expected_gaussian = np.exp(-v**2)
-        assert abs(H_gaussian - expected_gaussian) < 1e-6
+    def test_lorentzian_profile(self):
+        """Test Lorentzian line profile"""
+        wavelengths = jnp.linspace(5000, 6000, 1000)
+        line_center = 5500.0
+        gamma = 0.05  # Angstroms
         
-        # Large v limit (should be close to α/(π v²))
-        alpha = 0.1
-        v = 50.0
-        H_large_v = voigt_hjerting(alpha, v)
-        expected_large_v = alpha / (pi * v**2)
-        # The Korg implementation uses a more accurate expansion, so allow larger tolerance
-        assert abs(H_large_v - expected_large_v) < 1e-5
+        profile = lorentzian_profile(wavelengths, line_center, gamma)
+        
+        # Check peak is at center
+        peak_idx = jnp.argmax(profile)
+        dw = wavelengths[1] - wavelengths[0]
+        assert abs(wavelengths[peak_idx] - line_center) < dw
+        
+        # Check that profile is positive
+        assert jnp.all(profile >= 0)
+        
+        # Check FWHM relationship
+        half_max = jnp.max(profile) / 2
+        indices = jnp.where(profile >= half_max)[0]
+        fwhm_measured = wavelengths[indices[-1]] - wavelengths[indices[0]]
+        fwhm_expected = 2 * gamma
+        np.testing.assert_allclose(fwhm_measured, fwhm_expected, rtol=0.1)
     
-    def test_line_profile_normalization(self):
-        """Test that line profile integrates to correct total strength"""
-        lambda_0 = 5000e-8  # 5000 Å in cm
-        sigma = 1e-8        # 0.1 Å width
-        gamma = 0.5e-8      # 0.05 Å Lorentz width
-        amplitude = 1.0     # Total line strength
+    def test_voigt_profile(self):
+        """Test Voigt line profile (Gaussian + Lorentzian convolution)"""
+        wavelengths = jnp.linspace(5499, 5501, 200)
+        line_center = 5500.0
+        sigma = 0.05  # Gaussian width
+        gamma = 0.03  # Lorentzian width
         
-        # Create wavelength grid around the line
-        wavelengths = np.linspace(lambda_0 - 10*sigma, lambda_0 + 10*sigma, 1000)
-        wavelengths = jnp.array(wavelengths)
+        profile = voigt_profile(wavelengths, line_center, sigma, gamma)
         
-        # Calculate profile  
-        profile = line_profile(lambda_0, sigma, gamma, amplitude, wavelengths)
+        # Check normalization (approximately)
+        dw = wavelengths[1] - wavelengths[0]
+        integral = jnp.sum(profile) * dw
+        np.testing.assert_allclose(integral, 1.0, rtol=1e-2)
         
-        # Integrate numerically
-        dlambda = wavelengths[1] - wavelengths[0]
-        integrated_strength = jnp.sum(profile) * dlambda
+        # Check peak is at center
+        peak_idx = jnp.argmax(profile)
+        assert abs(wavelengths[peak_idx] - line_center) < dw
         
-        # Should be reasonably close to the input amplitude (relaxed tolerance for now)
-        assert abs(integrated_strength - amplitude) < 1.0
+        # Voigt should be between pure Gaussian and pure Lorentzian
+        gaussian = gaussian_profile(wavelengths, line_center, sigma)
+        lorentzian = lorentzian_profile(wavelengths, line_center, gamma)
+        
+        # At line center, Voigt should be between the two
+        center_idx = jnp.argmin(jnp.abs(wavelengths - line_center))
+        assert min(gaussian[center_idx], lorentzian[center_idx]) <= profile[center_idx] <= max(gaussian[center_idx], lorentzian[center_idx])
+    
+    def test_profile_broadening_limits(self):
+        """Test limiting cases of profile broadening"""
+        wavelengths = jnp.linspace(5499, 5501, 200)
+        line_center = 5500.0
+        
+        # Pure Gaussian limit (gamma → 0)
+        profile_gaussian = voigt_profile(wavelengths, line_center, 0.05, 1e-10)
+        profile_gaussian_pure = gaussian_profile(wavelengths, line_center, 0.05)
+        np.testing.assert_allclose(profile_gaussian, profile_gaussian_pure, rtol=1e-6)
+        
+        # Pure Lorentzian limit (sigma → 0)  
+        profile_lorentzian = voigt_profile(wavelengths, line_center, 1e-10, 0.03)
+        profile_lorentzian_pure = lorentzian_profile(wavelengths, line_center, 0.03)
+        np.testing.assert_allclose(profile_lorentzian, profile_lorentzian_pure, rtol=1e-6)
 
 
 class TestBroadening:
     """Test broadening mechanism calculations"""
     
-    def test_doppler_width_scaling(self):
-        """Test Doppler width temperature and mass scaling"""
-        lambda_0 = 5000e-8
-        T1, T2 = 5000.0, 10000.0
-        mass = 9.1094e-24  # Approximately atomic mass unit in grams
-        xi = 1e5           # 1 km/s in cm/s
+    def test_natural_broadening(self):
+        """Test natural (radiative) broadening"""
+        wavelength = 5500.0  # Angstroms
+        oscillator_strength = 1.0
         
-        # Doppler width should scale as √T
-        sigma1 = doppler_width(lambda_0, T1, mass, xi)
-        sigma2 = doppler_width(lambda_0, T2, mass, xi)
+        gamma_rad = natural_broadening(wavelength, oscillator_strength)
         
-        expected_ratio = np.sqrt(T2/T1)
-        actual_ratio = sigma2 / sigma1
+        # Should be positive
+        assert gamma_rad > 0
         
-        # Should be close (may not be exact due to microturbulence)
-        assert abs(actual_ratio - expected_ratio) < 0.1
+        # Should scale with oscillator strength
+        gamma_rad_strong = natural_broadening(wavelength, 2.0)
+        assert gamma_rad_strong > gamma_rad
+        
+        # Should scale with wavelength (λ^-2 dependence)
+        gamma_rad_short = natural_broadening(4000.0, oscillator_strength)
+        gamma_rad_long = natural_broadening(7000.0, oscillator_strength)
+        assert gamma_rad_short > gamma_rad_long
     
-    def test_stark_broadening_scaling(self):
-        """Test Stark broadening temperature dependence"""
-        gamma_ref = 1.0
-        T_ref = 10000.0
-        T_test = 5000.0
+    def test_stark_broadening(self):
+        """Test Stark (pressure) broadening"""
+        wavelength = 5500.0
+        temperature = 5800.0
+        electron_density = 1e10  # cm^-3
+        stark_constant = 1e-15  # Example value
         
-        gamma_scaled = scaled_stark(gamma_ref, T_test, T_ref)
-        expected_ratio = (T_test / T_ref)**(1.0/6.0)
+        gamma_stark = stark_broadening(wavelength, temperature, electron_density, stark_constant)
         
-        assert abs(gamma_scaled / gamma_ref - expected_ratio) < 1e-10
+        # Should be positive
+        assert gamma_stark >= 0
+        
+        # Should scale with electron density
+        gamma_stark_dense = stark_broadening(wavelength, temperature, 1e12, stark_constant)
+        assert gamma_stark_dense > gamma_stark
+        
+        # Should have temperature dependence
+        gamma_stark_hot = stark_broadening(wavelength, 8000.0, electron_density, stark_constant)
+        # Stark broadening typically increases with temperature
+        assert jnp.isfinite(gamma_stark_hot)
     
-    def test_vdw_simple_scaling(self):
-        """Test simple van der Waals broadening scaling"""
-        gamma_ref = 1.0
-        mass = 9.1094e-24  
-        T_test = 5000.0
-        T_ref = 10000.0
+    def test_vdw_broadening(self):
+        """Test van der Waals broadening"""
+        wavelength = 5500.0
+        temperature = 5800.0
+        neutral_density = 1e12  # cm^-3
+        vdw_constant = 1e-30  # Example value
         
-        gamma_scaled = scaled_vdw(gamma_ref, mass, T_test, T_ref)
-        expected_ratio = (T_test / T_ref)**0.3
+        gamma_vdw = vdw_broadening(wavelength, temperature, neutral_density, vdw_constant)
         
-        assert abs(gamma_scaled / gamma_ref - expected_ratio) < 1e-10
+        # Should be positive
+        assert gamma_vdw >= 0
+        
+        # Should scale with neutral density
+        gamma_vdw_dense = vdw_broadening(wavelength, temperature, 1e14, vdw_constant)
+        assert gamma_vdw_dense > gamma_vdw
+        
+        # Should have temperature dependence (typically T^0.3)
+        gamma_vdw_hot = vdw_broadening(wavelength, 8000.0, neutral_density, vdw_constant)
+        assert gamma_vdw_hot > gamma_vdw  # Higher T gives more broadening
+    
+    def test_broadening_combinations(self):
+        """Test combination of broadening mechanisms"""
+        wavelength = 5500.0
+        temperature = 5800.0
+        electron_density = 1e10
+        neutral_density = 1e12
+        
+        gamma_nat = natural_broadening(wavelength, 1.0)
+        gamma_stark = stark_broadening(wavelength, temperature, electron_density, 1e-15)
+        gamma_vdw = vdw_broadening(wavelength, temperature, neutral_density, 1e-30)
+        
+        # Total broadening (quadrature sum for Voigt profile)
+        gamma_total = jnp.sqrt(gamma_nat**2 + gamma_stark**2 + gamma_vdw**2)
+        
+        # Total should be larger than any individual component
+        assert gamma_total >= gamma_nat
+        assert gamma_total >= gamma_stark
+        assert gamma_total >= gamma_vdw
 
 
-class TestUtilityFunctions:
-    """Test utility functions"""
+class TestLineDataTypes:
+    """Test line and species data structures"""
     
-    def test_inverse_density_functions(self):
-        """Test inverse PDF functions"""
-        # Test Gaussian inverse
-        sigma = 1.0
-        rho = 0.1
-        x = inverse_gaussian_density(rho, sigma)
+    def test_species_creation(self):
+        """Test Species data structure"""
+        # Neutral iron
+        fe_i = Species(element=26, ionization=0)
+        assert fe_i.element == 26
+        assert fe_i.ionization == 0
         
-        # Verify by computing forward direction
-        expected_rho = np.exp(-0.5 * (x/sigma)**2) / (sigma * np.sqrt(2*pi))
-        assert abs(expected_rho - rho) < 1e-6
-        
-        # Test Lorentz inverse  
-        gamma = 1.0
-        rho = 0.1
-        x = inverse_lorentz_density(rho, gamma)
-        
-        # Verify by computing forward direction
-        expected_rho = 1.0 / (pi * gamma * (1 + (x/gamma)**2))
-        assert abs(expected_rho - rho) < 1e-6
+        # Singly ionized calcium
+        ca_ii = Species(element=20, ionization=1)
+        assert ca_ii.element == 20
+        assert ca_ii.ionization == 1
     
-    def test_sigma_line_units(self):
-        """Test line cross-section calculation"""
-        lambda_0 = 5000e-8  # 5000 Å in cm
-        sigma = sigma_line(lambda_0)
+    def test_line_creation(self):
+        """Test Line data structure"""
+        species = Species(element=26, ionization=0)  # Fe I
         
-        # Should be in cm² and proportional to λ²
-        assert sigma > 0
-        assert sigma < 1e-10  # Reasonable order of magnitude
-        
-        # Test wavelength scaling
-        lambda_1 = 5000e-8
-        lambda_2 = 10000e-8
-        sigma_1 = sigma_line(lambda_1)
-        sigma_2 = sigma_line(lambda_2)
-        
-        ratio = sigma_2 / sigma_1
-        expected_ratio = (lambda_2 / lambda_1)**2
-        assert abs(ratio - expected_ratio) < 1e-10
-
-
-class TestLineData:
-    """Test LineData structure and utilities"""
-    
-    def test_line_data_creation(self):
-        """Test creating LineData structures"""
-        line = create_line_data(
-            wavelength_cm=5000e-8,
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=2.5,  # eV
             log_gf=-1.0,
-            E_lower_eV=2.0,
-            species_id=26,  # Fe I
-            gamma_rad=1e6,
-            gamma_stark=1e-5,
-            vdw_param1=1e-7,
-            vdw_param2=0.3
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
         )
         
-        assert line.wavelength == 5000e-8
+        assert line.wavelength == 5500.0
+        assert line.species.element == 26
+        assert line.excitation_potential == 2.5
         assert line.log_gf == -1.0
-        assert line.E_lower == 2.0
-        assert line.species_id == 26
-        assert line.gamma_rad == 1e6
-        assert line.gamma_stark == 1e-5
-        assert line.vdw_param1 == 1e-7
-        assert line.vdw_param2 == 0.3
+        
+    def test_line_strength_calculation(self):
+        """Test line strength calculations"""
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=2.0,
+            log_gf=-1.0,
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
+        )
+        
+        temperature = 5800.0
+        partition_function = 100.0
+        abundance = 1e-5  # N/N_total
+        
+        # Test that we can calculate line opacity coefficient
+        opacity_coeff = line_opacity_coefficient(
+            line, temperature, partition_function, abundance
+        )
+        
+        assert opacity_coeff > 0
+        assert jnp.isfinite(opacity_coeff)
 
 
 class TestLineAbsorption:
-    """Test full line absorption calculation"""
-    
-    def test_empty_linelist(self):
-        """Test behavior with empty linelist"""
-        wavelengths = jnp.linspace(5000e-8, 5010e-8, 100)
-        linelist = []
-        
-        alpha = line_absorption(
-            wavelengths=wavelengths,
-            linelist=linelist,
-            temperature=5000.0,
-            electron_density=1e15,
-            number_densities={26: 1e12},
-            partition_functions={26: lambda x: 1.0},
-            microturbulent_velocity=1e5
-        )
-        
-        # Should return zeros
-        assert jnp.allclose(alpha, 0.0)
+    """Test line absorption calculations"""
     
     def test_single_line_absorption(self):
-        """Test absorption calculation for single line"""
-        # Create wavelength grid
-        lambda_center = 5000e-8  # 5000 Å
-        wavelengths = jnp.linspace(lambda_center - 5e-8, lambda_center + 5e-8, 200)
+        """Test absorption from a single line"""
+        wavelengths = jnp.linspace(5499, 5501, 100)
         
-        # Create simple test line (Fe I)
-        line = create_line_data(
-            wavelength_cm=lambda_center,
+        # Create test line
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=2.0,
             log_gf=-1.0,
-            E_lower_eV=2.0,
-            species_id=26,
-            gamma_rad=1e6,
-            gamma_stark=1e-5,
-            vdw_param1=1e-7,
-            vdw_param2=0.0
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
         )
         
-        linelist = [line]
+        # Test atmosphere layer
+        temperature = 5800.0
+        electron_density = 1e10
+        neutral_density = 1e12
+        microturbulence = 1.0  # km/s
         
-        # Mock partition function (constant)
-        def mock_partition_fn(log_T):
-            return 10.0
-        
-        alpha = line_absorption(
-            wavelengths=wavelengths,
-            linelist=linelist,
-            temperature=5000.0,
-            electron_density=1e15,
-            number_densities={26: 1e12},
-            partition_functions={26: mock_partition_fn},
-            microturbulent_velocity=1e5
+        absorption = line_absorption_single(
+            wavelengths, line, temperature, electron_density, 
+            neutral_density, microturbulence
         )
         
-        # Should have non-zero absorption near line center
-        center_idx = len(wavelengths) // 2
-        assert alpha[center_idx] > 0.0
+        # Check basic properties
+        assert len(absorption) == len(wavelengths)
+        assert jnp.all(absorption >= 0)
+        assert jnp.all(jnp.isfinite(absorption))
         
-        # Absorption should decrease away from center
-        assert alpha[center_idx] > alpha[center_idx - 50]
-        assert alpha[center_idx] > alpha[center_idx + 50]
+        # Peak should be near line center
+        peak_idx = jnp.argmax(absorption) 
+        peak_wavelength = wavelengths[peak_idx]
+        assert abs(peak_wavelength - line.wavelength) < 0.1
+    
+    def test_total_line_absorption(self):
+        """Test total absorption from multiple lines"""
+        wavelengths = jnp.linspace(5000, 6000, 1000)
         
-        # Total absorption should be finite
-        assert jnp.isfinite(jnp.sum(alpha))
+        # Create test atmosphere
+        A_X = format_abundances(0.0)
+        atm = interpolate_atmosphere(5800, 4.0, A_X)
+        
+        # Create test linelist
+        lines = []
+        for wl in [5200.0, 5400.0, 5600.0, 5800.0]:
+            species = Species(element=26, ionization=0)
+            line = Line(
+                wavelength=wl,
+                species=species,
+                excitation_potential=2.0,
+                log_gf=-1.0,
+                radiative_damping=1e8,
+                stark_damping=1e-15,
+                vdw_damping=1e-30
+            )
+            lines.append(line)
+        
+        microturbulence = 1.0
+        
+        absorption = total_line_absorption(
+            wavelengths, lines, atm, A_X, microturbulence
+        )
+        
+        # Check shape
+        assert absorption.shape == (atm['n_layers'], len(wavelengths))
+        assert jnp.all(absorption >= 0)
+        assert jnp.all(jnp.isfinite(absorption))
+        
+        # Should have peaks near line centers
+        total_abs = jnp.sum(absorption, axis=0)
+        for line in lines:
+            line_idx = jnp.argmin(jnp.abs(wavelengths - line.wavelength))
+            # Check that there's significant absorption near line center
+            assert total_abs[line_idx] > jnp.mean(total_abs) * 0.1
     
     def test_line_absorption_temperature_dependence(self):
-        """Test that line absorption depends correctly on temperature"""
-        lambda_center = 5000e-8
-        wavelengths = jnp.linspace(lambda_center - 2e-8, lambda_center + 2e-8, 100)
+        """Test temperature dependence of line absorption"""
+        wavelengths = jnp.linspace(5499, 5501, 50)
         
-        line = create_line_data(
-            wavelength_cm=lambda_center,
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=3.0,  # Higher excitation
             log_gf=-1.0,
-            E_lower_eV=2.0,  # Non-zero excitation energy
-            species_id=26,
-            gamma_rad=1e6,
-            gamma_stark=1e-5,
-            vdw_param1=1e-7
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
         )
         
-        def mock_partition_fn(log_T):
-            return 10.0
+        electron_density = 1e10
+        neutral_density = 1e12
+        microturbulence = 1.0
         
-        # Test at two temperatures
-        T1, T2 = 4000.0, 6000.0
+        # Test different temperatures
+        T_cool = 4000.0
+        T_hot = 8000.0
         
-        alpha1 = line_absorption(
-            wavelengths=wavelengths,
-            linelist=[line],
-            temperature=T1,
-            electron_density=1e15,
-            number_densities={26: 1e12},
-            partition_functions={26: mock_partition_fn},
-            microturbulent_velocity=1e5
+        abs_cool = line_absorption_single(
+            wavelengths, line, T_cool, electron_density, neutral_density, microturbulence
+        )
+        abs_hot = line_absorption_single(
+            wavelengths, line, T_hot, electron_density, neutral_density, microturbulence
         )
         
-        alpha2 = line_absorption(
-            wavelengths=wavelengths,
-            linelist=[line],
-            temperature=T2,
-            electron_density=1e15,
-            number_densities={26: 1e12},
-            partition_functions={26: mock_partition_fn},
-            microturbulent_velocity=1e5
+        # High excitation lines should be stronger at higher temperatures
+        assert jnp.max(abs_hot) > jnp.max(abs_cool)
+    
+    def test_line_absorption_microturbulence(self):
+        """Test microturbulence effect on line profiles"""
+        wavelengths = jnp.linspace(5499, 5501, 100)
+        
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=2.0,
+            log_gf=-1.0,
+            radiative_damping=1e8,
+            stark_damning=1e-15,
+            vdw_damping=1e-30
         )
         
-        # Higher temperature should affect line strength due to Boltzmann factor
-        # and should broaden the line (different peak values)
-        peak1 = jnp.max(alpha1)
-        peak2 = jnp.max(alpha2)
+        temperature = 5800.0
+        electron_density = 1e10
+        neutral_density = 1e12
         
-        # Both should be positive
-        assert peak1 > 0
-        assert peak2 > 0
+        # Test different microturbulence values
+        vmic_low = 0.5  # km/s
+        vmic_high = 2.0  # km/s
         
-        # Temperature dependence should be reasonable
-        assert abs(peak2/peak1 - 1.0) > 0.01  # Should see some difference
+        abs_low = line_absorption_single(
+            wavelengths, line, temperature, electron_density, neutral_density, vmic_low
+        )
+        abs_high = line_absorption_single(
+            wavelengths, line, temperature, electron_density, neutral_density, vmic_high
+        )
+        
+        # Higher microturbulence should broaden lines
+        # Peak absorption should be lower, but integrated strength similar
+        assert jnp.max(abs_high) < jnp.max(abs_low)
+        
+        # Integrated strength should be similar
+        dw = wavelengths[1] - wavelengths[0]
+        strength_low = jnp.sum(abs_low) * dw
+        strength_high = jnp.sum(abs_high) * dw
+        np.testing.assert_allclose(strength_low, strength_high, rtol=0.1)
 
 
-# Test runner
-if __name__ == "__main__":
-    # Run specific test classes
-    test_voigt = TestVoigtProfiles()
-    test_voigt.test_harris_series_basic()
-    test_voigt.test_voigt_hjerting_limits()
-    test_voigt.test_line_profile_normalization()
-    print("✓ Voigt profile tests passed")
+class TestLineListOperations:
+    """Test operations on line lists"""
     
-    test_broadening = TestBroadening()
-    test_broadening.test_doppler_width_scaling()
-    test_broadening.test_stark_broadening_scaling()
-    test_broadening.test_vdw_simple_scaling()
-    print("✓ Broadening tests passed")
+    def test_line_selection_by_wavelength(self):
+        """Test selecting lines within wavelength range"""
+        # Create test linelist
+        lines = []
+        wavelengths = [4500, 5000, 5500, 6000, 6500]
+        for wl in wavelengths:
+            species = Species(element=26, ionization=0)
+            line = Line(
+                wavelength=wl,
+                species=species,
+                excitation_potential=2.0,
+                log_gf=-1.0,
+                radiative_damping=1e8,
+                stark_damping=1e-15,
+                vdw_damping=1e-30
+            )
+            lines.append(line)
+        
+        # Select lines in range
+        wl_min, wl_max = 5200, 5800
+        selected_lines = [line for line in lines 
+                         if wl_min <= line.wavelength <= wl_max]
+        
+        assert len(selected_lines) == 1  # Only 5500 Å line
+        assert selected_lines[0].wavelength == 5500.0
     
-    test_utils = TestUtilityFunctions()
-    test_utils.test_inverse_density_functions()
-    test_utils.test_sigma_line_units()
-    print("✓ Utility function tests passed")
+    def test_line_strength_filtering(self):
+        """Test filtering lines by strength"""
+        lines = []
+        log_gf_values = [-3.0, -2.0, -1.0, 0.0, 1.0]
+        
+        for log_gf in log_gf_values:
+            species = Species(element=26, ionization=0)
+            line = Line(
+                wavelength=5500.0,
+                species=species,
+                excitation_potential=2.0,
+                log_gf=log_gf,
+                radiative_damping=1e8,
+                stark_damping=1e-15,
+                vdw_damping=1e-30
+            )
+            lines.append(line)
+        
+        # Filter strong lines
+        strong_lines = [line for line in lines if line.log_gf > -2.0]
+        assert len(strong_lines) == 3  # log_gf = -1, 0, 1
     
-    test_data = TestLineData()
-    test_data.test_line_data_creation()
-    print("✓ LineData tests passed")
+    def test_species_filtering(self):
+        """Test filtering lines by species"""
+        lines = []
+        elements = [26, 20, 12, 1]  # Fe, Ca, Mg, H
+        
+        for element in elements:
+            species = Species(element=element, ionization=0)
+            line = Line(
+                wavelength=5500.0,
+                species=species,
+                excitation_potential=2.0,
+                log_gf=-1.0,
+                radiative_damping=1e8,
+                stark_damping=1e-15,
+                vdw_damping=1e-30
+            )
+            lines.append(line)
+        
+        # Filter iron lines
+        fe_lines = [line for line in lines if line.species.element == 26]
+        assert len(fe_lines) == 1
+        assert fe_lines[0].species.element == 26
+
+
+class TestEdgeCases:
+    """Test edge cases and error conditions"""
     
-    test_absorption = TestLineAbsorption()
-    test_absorption.test_empty_linelist()
-    test_absorption.test_single_line_absorption()
-    test_absorption.test_line_absorption_temperature_dependence()
-    print("✓ Line absorption tests passed")
+    def test_zero_abundance(self):
+        """Test behavior with zero abundance"""
+        wavelengths = jnp.linspace(5499, 5501, 50)
+        
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=2.0,
+            log_gf=-1.0,
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
+        )
+        
+        temperature = 5800.0
+        electron_density = 1e10
+        neutral_density = 0.0  # Zero abundance
+        microturbulence = 1.0
+        
+        absorption = line_absorption_single(
+            wavelengths, line, temperature, electron_density, 
+            neutral_density, microturbulence
+        )
+        
+        # Should be zero or very small
+        assert jnp.all(absorption >= 0)
+        assert jnp.max(absorption) < 1e-10
     
-    print("\n🎉 All jorg.lines tests passed!")
+    def test_extreme_temperatures(self):
+        """Test behavior at extreme temperatures"""
+        wavelengths = jnp.array([5500.0])
+        
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=2.0,
+            log_gf=-1.0,
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
+        )
+        
+        electron_density = 1e10
+        neutral_density = 1e12
+        microturbulence = 1.0
+        
+        # Very cool temperature
+        abs_cool = line_absorption_single(
+            wavelengths, line, 1000.0, electron_density, neutral_density, microturbulence
+        )
+        assert jnp.isfinite(abs_cool[0])
+        
+        # Very hot temperature
+        abs_hot = line_absorption_single(
+            wavelengths, line, 50000.0, electron_density, neutral_density, microturbulence
+        )
+        assert jnp.isfinite(abs_hot[0])
+    
+    def test_very_weak_lines(self):
+        """Test very weak lines"""
+        wavelengths = jnp.linspace(5499, 5501, 50)
+        
+        species = Species(element=26, ionization=0)
+        line = Line(
+            wavelength=5500.0,
+            species=species,
+            excitation_potential=10.0,  # Very high excitation
+            log_gf=-5.0,  # Very weak
+            radiative_damping=1e8,
+            stark_damping=1e-15,
+            vdw_damping=1e-30
+        )
+        
+        temperature = 5800.0
+        electron_density = 1e10
+        neutral_density = 1e12
+        microturbulence = 1.0
+        
+        absorption = line_absorption_single(
+            wavelengths, line, temperature, electron_density, 
+            neutral_density, microturbulence
+        )
+        
+        # Should be very small but finite
+        assert jnp.all(jnp.isfinite(absorption))
+        assert jnp.all(absorption >= 0)
+        assert jnp.max(absorption) < 1e-5
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

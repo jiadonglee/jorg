@@ -1,270 +1,281 @@
-# Jorg Project Structure
+# Jorg Project Structure Documentation
 
-This document outlines the planned directory structure and organization for the Jorg (JAX-based Korg) project.
+This document provides a comprehensive overview of the Jorg project organization, including the rationale behind the structure, dependency relationships, and development workflow.
 
-## Directory Structure
+## 📁 Directory Structure
 
 ```
 Jorg/
-├── README.md                     # Project overview and quick start
-├── ROADMAP.md                    # Development roadmap and timeline
-├── ARCHITECTURE.md               # Technical architecture analysis
-├── project_structure.md          # This file
-├── LICENSE                       # MIT License
-├── setup.py                      # Package configuration
-├── pyproject.toml               # Modern Python packaging
-├── requirements.txt             # Core dependencies
-├── requirements-dev.txt         # Development dependencies
-├── requirements-gpu.txt         # GPU-specific dependencies
-├── .gitignore                   # Git ignore patterns
-├── .github/                     # GitHub workflows and templates
-│   ├── workflows/
-│   │   ├── ci.yml              # Continuous integration tests
-│   │   ├── gpu-tests.yml       # GPU-specific testing
-│   │   └── benchmarks.yml      # Performance benchmarking
-│   └── ISSUE_TEMPLATE.md       # Issue templates
+├── 📄 README.md                          # Project overview and quick start
+├── 📄 LICENSE                            # MIT license
+├── 📄 pyproject.toml                     # Modern Python packaging configuration
+├── 📄 setup.py                           # Setuptools compatibility
+├── 📄 .gitignore                         # Git ignore patterns
+├── 📄 PROJECT_STRUCTURE.md               # This file
 │
-├── jorg/                        # Main package directory
-│   ├── __init__.py             # Package initialization and main API
-│   ├── version.py              # Version information
-│   ├── constants.py            # Physical constants and unit conversions
+├── 📁 src/jorg/                          # 🎯 Main package source code
+│   ├── 📄 __init__.py                    # Package initialization and main API
+│   ├── 📄 synthesis.py                   # High-level synthesis interface
+│   ├── 📄 constants.py                   # Physical constants and unit conversions
 │   │
-│   ├── synthesis.py            # High-level synthesis interfaces
-│   │   # synth(), synthesize(), batch_synth()
+│   ├── 📁 continuum/                     # Continuum absorption calculations
+│   │   ├── 📄 __init__.py                # Module exports
+│   │   ├── 📄 core.py                    # Main total_continuum_absorption()
+│   │   ├── 📄 hydrogen.py                # H I, H⁻ bound-free and free-free
+│   │   ├── 📄 helium.py                  # He I, He II absorption
+│   │   ├── 📄 scattering.py              # Thomson, Rayleigh scattering
+│   │   └── 📄 utils.py                   # Continuum-specific utilities
 │   │
-│   ├── continuum/              # Continuum absorption calculations
-│   │   ├── __init__.py
-│   │   ├── core.py            # Main total_continuum_absorption()
-│   │   ├── hydrogen.py        # H I, H⁻ absorption
-│   │   ├── helium.py          # He I, He II absorption
-│   │   ├── metals.py          # Metal bound-free absorption
-│   │   ├── scattering.py      # Thomson, Rayleigh scattering
-│   │   └── positive_ions.py   # Free-free from positive ions
+│   ├── 📁 lines/                         # Line absorption calculations
+│   │   ├── 📄 __init__.py                # Module exports
+│   │   ├── 📄 core.py                    # Main line_absorption() functions
+│   │   ├── 📄 hydrogen_lines.py          # 🌟 Sophisticated hydrogen line treatment
+│   │   ├── 📄 hydrogen_lines_simple.py   # Simplified hydrogen lines (Balmer focus)
+│   │   ├── 📄 linelist.py                # Linelist reading and parsing
+│   │   ├── 📄 opacity.py                 # Line opacity calculations
+│   │   ├── 📄 profiles.py                # Voigt, Gaussian, Lorentzian profiles
+│   │   ├── 📄 broadening.py              # Doppler, van der Waals, Stark broadening
+│   │   ├── 📄 species.py                 # Species identification and handling
+│   │   └── 📄 utils.py                   # Line-specific utilities
 │   │
-│   ├── lines/                  # Line absorption calculations
-│   │   ├── __init__.py
-│   │   ├── core.py            # Main line_absorption() function
-│   │   ├── profiles.py        # Voigt, Lorentzian, Gaussian profiles
-│   │   ├── broadening.py      # Doppler, Stark, van der Waals broadening
-│   │   ├── hydrogen_lines.py  # Special hydrogen line treatment
-│   │   └── molecular.py       # Molecular line absorption
+│   ├── 📁 utils/                         # General utility functions
+│   │   ├── 📄 __init__.py                # Utility exports
+│   │   ├── 📄 math.py                    # Mathematical functions and safe operations
+│   │   └── 📄 wavelength_utils.py        # Wavelength/frequency conversions
 │   │
-│   ├── rt/                     # Radiative transfer
-│   │   ├── __init__.py
-│   │   ├── core.py            # Main radiative_transfer() function
-│   │   ├── schemes.py         # Linear, Bezier integration schemes
-│   │   ├── geometry.py        # Ray calculation for different geometries
-│   │   └── intensity.py       # Intensity computation methods
-│   │
-│   ├── statmech/               # Statistical mechanics and equilibrium
-│   │   ├── __init__.py
-│   │   ├── equilibrium.py     # Chemical equilibrium solver
-│   │   ├── partition.py       # Partition function calculations
-│   │   ├── ionization.py      # Saha equation and ionization balance
-│   │   └── molecular.py       # Molecular equilibrium
-│   │
-│   ├── atmosphere/             # Atmospheric model handling
-│   │   ├── __init__.py
-│   │   ├── models.py          # Atmosphere data structures
-│   │   ├── interpolation.py   # MARCS interpolation
-│   │   ├── io.py              # Atmosphere file I/O
-│   │   └── structure.py       # Atmospheric layer calculations
-│   │
-│   ├── data/                   # Data handling and species management
-│   │   ├── __init__.py
-│   │   ├── loaders.py         # File I/O utilities
-│   │   ├── species.py         # Species definitions and registry
-│   │   ├── linelists.py       # Line list handling
-│   │   ├── abundances.py      # Abundance patterns
-│   │   └── atomic_data.py     # Atomic/molecular data management
-│   │
-│   ├── utils/                  # Utility functions
-│   │   ├── __init__.py
-│   │   ├── math.py            # Mathematical functions (Voigt, expint, etc.)
-│   │   ├── interpolation.py   # Interpolation routines
-│   │   ├── units.py           # Unit conversions
-│   │   ├── wavelengths.py     # Wavelength/frequency handling
-│   │   └── validation.py      # Input validation and error checking
-│   │
-│   └── optimization/           # JAX-specific optimizations
-│       ├── __init__.py
-│       ├── batching.py        # Batched operations and vmapping
-│       ├── gradients.py       # Custom gradient implementations
-│       ├── memory.py          # Memory optimization utilities
-│       └── compilation.py     # JIT compilation helpers
+│   └── 📁 data/                          # Package data files
+│       └── 📄 mclaughlin_hminus.json     # H⁻ absorption data
 │
-├── tests/                      # Test suite
-│   ├── __init__.py
-│   ├── conftest.py            # Pytest configuration and fixtures
-│   ├── test_synthesis.py      # High-level synthesis tests
-│   ├── test_continuum/        # Continuum absorption tests
-│   │   ├── test_hydrogen.py
-│   │   ├── test_helium.py
-│   │   ├── test_metals.py
-│   │   └── test_scattering.py
-│   ├── test_lines/            # Line absorption tests
-│   │   ├── test_profiles.py
-│   │   ├── test_broadening.py
-│   │   └── test_hydrogen_lines.py
-│   ├── test_rt/               # Radiative transfer tests
-│   │   ├── test_transfer.py
-│   │   └── test_schemes.py
-│   ├── test_statmech/         # Statistical mechanics tests
-│   │   ├── test_equilibrium.py
-│   │   └── test_partition.py
-│   ├── test_utils/            # Utility function tests
-│   │   ├── test_math.py
-│   │   └── test_interpolation.py
-│   ├── reference/             # Reference data for validation
-│   │   ├── korg_outputs/      # Reference outputs from Korg.jl
-│   │   └── test_spectra/      # Test stellar spectra
-│   └── integration/           # Full integration tests
-│       ├── test_accuracy.py   # Accuracy vs Korg.jl
-│       ├── test_performance.py # Performance benchmarks
-│       └── test_physics.py    # Physical sanity checks
+├── 📁 tests/                             # 🧪 Test suite
+│   ├── 📄 __init__.py                    # Test package initialization
+│   ├── 📄 conftest.py                    # Pytest configuration and fixtures
+│   │
+│   ├── 📁 unit/                          # Unit tests for individual modules
+│   │   ├── 📄 __init__.py
+│   │   ├── 📁 continuum/                 # Continuum module tests
+│   │   │   ├── 📄 __init__.py
+│   │   │   └── 📄 test_continuum.py
+│   │   ├── 📁 lines/                     # Line module tests
+│   │   │   ├── 📄 __init__.py
+│   │   │   ├── 📄 test_lines.py
+│   │   │   ├── 📄 test_linelist_reading.py
+│   │   │   └── 📄 test_voigt_accuracy.py
+│   │   └── 📁 utils/                     # Utility tests
+│   │       └── 📄 __init__.py
+│   │
+│   ├── 📁 integration/                   # Integration and end-to-end tests
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 test_accuracy.py           # Accuracy vs Korg.jl comparison
+│   │   ├── 📄 test_korg_jorg_comparison.py # Detailed comparison tests
+│   │   └── 📄 test_plotting.py           # Visualization tests
+│   │
+│   └── 📁 fixtures/                      # Test data and reference outputs
+│       ├── 📄 __init__.py
+│       ├── 📄 generate_korg_reference.py # Reference data generation
+│       └── 📁 reference_data/            # Korg.jl reference outputs
+│           ├── 📄 korg_detailed_reference.json
+│           ├── 📄 korg_reference_data.json
+│           ├── 📄 korg_reference_voigt.json
+│           └── 📄 lines_comparison_summary.json
 │
-├── benchmarks/                 # Performance benchmarking
-│   ├── __init__.py
-│   ├── run_benchmarks.py      # Main benchmark runner
-│   ├── synthesis_bench.py     # Synthesis performance tests
-│   ├── memory_bench.py        # Memory usage benchmarks
-│   ├── gpu_scaling.py         # Multi-GPU scaling tests
-│   └── comparison_plots.py    # Visualization of benchmark results
+├── 📁 examples/                          # 📚 Usage examples and tutorials
+│   └── 📄 basic_linelist_usage.py        # Linelist reading example
 │
-├── examples/                   # Usage examples and tutorials
-│   ├── __init__.py
-│   ├── basic_synthesis.py     # Simple synthesis example
-│   ├── parameter_fitting.py   # Gradient-based fitting example
-│   ├── batch_processing.py    # Batch synthesis example
-│   ├── gpu_acceleration.py    # GPU usage examples
-│   ├── custom_atmospheres.py  # Custom atmosphere models
-│   └── notebooks/             # Jupyter notebooks
-│       ├── tutorial.ipynb     # Getting started tutorial
-│       ├── performance.ipynb  # Performance comparison
-│       └── fitting.ipynb      # Parameter fitting examples
+├── 📁 benchmarks/                        # ⚡ Performance benchmarking
+│   ├── 📄 speed_comparison.py            # Jorg vs Korg speed comparison
+│   └── 📄 linelist_reading_benchmark.py  # Linelist I/O performance
 │
-├── docs/                       # Documentation
-│   ├── conf.py                # Sphinx configuration
-│   ├── index.rst             # Documentation main page
-│   ├── installation.rst      # Installation instructions
-│   ├── quickstart.rst        # Quick start guide
-│   ├── api/                  # API documentation
-│   │   ├── synthesis.rst
-│   │   ├── continuum.rst
-│   │   ├── lines.rst
-│   │   ├── rt.rst
-│   │   └── utils.rst
-│   ├── tutorials/            # Detailed tutorials
-│   │   ├── basic_usage.rst
-│   │   ├── advanced_features.rst
-│   │   └── performance_tips.rst
-│   ├── theory/               # Theoretical background
-│   │   ├── stellar_atmospheres.rst
-│   │   ├── radiative_transfer.rst
-│   │   └── line_formation.rst
-│   └── development/          # Development documentation
-│       ├── contributing.rst
-│       ├── architecture.rst
-│       └── testing.rst
+├── 📁 scripts/                           # 🔧 Development and utility scripts
+│   ├── 📄 debug_vald_parser.py           # VALD parser debugging
+│   ├── 📄 generate_korg_reference.jl     # Reference data generation (Julia)
+│   ├── 📄 korg_linelist_benchmark.jl     # Korg benchmarking (Julia)
+│   └── 📄 simple_korg_benchmark.jl       # Simple Korg timing (Julia)
 │
-├── data/                       # Data files (not in git, downloaded separately)
-│   ├── atmospheres/           # MARCS atmosphere models
-│   ├── linelists/            # Atomic and molecular line lists
-│   ├── atomic_data/          # Partition functions, ionization energies
-│   └── molecular_data/       # Molecular cross-sections
+├── 📁 docs/                              # 📖 Documentation
+│   ├── 📁 source/                        # Sphinx source files
+│   │   ├── 📄 ARCHITECTURE.md
+│   │   ├── 📄 LINES_IMPLEMENTATION_SUMMARY.md
+│   │   ├── 📄 ORGANIZATION_SUMMARY.md
+│   │   ├── 📄 project_structure.md
+│   │   ├── 📄 ROADMAP.md
+│   │   └── 📄 SPEED_TEST_RESULTS.md
+│   ├── 📁 api/                           # API documentation
+│   └── 📁 tutorials/                     # User tutorials
 │
-├── scripts/                   # Utility scripts
-│   ├── setup_data.py         # Download and setup data files
-│   ├── convert_korg_data.py  # Convert Korg.jl data to JAX format
-│   ├── generate_tests.py     # Generate reference test data
-│   └── performance_profiling.py # Performance profiling utilities
-│
-└── tools/                     # Development tools
-    ├── code_generators/       # Code generation utilities
-    ├── data_converters/       # Data format conversion tools
-    └── validation/            # Validation against Korg.jl
-        ├── compare_outputs.py
-        └── generate_references.py
+└── 📁 comparison_tests/                  # 🔬 Legacy comparison tests (to be migrated)
+    ├── 📄 README.md
+    ├── 📄 component_wise_comparison.py
+    ├── 📄 create_final_comparison_plots.py
+    └── 📄 ... (other comparison scripts)
 ```
 
-## Module Organization Principles
+## 🏗️ Architectural Principles
 
-### 1. Physical Separation
-Each major physical process gets its own module:
-- `continuum/`: All continuum opacity sources
-- `lines/`: All line absorption calculations  
-- `rt/`: Radiative transfer solution
-- `statmech/`: Chemical and ionization equilibrium
+### 1. **Modular Design**
+- **Physical separation**: Each major physical process (continuum, lines, radiative transfer) has its own module
+- **Computational separation**: JAX-specific optimizations are isolated from physics algorithms
+- **Clear interfaces**: Well-defined APIs between modules
 
-### 2. Computational Separation
-JAX-specific optimizations are separated:
-- `optimization/`: JAX compilation, batching, custom gradients
-- Core physics modules focus on algorithms, not optimization
+### 2. **Dependency Hierarchy**
+```
+🌳 Dependency Tree:
+   utils/ ← Base utilities (no internal dependencies)
+      ↑
+   constants.py ← Physical constants
+      ↑
+   continuum/, lines/ ← Physics modules (depend on utils, constants)
+      ↑
+   synthesis.py ← High-level interface (depends on continuum, lines)
+      ↑
+   tests/ ← Test everything (depends on all modules)
+```
 
-### 3. Data Flow Separation
-- `data/`: Input data handling and species management
-- `atmosphere/`: Atmospheric model structures and interpolation
-- `utils/`: General utility functions
+### 3. **Source Layout (src/)**
+Following Python best practices with the `src/` layout:
+- **Prevents accidental imports** from development directory
+- **Clear separation** between source and tests
+- **Better packaging** and distribution
 
-### 4. Testing Strategy
-- Unit tests for each module
-- Integration tests for complete synthesis
-- Reference tests against Korg.jl
-- Performance benchmarks
+### 4. **Test Organization**
+- **Unit tests**: Test individual functions/classes in isolation
+- **Integration tests**: Test module interactions and end-to-end workflows
+- **Fixtures**: Shared test data and reference outputs
+- **Separate by scope**: Unit vs integration vs performance tests
 
-## Key Design Decisions
+## 🔄 Data Flow and Module Interactions
 
-### 1. Flat Module Structure
-Avoid deep nesting to keep imports simple:
+### High-Level Synthesis Flow
+```
+📊 synthesis.py
+    ↓ calls
+🌡️ continuum/core.py ← continuum/hydrogen.py, helium.py, scattering.py
+    ↓ combines with
+📊 lines/core.py ← lines/linelist.py, opacity.py, profiles.py
+    ↓ uses
+🔧 utils/math.py, wavelength_utils.py
+    ↓ references
+📐 constants.py
+```
+
+### Import Strategy
 ```python
-from jorg import synth
+# High-level user imports
+from jorg import synth, synthesize
+
+# Module-level imports
 from jorg.continuum import total_continuum_absorption
-from jorg.lines import line_absorption
+from jorg.lines import total_line_absorption, LineList
+
+# Utility imports
+from jorg.utils import air_to_vacuum, voigt_hjerting
+from jorg.constants import SPEED_OF_LIGHT, BOLTZMANN_K
 ```
 
-### 2. Functional Programming
-JAX encourages functional programming:
-- Pure functions without side effects
-- Immutable data structures
-- Clear separation of computation and state
+## 🧪 Testing Strategy
 
-### 3. Vectorization-First
-Design all functions for vectorized operation:
-```python
-# Single spectrum
-flux = synth(Teff=5778, logg=4.44, m_H=0.0, ...)
+### Test Categories
+1. **Unit Tests** (`tests/unit/`)
+   - Individual function testing
+   - Mock external dependencies
+   - Fast execution (<1s per test)
 
-# Multiple spectra (same function, vectorized inputs)
-flux = synth(Teff=[5778, 6000, 5500], logg=[4.44, 4.0, 4.5], ...)
+2. **Integration Tests** (`tests/integration/`)
+   - Multi-module interactions
+   - Accuracy vs reference implementations
+   - End-to-end synthesis workflows
+
+3. **Performance Tests** (`benchmarks/`)
+   - Speed comparisons vs Korg.jl
+   - Memory usage profiling
+   - Scaling analysis
+
+### Test Data Management
+- **Small test data**: Included in repository
+- **Large reference data**: Downloaded separately or generated on-demand
+- **Reproducible**: Version-controlled reference outputs
+
+## 📦 Package Configuration
+
+### Modern Python Packaging
+- **pyproject.toml**: Primary configuration (PEP 518/621)
+- **setup.py**: Minimal compatibility shim
+- **Optional dependencies**: GPU, development, documentation extras
+
+### Key Features
+- **Automatic version discovery**: From git tags or explicit version
+- **Entry points**: Command-line interfaces (future)
+- **Data files**: Included package data (constants, reference spectra)
+- **Comprehensive metadata**: For PyPI publication
+
+## 🔧 Development Workflow
+
+### Setup
+```bash
+# Clone and install in development mode
+git clone https://github.com/jorg-project/jorg.git
+cd jorg
+pip install -e ".[dev,docs,gpu]"
 ```
 
-### 4. Gradients as First-Class Feature
-Enable automatic differentiation throughout:
-```python
-# Any synthesis function can be differentiated
-grad_synth = jax.grad(synth, argnums=(0, 1, 2))  # w.r.t. Teff, logg, m_H
+### Common Tasks
+```bash
+# Run tests
+pytest                          # All tests
+pytest tests/unit/             # Unit tests only
+pytest -m "not slow"           # Skip slow tests
+pytest --cov=jorg             # With coverage
+
+# Code quality
+black src/ tests/              # Format code
+flake8 src/ tests/             # Lint
+mypy src/                      # Type checking
+
+# Documentation
+cd docs/ && make html          # Build docs
 ```
 
-## Development Workflow
+### Release Process
+1. **Version bump**: Update version in `src/jorg/__init__.py`
+2. **Testing**: Full test suite including slow tests
+3. **Documentation**: Update docs and changelog
+4. **Build**: `python -m build`
+5. **Publish**: `twine upload dist/*`
 
-### 1. Module Development Order
-1. `utils/math.py` - Core mathematical functions
-2. `data/` - Data structures and loading
-3. `continuum/` - Continuum absorption (well-defined physics)
-4. `lines/` - Line absorption (most complex, highest impact)
-5. `rt/` - Radiative transfer (integration of above)
-6. `synthesis.py` - High-level interfaces
+## 🎯 Future Enhancements
 
-### 2. Testing Strategy
-- Write tests alongside each module
-- Use reference data from Korg.jl for validation
-- Continuous integration with CPU and GPU testing
-- Performance regression testing
+### Planned Additions
+- **Radiative Transfer Module** (`src/jorg/rt/`)
+- **Atmosphere Interpolation** (`src/jorg/atmosphere/`)
+- **Statistical Mechanics** (`src/jorg/statmech/`)
+- **Optimization Utilities** (`src/jorg/optimization/`)
 
-### 3. Documentation
-- Docstrings for all public functions
-- Sphinx-generated API documentation
-- Jupyter notebook tutorials
-- Performance comparison documentation
+### Infrastructure Improvements
+- **Continuous Integration**: GitHub Actions with CPU/GPU tests
+- **Documentation**: Sphinx with auto-generated API docs
+- **Performance Monitoring**: Automated benchmark tracking
+- **Example Gallery**: Jupyter notebook tutorials
 
-This structure provides a solid foundation for the Jorg project, emphasizing modularity, testability, and JAX optimization while maintaining scientific accuracy.
+## 📚 Documentation Structure
+
+### User Documentation
+- **README.md**: Quick start and overview
+- **Installation Guide**: Detailed setup instructions
+- **Tutorials**: Step-by-step examples
+- **API Reference**: Auto-generated from docstrings
+
+### Developer Documentation
+- **This File**: Project structure and architecture
+- **Contributing Guide**: Code standards and workflow
+- **Architecture Documents**: Design decisions and rationale
+- **Performance Analysis**: Benchmark results and optimization notes
+
+---
+
+This structure provides a solid foundation for the Jorg project, emphasizing:
+- ✅ **Modularity** for maintainable code
+- ✅ **Testability** with comprehensive test coverage  
+- ✅ **Performance** through JAX optimization
+- ✅ **Usability** with clear APIs and documentation
+- ✅ **Extensibility** for future enhancements
+
+The organization follows Python best practices and enables efficient development, testing, and deployment of the stellar spectral synthesis package.

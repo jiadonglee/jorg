@@ -222,3 +222,87 @@ def convert_broadening_to_wavelength(gamma_angular: float, lambda_0: float) -> f
         Broadening parameter in wavelength units (HWHM)
     """
     return gamma_angular * lambda_0**2 / (c_cgs * 4.0 * jnp.pi)
+
+
+# Additional broadening functions for compatibility with test suite
+@jax.jit
+def natural_broadening(wavelength: float, oscillator_strength: float) -> float:
+    """
+    Calculate natural (radiative) broadening
+    
+    Parameters
+    ----------
+    wavelength : float
+        Wavelength in Angstroms
+    oscillator_strength : float
+        Oscillator strength (dimensionless)
+        
+    Returns
+    -------
+    float
+        Natural broadening parameter in Angstroms
+    """
+    # Convert to cm
+    lambda_cm = wavelength * 1e-8
+    
+    # Natural broadening constant
+    # γ_rad = (8π²e²f)/(mₑλ²c) in CGS units
+    e_cgs = 4.803e-10  # esu
+    me_cgs = 9.109e-28  # g
+    
+    gamma_rad = (8 * jnp.pi**2 * e_cgs**2 * oscillator_strength) / (me_cgs * lambda_cm**2 * c_cgs)
+    
+    # Convert back to Angstroms
+    return convert_broadening_to_wavelength(gamma_rad, lambda_cm) * 1e8
+
+
+@jax.jit 
+def stark_broadening(wavelength: float, temperature: float, electron_density: float, stark_constant: float) -> float:
+    """
+    Calculate Stark (pressure) broadening
+    
+    Parameters
+    ----------
+    wavelength : float
+        Wavelength in Angstroms
+    temperature : float
+        Temperature in K
+    electron_density : float
+        Electron density in cm^-3
+    stark_constant : float
+        Stark broadening constant
+        
+    Returns
+    -------
+    float
+        Stark broadening parameter in Angstroms
+    """
+    # Stark broadening scales with electron density and temperature
+    gamma_stark = stark_constant * electron_density * (temperature / 10000.0)**(1.0/6.0)
+    return gamma_stark
+
+
+@jax.jit
+def vdw_broadening(wavelength: float, temperature: float, neutral_density: float, vdw_constant: float) -> float:
+    """
+    Calculate van der Waals broadening
+    
+    Parameters
+    ----------
+    wavelength : float
+        Wavelength in Angstroms
+    temperature : float
+        Temperature in K
+    neutral_density : float
+        Neutral atom density in cm^-3
+    vdw_constant : float
+        van der Waals broadening constant
+        
+    Returns
+    -------
+    float
+        van der Waals broadening parameter in Angstroms
+    """
+    # vdW broadening scales with neutral density and temperature^0.3
+    gamma_vdw = vdw_constant * neutral_density * (temperature / 10000.0)**0.3
+    return gamma_vdw

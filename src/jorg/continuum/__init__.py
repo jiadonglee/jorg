@@ -14,6 +14,7 @@ from .hydrogen import (
 )
 from .helium import he_minus_ff_absorption
 from .scattering import thomson_scattering, rayleigh_scattering
+from .metals_bf import metal_bf_absorption
 from .utils import frequency_to_wavelength, wavelength_to_frequency
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "h_minus_ff_absorption",
     "h2_plus_bf_ff_absorption",
     "he_minus_ff_absorption",
+    "metal_bf_absorption",
     "thomson_scattering",
     "rayleigh_scattering",
     "frequency_to_wavelength",

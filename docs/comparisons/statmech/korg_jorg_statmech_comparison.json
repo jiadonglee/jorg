@@ -1,0 +1,62 @@
+{
+  "Constants Precision": {
+    "passed": true
+  },
+  "Translational Function": {
+    "passed": true
+  },
+  "Ionization Energies": {
+    "passed": true
+  },
+  "Saha Equation Accuracy": {
+    "passed": true
+  },
+  "Performance Benchmark": {
+    "passed": true
+  },
+  "Stellar Conditions": {
+    "passed": false,
+    "data": {
+      "M_dwarf": {
+        "T": 3500,
+        "ne": 50000000000.0,
+        "H_ion_frac": 2.691806914696232e-10,
+        "He_ion_frac": 1.6167405477111522e-25,
+        "C_ion_frac": 8.350223501795816e-07,
+        "Fe_ion_frac": 0.09321669105473393
+      },
+      "Solar": {
+        "T": 5778,
+        "ne": 10000000000000.0,
+        "H_ion_frac": 0.0001460335915984597,
+        "He_ion_frac": 1.519068946517415e-13,
+        "C_ion_frac": 0.020876929704079717,
+        "Fe_ion_frac": 0.9702154071491317
+      },
+      "F_star": {
+        "T": 6500,
+        "ne": 10000000000000.0,
+        "H_ion_frac": 0.003585812718585636,
+        "He_ion_frac": 4.3439133828742314e-11,
+        "C_ion_frac": 0.23771258216042432,
+        "Fe_ion_frac": 0.9955229958902094
+      },
+      "A_star": {
+        "T": 8000,
+        "ne": 100000000000000.0,
+        "H_ion_frac": 0.04407950726879134,
+        "He_ion_frac": 2.2034826292140938e-08,
+        "C_ion_frac": 0.646243555931544,
+        "Fe_ion_frac": 0.9959173173640082
+      },
+      "B_star": {
+        "T": 12000,
+        "ne": 1000000000000000.0,
+        "H_ion_frac": 0.8561629335657178,
+        "He_ion_frac": 0.0005771889132101156,
+        "C_ion_frac": 0.9869765376118761,
+        "Fe_ion_frac": 0.5547628658571497
+      }
+    }
+  }
+}

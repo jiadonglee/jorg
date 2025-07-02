@@ -1,32 +1,45 @@
-# Jorg Tests Directory
+# Jorg Test Suite
 
-This directory contains all test scripts, comparison tools, and debugging utilities for the Jorg project.
+Comprehensive test suite for the Jorg stellar spectral synthesis package, organized by test type and component.
 
 ## Directory Structure
 
-```
-tests/
-├── README.md                           # This file
-├── __init__.py                         # Python package init
-├── test_continuum.py                   # Unit tests for continuum absorption  
-├── test_lines.py                       # Unit tests for line absorption
-├── test_voigt_accuracy.py              # Voigt-Hjerting accuracy tests
-│
-├── comparison_script.py                # Basic Korg vs Jorg comparison
-├── simple_comparison.py                # Simple continuum demonstration
-├── plot_line_comparison.py             # Comprehensive line data plots
-├── korg_jorg_comparison.py             # Detailed continuum comparison
-├── corrected_comparison.py             # Corrected comparison analysis
-├── final_korg_jorg_comparison.py       # Final comparison with performance
-│
-├── debug_comparison.py                 # Debug comparison differences
-├── debug_components.py                 # Debug individual components
-├── debug_cross_sections.py             # Debug cross-section calculations
-├── debug_ordering.py                   # Debug wavelength ordering
-├── final_debug.py                      # Final debugging utilities
-│
-└── generate_korg_reference.py          # Generate reference data from Korg.jl
-```
+### 🧪 `unit/`
+Component-specific unit tests:
+- `continuum/` - Continuum absorption tests (H⁻, metal BF/FF, scattering)
+- `lines/` - Line absorption tests (Voigt profiles, linelist parsing, molecular lines)
+- `statmech/` - Statistical mechanics tests (Saha equation, partition functions, chemical equilibrium)
+- `utils/` - Utility function tests
+
+### 🔗 `integration/`
+End-to-end integration tests:
+- `quick_test.py` - Fast integration smoke test
+- `test_synthesis.py` - Complete synthesis pipeline testing
+- `test_synthesis_pipeline.py` - Multi-component pipeline testing
+- `test_integration.py` - Cross-component integration testing
+- `test_accuracy.py` - Accuracy verification tests
+- `test_korg_jorg_comparison.py` - Direct Korg vs Jorg comparison
+- `test_plotting.py` - Visualization and plotting tests
+
+### ✅ `validation/`
+Scientific validation against Korg.jl:
+- `test_jorg_vs_korg_molecular.py` - Molecular line validation
+- `test_korg_compatibility.py` - API compatibility validation
+- `validate_molecular_implementation.py` - Molecular physics validation
+- `compare_statmech_korg_jorg.py` - Statistical mechanics comparison
+- `test_korg_validation.py` - General Korg validation
+- `test_jorg_korg_line_profiles_comparison.py` - Line profile comparison
+- `test_korg_jorg_line_profile_validation.py` - Line profile validation
+- `test_line_profile_fixes.py` - Line profile fix verification
+- `test_hydrogen_consistency.py` - Hydrogen line consistency tests
+
+### 🚀 `performance/`
+Performance benchmarking tests
+
+### 🔧 `fixtures/`
+Test data and reference outputs:
+- `reference_data/` - Korg reference data for validation
+- `generate_korg_reference.py` - Script to generate reference data
 
 ## Test Categories
 

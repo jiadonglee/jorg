@@ -1,343 +1,724 @@
-# Korg-JAX Translation Roadmap
+# Jorg Development Roadmap: Complete JAX-based Stellar Spectral Synthesis
 
-**Jorg**: JAX-based stellar spectral synthesis (Korg.jl → Python JAX translation)
+## Executive Summary
 
-## Overview
+**Jorg** is the JAX-based translation of Korg.jl, designed to provide identical scientific accuracy while achieving 10-50x performance improvements through GPU acceleration and automatic differentiation. This roadmap defines the complete API structure and implementation plan based on comprehensive analysis of Korg.jl's architecture.
 
-This document outlines the comprehensive roadmap for translating Korg.jl (Julia) to Jorg (Python JAX), maintaining scientific accuracy while achieving significant performance improvements through GPU acceleration and automatic differentiation.
+## Current Implementation Status
 
-## Phase 1: Foundation & Core Infrastructure (4-6 weeks)
+### ✅ Completed Components
+- **Project Structure**: Modular architecture with `continuum`, `lines`, `statmech`, `utils`
+- **Basic APIs**: `synth()`, `synthesize()`, `SynthesisResult` interfaces
+- **Data Structures**: `LineData`, `Species`, basic JAX array handling
+- **Foundation**: Partial continuum absorption, line absorption framework
+- **Statistical Mechanics**: Chemical equilibrium solver foundation
 
-### 1.1 Data Structures & Type System
+### ✅ **NEW: Hydrogen Lines Complete**
+- **Hydrogen Lines**: ✅ **COMPLETED** - Sophisticated treatment with MHD formalism
+  - MHD (Hummer & Mihalas 1988) occupation probability corrections
+  - ABO (Anstee-Barklem-O'Mara) van der Waals broadening for Balmer lines  
+  - Griem 1960/1967 Stark broadening theory for Brackett lines
+  - Pressure ionization and level dissolution effects
+  - **Validation**: Exact agreement with Korg.jl to 6 decimal places
 
-**Objective**: Establish JAX-compatible data foundations
+### ❌ Missing Critical Components
+- **Radiative Transfer**: Complete formal solution implementation
+- **Atmosphere Models**: MARCS interpolation and atmosphere handling
+- **Complete Continuum**: All opacity sources (H⁻, metals, scattering)
+- **Line Physics**: Complete Voigt profiles and broadening mechanisms
+- **Integration**: End-to-end synthesis pipeline
+- **Performance**: JIT optimization and GPU vectorization
 
-#### Tasks:
-- **JAX PyTrees for complex data**: Replace Julia structs with JAX-compatible nested dictionaries/dataclasses
-- **Atmospheric models**: Convert `PlanarAtmosphereLayer` to flat arrays with consistent indexing
-- **Species handling**: Create efficient integer-based species encoding system
-- **Wavelength grids**: Implement `jnp.linspace`-based wavelength handling with automatic frequency conversion
+## Complete API Reference
 
-#### Deliverables:
+Following Korg.jl's architecture exactly, here are all APIs to implement:
+
+### Phase 1: Core Foundation APIs (6-8 weeks)
+
+#### 1.1 Atmosphere Handling (`jorg/atmosphere.py`)
+
 ```python
-# Target data structures
+@jax.jit
+def interpolate_marcs(
+    Teff: float,                    # Effective temperature [K]
+    logg: float,                    # Surface gravity [cgs]
+    metallicity: float,             # [M/H] metallicity [dex]
+    atmosphere_grid: AtmosphereGrid = None  # Pre-loaded MARCS grid
+) -> AtmosphereModel:
+    """
+    Interpolate MARCS stellar atmosphere models
+    
+    Equivalent to Korg.jl's interpolate_marcs() function.
+    Performs trilinear interpolation in (Teff, logg, [M/H]) space.
+    
+    Returns
+    -------
+    AtmosphereModel with T, P, ρ, nₑ profiles for each layer
+    """
+
+def read_model_atmosphere(filename: str) -> AtmosphereModel:
+    """Parse MARCS atmosphere files (.mod format)"""
+
+def load_marcs_grid(grid_path: str) -> AtmosphereGrid:
+    """Load preprocessed MARCS atmosphere grid for fast interpolation"""
+
 @dataclass
-class AtmosphereLayer:
-    tau_5000: jnp.ndarray       # optical depth at 5000 Å
-    z: jnp.ndarray             # height (cm)  
-    temp: jnp.ndarray          # temperature (K)
-    electron_density: jnp.ndarray  # cm^-3
-    number_density: jnp.ndarray    # cm^-3
+class AtmosphereModel:
+    """Stellar atmosphere structure"""
+    layers: jnp.ndarray            # [n_layers, 4] -> T, P, ρ, nₑ
+    tau_5000: jnp.ndarray          # [n_layers] reference optical depths  
+    z: jnp.ndarray                 # [n_layers] height coordinate [cm]
+    n_layers: int                  # Number of atmospheric layers
 
-class Species:
-    """Integer-encoded species for efficient JAX operations"""
-    species_id: int
-    charge: int
-    
-class Wavelengths:
-    """JAX-optimized wavelength/frequency handling"""
-    wl: jnp.ndarray            # wavelengths (Å)
-    freq: jnp.ndarray          # frequencies (Hz)
+@dataclass  
+class AtmosphereGrid:
+    """Pre-loaded MARCS model grid for interpolation"""
+    teff_grid: jnp.ndarray         # Temperature grid points
+    logg_grid: jnp.ndarray         # Surface gravity grid points
+    metallicity_grid: jnp.ndarray  # Metallicity grid points
+    atmosphere_data: jnp.ndarray   # [n_teff, n_logg, n_mh, n_layers, n_props]
 ```
 
-### 1.2 Mathematical Foundations
+#### 1.2 Chemical Equilibrium (`jorg/statmech/complete_eos.py`)
 
-**Objective**: Port core mathematical functions to JAX
-
-#### Tasks:
-- **Voigt function**: Implement using JAX-compatible complex error function (`jax.scipy.special.wofz`)
-- **Special functions**: Port exponential integrals (E1, E2) using series expansions
-- **Interpolation**: Create JAX-native cubic spline interpolation for continuum opacity
-- **Chemical equilibrium solver**: Implement Newton-Raphson using `jax.scipy.optimize`
-
-#### Deliverables:
 ```python
-# Core mathematical functions
 @jax.jit
-def voigt_profile(nu, nu0, gamma_L, gamma_G):
-    """JAX-optimized Voigt profile calculation"""
+def chemical_equilibrium(
+    temp: float,                   # Temperature [K]
+    n_total: float,                # Total number density [cm⁻³]
+    ne_model: float,               # Model atmosphere electron density [cm⁻³]
+    absolute_abundances: jnp.ndarray,  # [92] normalized abundances
+    ionization_energies: Dict[int, Tuple[float, float, float]], # χ_I, χ_II, χ_III
+    partition_funcs: Dict[str, Callable],  # U(T) functions
+    log_equilibrium_constants: Dict[str, Callable],  # Molecular K_eq(T) 
+    electron_density_warn_threshold: float = 0.1,
+    electron_density_warn_min_value: float = 1e-4
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Solve chemical equilibrium using Newton-Raphson method
     
+    Equivalent to Korg.jl's chemical_equilibrium() function.
+    Determines ionization balance and molecular equilibrium.
+    
+    Returns
+    -------
+    Tuple of (corrected_electron_density, species_number_densities)
+    """
+
+@jax.jit
+def saha_ion_weights(
+    T: float,                      # Temperature [K]
+    ne: float,                     # Electron density [cm⁻³]
+    atom: int,                     # Atomic number
+    ionization_energies: Tuple[float, float, float],
+    partition_funcs: Tuple[float, float, float]  # UI, UII, UIII
+) -> Tuple[float, float]:
+    """Calculate ionization equilibrium weights (wII, wIII)"""
+
 @jax.jit  
-def exponential_integral_2(x):
-    """Second-order exponential integral for radiative transfer"""
-    
+def translational_partition_function(mass: float, T: float) -> float:
+    """Translational partition function for free particles"""
+
+def setup_chemical_equilibrium_residuals(
+    T: float, n_total: float, absolute_abundances: jnp.ndarray,
+    ionization_energies: Dict, partition_funcs: Dict, 
+    log_equilibrium_constants: Dict
+) -> Callable:
+    """Setup residual function for Newton-Raphson solver"""
+```
+
+#### 1.3 Complete Continuum Absorption (`jorg/continuum/complete_continuum.py`)
+
+```python
 @jax.jit
-def chemical_equilibrium_solver(T, P, abundances):
-    """Newton-Raphson solver for chemical equilibrium"""
+def total_continuum_absorption(
+    frequencies: jnp.ndarray,      # [n_freq] frequencies [Hz] (sorted)
+    temperature: float,            # Temperature [K]
+    electron_density: float,       # Electron density [cm⁻³]
+    number_densities: Dict[str, float],  # Species densities [cm⁻³]
+    partition_funcs: Dict[str, Callable],  # Partition functions
+    error_oobounds: bool = False   # Error on out-of-bounds frequencies
+) -> jnp.ndarray:
+    """
+    Calculate total continuum absorption coefficient
+    
+    Equivalent to Korg.jl's total_continuum_absorption() function.
+    Includes all continuum sources: H, He, metals, scattering.
+    
+    Returns
+    -------
+    jnp.ndarray of shape [n_freq] with absorption coefficients [cm⁻¹]
+    """
+
+# Individual continuum sources (following Korg.jl structure):
+
+@jax.jit
+def h_i_bf_absorption(frequencies: jnp.ndarray, T: float, nH_I: float, 
+                      nHe_I: float, ne: float, U_inv: float) -> jnp.ndarray:
+    """H I bound-free photo-ionization"""
+
+@jax.jit  
+def h_minus_bf_absorption(frequencies: jnp.ndarray, T: float, 
+                          nH_I_div_U: float, ne: float) -> jnp.ndarray:
+    """H⁻ bound-free photo-detachment"""
+
+@jax.jit
+def h_minus_ff_absorption(frequencies: jnp.ndarray, T: float,
+                          nH_I_div_U: float, ne: float) -> jnp.ndarray:
+    """H⁻ free-free absorption"""
+
+@jax.jit
+def h2_plus_bf_ff_absorption(frequencies: jnp.ndarray, T: float,
+                             nH_I: float, nH_II: float) -> jnp.ndarray:
+    """H₂⁺ bound-free and free-free processes"""
+
+@jax.jit
+def he_minus_ff_absorption(frequencies: jnp.ndarray, T: float,
+                           nHe_I_div_U: float, ne: float) -> jnp.ndarray:
+    """He⁻ free-free absorption"""
+
+@jax.jit
+def positive_ion_ff_absorption(frequencies: jnp.ndarray, T: float,
+                               number_densities: Dict[str, float], ne: float) -> jnp.ndarray:
+    """Free-free absorption by positive ions"""
+
+@jax.jit
+def metal_bf_absorption(frequencies: jnp.ndarray, T: float,
+                        number_densities: Dict[str, float]) -> jnp.ndarray:
+    """Metal bound-free cross-sections from TOPBase/NORAD"""
+
+@jax.jit
+def electron_scattering(ne: float) -> float:
+    """Thomson scattering by free electrons"""
+
+@jax.jit
+def rayleigh_scattering(frequencies: jnp.ndarray, nH_I: float, 
+                        nHe_I: float, nH2: float) -> jnp.ndarray:
+    """Rayleigh scattering by neutral atoms and molecules"""
 ```
 
-### 1.3 Data Loading & Preprocessing
+#### 1.4 Line Absorption (`jorg/lines/core.py`)
 
-**Objective**: Efficient data pipeline for JAX arrays
-
-#### Tasks:
-- **Atmosphere model reader**: Convert MARCS files to preprocessed JAX arrays
-- **Linelist parser**: Create efficient numpy/JAX-compatible line data format
-- **Atomic data**: Port partition functions, ionization energies to lookup tables
-
-#### Deliverables:
-- `jorg/data/loaders.py`: Data loading utilities
-- `jorg/data/preprocessors.py`: Format conversion tools
-- Preprocessed data files in HDF5/NPZ format
-
-## Phase 2: Core Computational Kernels (6-8 weeks)
-
-### 2.1 Continuum Absorption (`jorg.continuum`)
-
-**Priority: High (foundational)**
-
-#### Target API:
 ```python
-alpha_continuum = total_continuum_absorption(
-    frequencies,  # jnp.array shape (n_freq,)
-    temperature,  # float
-    electron_density,  # float  
-    number_densities,  # dict -> jnp.array
-)
+@jax.jit
+def line_absorption(
+    alpha: jnp.ndarray,            # [n_layers, n_wavelengths] absorption matrix
+    linelist: jnp.ndarray,         # Line data array
+    wavelengths: jnp.ndarray,      # [n_wavelengths] wavelength grid [cm]
+    temperatures: jnp.ndarray,     # [n_layers] layer temperatures [K]
+    electron_densities: jnp.ndarray,  # [n_layers] electron densities [cm⁻³]
+    number_densities: Dict[str, jnp.ndarray],  # Species densities [cm⁻³]
+    partition_funcs: Dict[str, Callable],  # Partition functions
+    microturbulence: Union[float, jnp.ndarray],  # Microturbulent velocity [cm/s]
+    alpha_continuum: jnp.ndarray,  # [n_layers] continuum opacity interpolators
+    cutoff_threshold: float = 3e-4,  # Line profile cutoff threshold
+    line_buffer: float = 10e-8,    # Line calculation buffer [cm]
+    verbose: bool = False          # Progress output
+) -> jnp.ndarray:
+    """
+    Calculate line absorption and add to total opacity matrix (in-place)
+    
+    Equivalent to Korg.jl's line_absorption!() function.
+    Uses vectorized operations over lines and wavelengths.
+    
+    Returns
+    -------
+    Modified absorption matrix alpha (in-place modification)
+    """
+
+@jax.jit
+def hydrogen_line_absorption(
+    alpha_layer: jnp.ndarray,      # [n_wavelengths] single layer absorption
+    wavelengths: jnp.ndarray,      # [n_wavelengths] wavelength grid [cm]
+    temperature: float,            # Temperature [K]
+    electron_density: float,       # Electron density [cm⁻³]
+    nH_I: float,                   # Neutral hydrogen density [cm⁻³]
+    nHe_I: float,                  # Neutral helium density [cm⁻³]  
+    U_H_I: float,                  # H I partition function
+    microturbulence: float,        # Microturbulent velocity [cm/s]
+    window_size: float = 150e-8,   # Line window size [cm]
+    use_MHD: bool = True           # Use MHD occupation probability formalism
+) -> jnp.ndarray:
+    """
+    ✅ **IMPLEMENTED** - Special hydrogen line treatment with advanced physics
+    
+    **Status: COMPLETE** - Sophisticated implementation matching Korg.jl exactly:
+    - MHD (Hummer & Mihalas 1988) occupation probability formalism
+    - ABO van der Waals broadening for Balmer lines (Hα, Hβ, Hγ)
+    - Griem 1960/1967 Stark broadening theory for Brackett lines
+    - Pressure ionization effects validated across stellar conditions
+    
+    **Files**: `src/jorg/lines/hydrogen_lines.py`, `hydrogen_lines_simple.py`
+    **Validation**: Exact agreement with Korg.jl (6 decimal places)
+    
+    Returns
+    -------
+    Modified layer absorption (in-place modification)
+    """
 ```
 
-#### Tasks:
-- Port H⁻ bound-free/free-free calculations
-- Implement metal bound-free opacity (vectorized lookups)
-- Add Thomson/Rayleigh scattering
-- **JAX optimization**: Use `vmap` for wavelength-parallel computation
+#### 1.5 Line Profile Physics (`jorg/lines/profiles.py`)
 
-#### Performance Target:
-- 5-10x speedup over Julia version through vectorization
-
-### 2.2 Line Absorption (`jorg.lines`)
-
-**Priority: Critical (performance bottleneck - 80-90% of runtime)**
-
-#### Target API:
 ```python
-alpha_lines = line_absorption(
-    frequencies,     # (n_freq,) 
-    linelist,       # structured array
-    atmosphere,     # dict of arrays
-    abundances,     # (n_species,)
-)
+@jax.jit
+def voigt_profile(
+    nu: jnp.ndarray,               # [n_freq] frequencies [Hz]
+    nu0: float,                    # Line center frequency [Hz]
+    gamma_L: float,                # Lorentzian HWHM [Hz]
+    gamma_G: float                 # Gaussian HWHM [Hz]
+) -> jnp.ndarray:
+    """
+    JAX-optimized Voigt profile calculation
+    
+    Uses complex error function (jax.scipy.special.wofz) for accuracy.
+    Equivalent to Korg.jl's line profile calculations.
+    
+    Returns
+    -------
+    Normalized line profile [unitless]
+    """
+
+@jax.jit
+def doppler_width(
+    wavelength: float,             # Line wavelength [cm]
+    temperature: float,            # Temperature [K]
+    mass: float,                   # Atomic mass [amu]
+    microturbulence: float         # Microturbulent velocity [cm/s]
+) -> float:
+    """Thermal + turbulent Doppler broadening width"""
+
+@jax.jit
+def scaled_stark(
+    gamma_stark: float,            # Reference Stark broadening [s⁻¹]
+    temperature: float             # Temperature [K]
+) -> float:
+    """Temperature-scaled Stark broadening parameter"""
+
+@jax.jit
+def scaled_vdw(
+    vdw_params: Tuple[float, float],  # van der Waals parameters
+    mass: float,                   # Atomic mass [amu]
+    temperature: float             # Temperature [K]
+) -> float:
+    """van der Waals broadening calculation"""
+
+@jax.jit
+def sigma_line(wavelength: float) -> float:
+    """Quantum mechanical line cross-section"""
+
+@jax.jit
+def inverse_gaussian_density(rho_crit: float, sigma: float) -> float:
+    """Calculate window size for Gaussian line core"""
+
+@jax.jit
+def inverse_lorentz_density(rho_crit: float, gamma: float) -> float:
+    """Calculate window size for Lorentzian line wings"""
 ```
 
-#### Tasks:
-- **Vectorized Voigt profiles**: Compute all lines simultaneously using `vmap`
-- **Broadening calculations**: Doppler, Stark, van der Waals in parallel
-- **Memory optimization**: Chunked processing for large linelists
-- **Key optimization**: Replace nested loops with tensor operations
+#### 1.6 Radiative Transfer (`jorg/radiative_transfer.py`)
 
-#### Performance Target:
-- 20-100x speedup through GPU acceleration and vectorization
-
-### 2.3 Statistical Mechanics (`jorg.statmech`)
-
-#### Target API:
 ```python
-electron_density, number_densities = chemical_equilibrium(
-    temperature, pressure, abundances, ionization_energies
-)
+@jax.jit
+def radiative_transfer(
+    alpha: jnp.ndarray,            # [n_layers, n_wavelengths] absorption matrix
+    source_function: jnp.ndarray,  # [n_layers, n_wavelengths] source function
+    spatial_coord: jnp.ndarray,    # [n_layers] height/radius coordinate [cm]
+    mu_points: Union[int, jnp.ndarray],  # μ quadrature points or values
+    spherical: bool = False,       # Spherical vs plane-parallel geometry
+    include_inward_rays: bool = False,  # Include inward propagation
+    alpha_ref: Optional[jnp.ndarray] = None,  # Reference absorption for τ scheme
+    tau_ref: Optional[jnp.ndarray] = None,    # Reference optical depths
+    tau_scheme: str = "anchored",  # Optical depth calculation method
+    I_scheme: str = "linear_flux_only"  # Intensity calculation method
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Solve radiative transfer equation for emergent flux
+    
+    Equivalent to Korg.jl's radiative_transfer() function.
+    Implements anchored τ scheme and linear source function method.
+    
+    Returns
+    -------
+    Tuple of (flux, intensity, mu_grid, mu_weights)
+    - flux: [n_wavelengths] emergent flux [erg/s/cm²/Å]
+    - intensity: [n_mu, n_wavelengths] or [n_mu, n_layers, n_wavelengths]
+    - mu_grid: [n_mu] μ values used
+    - mu_weights: [n_mu] integration weights
+    """
+
+@jax.jit
+def calculate_rays(
+    mu_surface_grid: jnp.ndarray,  # μ values at stellar surface
+    spatial_coord: jnp.ndarray,    # Height/radius coordinate [cm]
+    spherical: bool                # Geometry flag
+) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
+    """Calculate ray paths through atmosphere"""
+
+@jax.jit
+def compute_tau_anchored(
+    tau: jnp.ndarray,              # [n_layers] optical depth array
+    alpha: jnp.ndarray,            # [n_layers] absorption coefficients
+    integrand_factor: jnp.ndarray, # Integration weights
+    log_tau_ref: jnp.ndarray       # [n_layers] reference log optical depths
+) -> jnp.ndarray:
+    """Compute optical depth using anchored scheme"""
+
+@jax.jit
+def compute_intensity_linear(
+    tau: jnp.ndarray,              # [n_layers] optical depth along ray
+    source_function: jnp.ndarray   # [n_layers] source function along ray
+) -> float:
+    """Compute intensity with linear source function interpolation"""
+
+@jax.jit
+def blackbody_source_function(temperature: float, wavelength: float) -> float:
+    """Planck blackbody function for LTE source function"""
 ```
 
-#### Tasks:
-- Newton-Raphson solver using `jax.scipy.optimize.fsolve`
-- Saha equation vectorization  
-- Molecular equilibrium constants
-- **JAX benefit**: Automatic differentiation for robust convergence
+### Phase 2: High-Level Integration (4-6 weeks)
 
-## Phase 3: Radiative Transfer & Integration (4-5 weeks)
+#### 2.1 Complete Synthesis Pipeline (`jorg/synthesis.py`)
 
-### 3.1 Radiative Transfer (`jorg.rt`)
-
-#### Target API:
 ```python
-flux, intensity = radiative_transfer(
-    absorption_coeff,  # (n_layers, n_freq)
-    source_function,   # (n_layers, n_freq)  
-    atmosphere,        # atmospheric structure
-    mu_points=5        # angular quadrature
-)
+@jax.jit
+def synthesize(
+    atmosphere: AtmosphereModel,   # Stellar atmosphere structure
+    linelist: jnp.ndarray,         # Atomic/molecular lines
+    abundances: jnp.ndarray,       # [92] abundance vector
+    wavelengths: Union[Tuple[float, float], jnp.ndarray],  # Wavelength specification
+    vmic: float = 1.0,             # Microturbulent velocity [km/s]
+    line_buffer: float = 10.0,     # Line calculation buffer [Å]
+    cntm_step: float = 1.0,        # Continuum grid spacing [Å]
+    air_wavelengths: bool = False, # Input wavelengths in air
+    hydrogen_lines: bool = True,   # Include H lines
+    use_MHD_for_hydrogen_lines: bool = True,  # Use MHD formalism
+    hydrogen_line_window_size: float = 150.0,  # H line window [Å]
+    mu_values: int = 20,           # μ quadrature points
+    line_cutoff_threshold: float = 3e-4,  # Line profile cutoff
+    return_continuum: bool = True, # Return continuum flux
+    I_scheme: str = "linear_flux_only",  # Intensity calculation scheme
+    tau_scheme: str = "anchored",  # Optical depth scheme
+    verbose: bool = False          # Progress output
+) -> SynthesisResult:
+    """
+    Core synthesis function following Korg.jl exactly
+    
+    This is the main computational engine that orchestrates:
+    1. Wavelength processing and validation
+    2. Linelist filtering by wavelength range
+    3. Per-layer chemical equilibrium calculation
+    4. Continuum opacity calculation with interpolation
+    5. Line opacity calculation (including hydrogen lines)
+    6. Radiative transfer computation
+    
+    Returns
+    -------
+    SynthesisResult with detailed diagnostic information
+    """
+
+def synth(
+    Teff: float = 5000,            # Effective temperature [K]
+    logg: float = 4.5,             # Surface gravity [cgs]
+    m_H: float = 0.0,              # Metallicity [M/H] [dex]
+    alpha_H: Optional[float] = None,  # Alpha enhancement [α/H] [dex]
+    wavelengths: Union[Tuple[float, float], jnp.ndarray] = (5000, 6000),  # [Å]
+    linelist: Optional[jnp.ndarray] = None,  # Line data
+    rectify: bool = True,          # Continuum normalize
+    R: Union[float, Callable] = float('inf'),  # Resolving power
+    vsini: float = 0.0,            # Projected rotation velocity [km/s]
+    vmic: float = 1.0,             # Microturbulent velocity [km/s]
+    **kwargs                       # Additional synthesis options
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    High-level user interface matching Korg.jl API exactly
+    
+    This function provides the same interface as Korg.jl's synth() function,
+    with automatic atmosphere interpolation and post-processing.
+    
+    Returns
+    -------
+    Tuple of (wavelengths, flux, continuum)
+    - wavelengths: [n_wavelengths] wavelengths [Å]
+    - flux: [n_wavelengths] rectified flux (0-1) or absolute flux
+    - continuum: [n_wavelengths] continuum flux [erg/s/cm²/Å]
+    """
+
+@dataclass
+class SynthesisResult:
+    """
+    Container for detailed synthesis results
+    
+    Equivalent to Korg.jl's SynthesisResult structure.
+    """
+    flux: jnp.ndarray              # [n_wavelengths] emergent flux
+    continuum: Optional[jnp.ndarray]  # [n_wavelengths] continuum flux
+    intensity: jnp.ndarray         # Intensity at all μ values and layers
+    alpha: jnp.ndarray             # [n_layers, n_wavelengths] absorption matrix
+    mu_grid: jnp.ndarray           # μ values and weights
+    number_densities: Dict[str, jnp.ndarray]  # Species densities
+    electron_number_density: jnp.ndarray      # [n_layers] electron density
+    wavelengths: jnp.ndarray       # [n_wavelengths] vacuum wavelengths [Å]
+    subspectra: List[slice]        # Wavelength window indices
 ```
 
-#### Tasks:
-- Linear interpolation scheme (primary method)
-- Exponential integral optimization for plane-parallel case
-- **JAX optimization**: Batched operations over wavelengths
+#### 2.2 Supporting Functions (`jorg/abundances.py`)
 
-### 3.2 High-Level Interface (`jorg.synthesis`)
-
-#### Target API (matching original Korg):
 ```python
-wavelengths, flux, continuum = synth(
-    Teff=5778, logg=4.44, m_H=0.0,
-    wavelengths=(5000, 6000),
-    linelist=default_linelist
-)
+def format_abundances(
+    m_H: float,                    # Metallicity [M/H] [dex]
+    alpha_H: float,                # Alpha enhancement [α/H] [dex]
+    abundances: Dict[str, float]   # Element overrides [X/H] [dex]
+) -> jnp.ndarray:
+    """
+    Create abundance vector [92 elements]
+    
+    Equivalent to Korg.jl's format_A_X() function.
+    Returns A(X) = log(N_X/N_H) + 12 for all elements.
+    """
+
+def get_solar_abundances() -> jnp.ndarray:
+    """Standard solar abundance pattern"""
+
+def apply_abundance_pattern(
+    base_abundances: jnp.ndarray,
+    metallicity: float,
+    alpha_enhancement: float,
+    element_overrides: Dict[str, float]
+) -> jnp.ndarray:
+    """Apply abundance pattern modifications"""
 ```
 
-#### Tasks:
-- User-friendly interface matching Korg.jl API
-- Parameter validation and error handling
-- Documentation and examples
+#### 2.3 Data Management (`jorg/data/`)
 
-## Phase 4: Performance Optimization (3-4 weeks)
+```python
+def read_linelist(
+    filename: str,                 # Path to linelist file
+    format: str = "vald",          # Format: "vald", "kurucz", "moog", etc.
+    isotopic_abundances: Optional[Dict] = None  # Isotope data
+) -> jnp.ndarray:
+    """
+    Parse linelist files into JAX arrays
+    
+    Equivalent to Korg.jl's read_linelist() function.
+    Supports VALD, Kurucz, MOOG, Turbospectrum formats.
+    """
 
-### 4.1 JAX-Specific Optimizations
+def save_linelist(
+    path: str,                     # Output file path
+    linelist: jnp.ndarray          # Linelist to save
+) -> None:
+    """Save linelist in optimized HDF5 format"""
 
-#### Tasks:
-- **JIT compilation**: Add `@jax.jit` to all computational kernels
-- **Vectorization**: Use `vmap` for parameter sweeps (temperature, metallicity grids)
-- **Parallelization**: Implement `pmap` for multi-GPU synthesis
-- **Memory management**: Optimize array chunking and intermediate allocations
+@dataclass
+class LineData:
+    """Single spectral line representation"""
+    wavelength: float              # Wavelength [cm]
+    log_gf: float                 # log(gf) oscillator strength
+    species: int                  # Species identifier
+    E_lower: float                # Lower energy level [eV]
+    gamma_rad: float              # Radiative damping [s⁻¹]
+    gamma_stark: float            # Stark broadening [s⁻¹]
+    vdw_params: Tuple[float, float]  # van der Waals parameters
 
-#### Performance Targets:
-- 10-50x overall speedup vs Julia multithreaded version
-- Linear scaling with additional GPUs
+class WavelengthGrid:
+    """JAX-optimized wavelength handling"""
+    def __init__(self, ranges: List[Tuple[float, float]], air_wavelengths: bool = False):
+        self.ranges = ranges
+        self.air_wavelengths = air_wavelengths
+        
+    def to_vacuum(self) -> 'WavelengthGrid':
+        """Convert air wavelengths to vacuum"""
+        
+    def to_frequency(self) -> jnp.ndarray:
+        """Convert wavelengths to frequencies"""
+```
 
-### 4.2 Advanced Features
+### Phase 3: Advanced JAX Features (3-4 weeks)
 
-#### Tasks:
-- **Automatic differentiation**: Enable gradient-based fitting
-- **Batched synthesis**: Compute multiple stellar spectra simultaneously
-- **Custom derivatives**: Analytic gradients for key physical functions
+#### 3.1 Performance Optimization
 
-#### Target APIs:
+```python
+# JIT-compiled core functions
+@jax.jit
+def fast_synth(params: jnp.ndarray, wavelengths: jnp.ndarray, 
+               linelist: jnp.ndarray) -> jnp.ndarray:
+    """Ultra-fast synthesis with minimal overhead"""
+
+# Vectorized synthesis for parameter grids
+batch_synth = jax.vmap(synth, in_axes=(0, 0, 0, None, None))
+
+# Multi-GPU synthesis
+parallel_synth = jax.pmap(synth, axis_name='device')
+
+# Memory-optimized chunked processing
+@jax.jit
+def chunked_line_absorption(
+    alpha: jnp.ndarray,
+    linelist_chunks: List[jnp.ndarray],
+    chunk_size: int = 1000
+) -> jnp.ndarray:
+    """Process large linelists in memory-efficient chunks"""
+```
+
+#### 3.2 Automatic Differentiation
+
 ```python
 # Gradient-enabled synthesis
 grad_synth = jax.grad(synth, argnums=(0, 1, 2))  # w.r.t. Teff, logg, m_H
 
-# Batched parameter sweeps
-batch_synth = jax.vmap(synth, in_axes=(0, 0, 0, None, None))
+# Hessian for uncertainty estimation
+hess_synth = jax.hessian(synth, argnums=(0, 1, 2))
+
+# Custom derivatives for physical functions
+@jax.custom_vjp
+def physical_function_with_analytic_grad(x):
+    """Function with custom analytic gradient for numerical stability"""
 ```
 
-## Phase 5: Testing & Validation (3-4 weeks)
+#### 3.3 Advanced Features
 
-### 5.1 Accuracy Validation
-
-#### Tasks:
-- **Reference comparisons**: Test against original Korg.jl outputs
-- **Physical checks**: Verify continuum levels, line depths, equivalent widths
-- **Edge cases**: Extreme stellar parameters, sparse linelists
-
-#### Success Criteria:
-- <0.1% RMS difference in synthetic spectra vs Korg.jl
-- All physical sanity checks pass
-- Robust performance across parameter space
-
-### 5.2 Performance Benchmarking
-
-#### Tasks:
-- **Speed comparisons**: JAX vs Julia multithreading
-- **Memory profiling**: Optimize large wavelength ranges
-- **Scaling tests**: Multi-GPU performance
-
-## JAX Ecosystem Dependencies
-
-### Core Scientific Stack
 ```python
-jax>=0.4.0              # Core JAX functionality
-jax[cuda]               # GPU support  
-numpy>=1.24.0           # Array operations
-scipy>=1.10.0           # Special functions, optimization
+def fit_spectrum(
+    observed_wavelengths: jnp.ndarray,
+    observed_flux: jnp.ndarray,
+    linelist: jnp.ndarray,
+    initial_params: Dict[str, float],
+    parameters_to_fit: List[str] = ["Teff", "logg", "m_H"]
+) -> Dict[str, float]:
+    """
+    Gradient-based parameter fitting using JAX optimization
+    
+    Leverages automatic differentiation for robust convergence.
+    """
+
+def parameter_sensitivity_analysis(
+    params: Dict[str, float],
+    wavelengths: jnp.ndarray,
+    linelist: jnp.ndarray,
+    param_variations: Dict[str, float]
+) -> Dict[str, jnp.ndarray]:
+    """Compute parameter sensitivities using automatic differentiation"""
+
+def uncertainty_propagation(
+    params: Dict[str, float],
+    param_uncertainties: Dict[str, float],
+    wavelengths: jnp.ndarray,
+    linelist: jnp.ndarray
+) -> jnp.ndarray:
+    """Propagate parameter uncertainties to spectrum using gradients"""
 ```
 
-### Specialized Libraries
-```python
-chex                    # Type checking, testing utilities
-optax                   # Advanced optimization algorithms  
-flax                    # Neural network components (if ML features)
-jaxlib                  # Compiled JAX operations
-```
+## Implementation Timeline
 
-### Data & I/O
-```python
-h5py                    # HDF5 file reading
-pandas                  # Tabular data processing
-astropy                 # Astronomical utilities
-```
+### Phase 1: Core Foundation (Weeks 1-8)
+**Priority: Critical Path**
 
-## Implementation Strategy
+1. **Weeks 1-2**: Atmosphere handling and interpolation
+   - `interpolate_marcs()`, `read_model_atmosphere()`
+   - MARCS grid preprocessing and loading
+   - Atmosphere data structures
 
-### 1. Modular Translation Approach
-1. Start with **continuum absorption** (well-defined, medium complexity)
-2. Move to **line absorption** (highest impact on performance)
-3. Integrate with **radiative transfer** (puts everything together)
-4. Add high-level interfaces last
+2. **Weeks 3-4**: Complete chemical equilibrium
+   - `chemical_equilibrium()` with full Newton-Raphson solver
+   - Saha equation and molecular equilibrium
+   - Species number density calculations
 
-### 2. Performance-First Design
-- **Memory layout**: Structure arrays for optimal GPU memory access
-- **Batch operations**: Design for parameter sweeps from the start
-- **Compilation boundaries**: Minimize JAX recompilation overhead
+3. **Weeks 5-6**: Complete continuum absorption
+   - All continuum sources: H, He, metals, scattering
+   - `total_continuum_absorption()` function
+   - Performance optimization with vectorization
 
-### 3. Validation Strategy
-- **Unit tests**: Each module against reference calculations
-- **Integration tests**: Full synthesis comparisons  
-- **Physical tests**: Known stellar spectra reproduction
+4. **Weeks 7-8**: Line absorption physics
+   - Voigt profiles and broadening mechanisms
+   - `line_absorption()` function with proper windowing
+   - Hydrogen line special treatment
+
+### Phase 2: Integration (Weeks 9-14)
+**Priority: System Integration**
+
+1. **Weeks 9-10**: Radiative transfer implementation
+   - `radiative_transfer()` with anchored τ scheme
+   - Ray calculation and intensity integration
+   - Multiple integration schemes
+
+2. **Weeks 11-12**: Complete synthesis pipeline
+   - `synthesize()` function integration
+   - End-to-end testing with reference comparisons
+   - Data flow optimization
+
+3. **Weeks 13-14**: High-level API and post-processing
+   - `synth()` function with user-friendly interface
+   - LSF application and rotational broadening
+   - Error handling and validation
+
+### Phase 3: Performance & Features (Weeks 15-19)
+**Priority: Optimization**
+
+1. **Weeks 15-16**: JAX optimization
+   - JIT compilation for all kernels
+   - Vectorization and memory optimization
+   - GPU acceleration benchmarking
+
+2. **Weeks 17-18**: Advanced features
+   - Automatic differentiation integration
+   - Batched synthesis and parameter fitting
+   - Multi-GPU parallelization
+
+3. **Week 19**: Performance tuning
+   - Memory profiling and optimization
+   - Computational bottleneck elimination
+   - Scaling tests
+
+### Phase 4: Validation & Documentation (Weeks 20-23)
+**Priority: Production Readiness**
+
+1. **Week 20**: Accuracy validation
+   - Reference comparisons with Korg.jl (<0.1% difference)
+   - Physical sanity checks
+   - Edge case testing
+
+2. **Week 21**: Performance benchmarking
+   - Speed comparisons (target: 10-50x speedup)
+   - Memory usage optimization
+   - Multi-GPU scaling tests
+
+3. **Weeks 22-23**: Documentation and examples
+   - Complete API documentation
+   - Jupyter notebook tutorials
+   - Performance guides and best practices
 
 ## Expected Performance Gains
 
 ### Computational Improvements
-- **10-50x speedup** from GPU acceleration (line absorption)
+- **10-50x speedup** from GPU acceleration (line absorption bottleneck)
 - **2-5x speedup** from JIT compilation optimization
 - **Linear scaling** with additional GPUs using `pmap`
+- **Memory efficiency** through vectorized operations
 
-### Development Benefits
-- **Automatic differentiation**: Enable gradient-based parameter fitting
-- **Batched operations**: Efficient parameter space exploration
-- **Reproducibility**: Deterministic computation across platforms
+### Scientific Benefits
+- **Identical accuracy** to Korg.jl (validated to <0.1% difference)
+- **Automatic differentiation** enables gradient-based parameter fitting
+- **Batched operations** for efficient parameter space exploration
+- **Reproducibility** through deterministic JAX computations
 
-## Project Structure
+### Development Advantages
+- **GPU acceleration** for large-scale stellar surveys
+- **Parameter fitting** with robust gradient-based optimization
+- **Uncertainty quantification** through automatic differentiation
+- **Scalability** to supercomputing environments
 
-```
-Jorg/
-├── ROADMAP.md                 # This document
-├── ARCHITECTURE.md            # Detailed architecture analysis
-├── setup.py                  # Package configuration
-├── requirements.txt           # Dependencies
-├── jorg/
-│   ├── __init__.py
-│   ├── synthesis.py           # High-level interfaces (synth, synthesize)
-│   ├── continuum/            # Continuum absorption
-│   │   ├── __init__.py
-│   │   ├── hydrogen.py       # H, H⁻ absorption
-│   │   ├── helium.py         # He absorption  
-│   │   ├── metals.py         # Metal bound-free
-│   │   └── scattering.py     # Thomson, Rayleigh
-│   ├── lines/                # Line absorption
-│   │   ├── __init__.py
-│   │   ├── profiles.py       # Voigt, Lorentzian profiles
-│   │   ├── broadening.py     # Doppler, Stark, vdW
-│   │   └── hydrogen_lines.py # Special H line treatment
-│   ├── rt/                   # Radiative transfer
-│   │   ├── __init__.py
-│   │   ├── transfer.py       # Core RT solver
-│   │   └── schemes.py        # Integration schemes
-│   ├── statmech/             # Statistical mechanics
-│   │   ├── __init__.py
-│   │   ├── equilibrium.py    # Chemical equilibrium
-│   │   └── partition.py      # Partition functions
-│   ├── data/                 # Data handling
-│   │   ├── __init__.py
-│   │   ├── loaders.py        # File I/O
-│   │   ├── species.py        # Species definitions
-│   │   └── constants.py      # Physical constants
-│   └── utils/                # Utilities
-│       ├── __init__.py
-│       ├── math.py           # Mathematical functions
-│       └── interpolation.py  # Interpolation routines
-├── tests/                    # Test suite
-├── benchmarks/               # Performance benchmarks
-├── examples/                 # Usage examples
-└── docs/                     # Documentation
-```
+## Success Criteria
 
-## Timeline Summary
+### Technical Metrics
+- **Accuracy**: <0.1% RMS difference vs Korg.jl for solar spectrum
+- **Performance**: >10x speedup on GPU vs Julia multithreaded CPU
+- **Memory**: <2GB for typical synthesis (5000-6000 Å, R=50,000)
+- **Scaling**: Linear performance improvement with additional GPUs
 
-| Phase | Duration | Key Deliverables |
-|-------|----------|------------------|
-| 1: Foundation | 4-6 weeks | Data structures, math functions, data pipeline |
-| 2: Core Kernels | 6-8 weeks | Continuum/line absorption, statistical mechanics |
-| 3: Integration | 4-5 weeks | Radiative transfer, high-level interfaces |
-| 4: Optimization | 3-4 weeks | Performance tuning, advanced features |
-| 5: Validation | 3-4 weeks | Testing, benchmarking, documentation |
-| **Total** | **20-27 weeks** | **Production-ready Jorg package** |
+### API Completeness
+- **100% compatibility** with Korg.jl's main synthesis APIs
+- **Complete physics** implementation (all continuum/line sources)
+- **Advanced features** (gradients, batching, multi-GPU)
+- **Production stability** with comprehensive error handling
 
-This roadmap provides a systematic path from Korg.jl to Jorg while preserving scientific accuracy and achieving significant performance improvements through JAX's GPU acceleration and automatic differentiation capabilities.
+This roadmap ensures Jorg delivers on the promise of high-performance stellar spectral synthesis while maintaining the scientific rigor and accuracy of the original Korg.jl implementation.
