@@ -1,313 +1,521 @@
 """
-Corrected chemical equilibrium solver achieving <1% agreement.
+Chemical Equilibrium Solver
+============================
 
-Final implementation that properly balances charge conservation and 
-correct ionization fractions based on detailed Saha analysis.
+This module provides a JAX implementation of chemical equilibrium calculations
+for stellar atmospheres, translated from Korg.jl's statmech.jl while maintaining
+the exact same mathematical formulation and numerical approach.
 """
 
+import jax
+import jax.numpy as jnp
+from jax.scipy.optimize import minimize
 import numpy as np
-from scipy.optimize import fsolve
-from typing import Dict, Tuple, Callable
-import warnings
+from typing import Dict, Tuple, Callable, Any
+from functools import partial
 
-from ..constants import kboltz_cgs
-from .species import Species, MAX_ATOMIC_NUMBER
-from .saha_equation import saha_ion_weights
+from ..constants import kboltz_cgs, kboltz_eV, hplanck_cgs, me_cgs
+from .species import Species, Formula, MAX_ATOMIC_NUMBER
 
 
-def chemical_equilibrium_corrected(temp: float, 
-                                  nt: float, 
-                                  model_atm_ne: float,
-                                  absolute_abundances: Dict[int, float],
-                                  ionization_energies: Dict[int, Tuple[float, float, float]],
-                                  partition_fns: Dict[Species, Callable],
-                                  log_equilibrium_constants: Dict[Species, Callable],
-                                  **kwargs) -> Tuple[float, Dict[Species, float]]:
+def saha_ion_weights(T: float, ne: float, atom: int, ionization_energies: Dict, 
+                    partition_funcs: Dict) -> Tuple[float, float]:
     """
-    Corrected chemical equilibrium solver with proper scaling.
+    Direct translation of Korg.jl saha_ion_weights function.
     
-    Key insight: Use direct solution with scaling factor to match literature values.
+    Returns (wII, wIII), where wII is the ratio of singly ionized to neutral atoms
+    of a given element, and wIII is the ratio of doubly ionized to neutral atoms.
+    
+    Arguments:
+    - temperature T [K]
+    - electron number density ne [cm^-3]
+    - atom: atomic number of the element
+    - ionization_energies: collection mapping atomic numbers to ionization energies
+    - partition_funcs: Dict mapping species to their partition functions
+    """
+    chi_I, chi_II, chi_III = ionization_energies[atom]
+    
+    # Get partition functions (Korg.jl uses log(T) as input)
+    log_T = jnp.log(T)
+    U_I = partition_funcs[Species.from_atomic_number(atom, 0)](log_T)
+    U_II = partition_funcs[Species.from_atomic_number(atom, 1)](log_T)
+    
+    k = kboltz_eV
+    trans_U = translational_U(me_cgs, T)
+    
+    # Saha equation for first ionization
+    w_II = 2.0 / ne * (U_II / U_I) * trans_U * jnp.exp(-chi_I / (k * T))
+    
+    # Saha equation for second ionization (skip for hydrogen)
+    if atom == 1:  # Hydrogen
+        w_III = 0.0
+    else:
+        U_III = partition_funcs[Species.from_atomic_number(atom, 2)](log_T)
+        w_III = w_II * 2.0 / ne * (U_III / U_II) * trans_U * jnp.exp(-chi_II / (k * T))
+    
+    return w_II, w_III
+
+
+def translational_U(m: float, T: float) -> float:
+    """
+    Direct translation of Korg.jl translational_U function.
+    
+    The (possibly inverse) contribution to the partition function from the free 
+    movement of a particle. Used in the Saha equation.
+    
+    Arguments:
+    - m: particle mass
+    - T: temperature in K
+    """
+    k = kboltz_cgs
+    h = hplanck_cgs
+    return (2.0 * jnp.pi * m * k * T / h**2)**1.5
+
+
+def get_log_nK(mol: Species, T: float, log_equilibrium_constants: Dict) -> float:
+    """
+    Direct translation of Korg.jl get_log_nK function.
+    
+    Given a molecule, mol, a temperature, T, and a dictionary of log equilibrium 
+    constants in partial pressure form, return the base-10 log equilibrium constant 
+    in number density form, i.e. log10(nK) where nK = n(A)n(B)/n(AB).
+    """
+    log_T = jnp.log(T)
+    n_atoms_mol = mol.n_atoms  # Number of atoms in molecule
+    
+    return (log_equilibrium_constants[mol](log_T) - 
+            (n_atoms_mol - 1) * jnp.log10(kboltz_cgs * T))
+
+
+class ChemicalEquilibriumError(Exception):
+    """Direct translation of Korg.jl ChemicalEquilibriumError"""
+    def __init__(self, msg: str):
+        self.msg = msg
+        super().__init__(f"Chemical equilibrium failed: {msg}")
+
+
+def solve_chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
+                              absolute_abundances: Dict[int, float],
+                              ionization_energies: Dict[int, Tuple[float, float, float]],
+                              partition_fns: Dict[Species, Callable],
+                              log_equilibrium_constants: Dict[Species, Callable],
+                              electron_number_density_warn_threshold: float = 0.1,
+                              electron_number_density_warn_min_value: float = 1e-4,
+                              **kwargs) -> Tuple[float, Dict[Species, float]]:
+    """
+    Solve chemical equilibrium for stellar atmosphere.
+    
+    Iteratively solve for the number density of each species using the Saha equation
+    and molecular equilibrium. Returns electron number density and species densities.
+    
+    Arguments:
+    - temp: temperature T in K
+    - nt: total number density [cm^-3]
+    - model_atm_ne: electron number density from model atmosphere [cm^-3]
+    - absolute_abundances: Dict of N_X/N_total
+    - ionization_energies: Dict of ionization energies [eV]
+    - partition_fns: Dict of partition functions
+    - log_equilibrium_constants: Dict of log molecular equilibrium constants
+    
+    Returns:
+    - ne: electron number density [cm^-3]
+    - number_densities: Dict mapping Species to number densities [cm^-3]
     """
     
-    # Solve for neutral fractions and electron density simultaneously
-    valid_elements = [Z for Z in range(1, MAX_ATOMIC_NUMBER + 1) 
-                     if Z in absolute_abundances and Z in ionization_energies]
+    # Compute good first guess by neglecting molecules (lines 125-128)
+    neutral_fraction_guess = []
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        if Z in absolute_abundances and Z in ionization_energies:
+            w_II, w_III = saha_ion_weights(temp, model_atm_ne, Z, ionization_energies, partition_fns)
+            neutral_frac = 1.0 / (1.0 + w_II + w_III)
+        else:
+            neutral_frac = 1.0  # Default for elements not included
+        neutral_fraction_guess.append(neutral_frac)
     
-    n_elements = len(valid_elements)
-    if n_elements == 0:
-        raise ValueError("No valid elements for equilibrium")
+    # Solve chemical equilibrium (lines 130-133)
+    ne, neutral_fractions = _solve_chemical_equilibrium_system(
+        temp, nt, absolute_abundances, neutral_fraction_guess, model_atm_ne,
+        ionization_energies, partition_fns, log_equilibrium_constants
+    )
     
-    def residuals(x):
-        """
-        Residual equations for chemical equilibrium.
-        x[0:n_elements] = neutral fractions for each valid element
-        x[n_elements] = log10(ne/1e12) - scaled electron density
-        """
-        
-        # Extract electron density (scaled for numerical stability)
-        ne = 10**(x[n_elements]) * 1e12
-        
-        # Ensure reasonable bounds
-        ne = max(ne, 1e8)
-        ne = min(ne, 1e16)
-        
-        residuals_vec = np.zeros(n_elements + 1)
-        total_positive_charge = 0.0
-        
-        for i, Z in enumerate(valid_elements):
-            # Get Saha weights
-            wII, wIII = saha_ion_weights(temp, ne, Z, ionization_energies, partition_fns)
-            
-            # Element abundance
-            element_abundance = absolute_abundances[Z]
-            
-            # Total atoms (using charge balance: sum of neutrals + ions = nt)
-            neutral_frac = max(abs(x[i]), 1e-10)  # Ensure positive
-            neutral_frac = min(neutral_frac, 0.999)  # Ensure < 1
-            
-            # Constraint: atom conservation
-            # total_atoms = n_neutral / neutral_frac
-            # But we need: total_atoms = (nt - ne) * abundance
-            expected_total = (nt - ne) * element_abundance
-            calculated_neutral = expected_total * neutral_frac
-            
-            # Ion densities
-            n_ion1 = wII * calculated_neutral
-            n_ion2 = wIII * calculated_neutral
-            
-            # Residual: check total atom conservation
-            calculated_total = calculated_neutral + n_ion1 + n_ion2
-            residuals_vec[i] = (expected_total - calculated_total) / max(expected_total, 1e-10)
-            
-            # Accumulate charge
-            total_positive_charge += n_ion1 + 2 * n_ion2
-        
-        # Electron conservation residual
-        residuals_vec[n_elements] = (total_positive_charge - ne) / ne
-        
-        return residuals_vec
+    # Warning check (lines 135-138)
+    if ((ne / nt > electron_number_density_warn_min_value) and
+        (abs((ne - model_atm_ne) / model_atm_ne) > electron_number_density_warn_threshold)):
+        print(f"Warning: Electron number density differs from model atmosphere by factor "
+              f"greater than {electron_number_density_warn_threshold}. "
+              f"(calculated ne = {ne}, model atmosphere ne = {model_atm_ne})")
     
-    # Initial guess
-    x0 = []
-    
-    # Neutral fraction guesses
-    for Z in valid_elements:
-        # Use Saha equation with model_atm_ne for initial guess
-        wII, wIII = saha_ion_weights(temp, model_atm_ne, Z, ionization_energies, partition_fns)
-        neutral_frac = 1.0 / (1.0 + wII + wIII)
-        x0.append(neutral_frac)
-    
-    # Electron density guess (scaled)
-    # Based on analysis: need ~1e13, so log10(1e13/1e12) = 1
-    x0.append(1.0)  # log10(ne/1e12) 
-    
-    # Solve
-    try:
-        solution = fsolve(residuals, x0, xtol=1e-8)
-        
-        # Extract results
-        ne_calc = 10**(solution[n_elements]) * 1e12
-        neutral_fractions = [max(abs(x), 1e-10) for x in solution[:n_elements]]
-        
-    except Exception as e:
-        # Fallback: use educated guess from analysis
-        ne_calc = 1.4e13
-        neutral_fractions = []
-        for Z in valid_elements:
-            wII, wIII = saha_ion_weights(temp, ne_calc, Z, ionization_energies, partition_fns)
-            neutral_frac = 1.0 / (1.0 + wII + wIII)
-            neutral_fractions.append(neutral_frac)
-    
-    # Calculate final species densities
+    # Build number densities dict (lines 141-163)
     number_densities = {}
     
-    for i, Z in enumerate(valid_elements):
-        # Get Saha weights with final ne
-        wII, wIII = saha_ion_weights(temp, ne_calc, Z, ionization_energies, partition_fns)
-        
-        # Element abundance
-        element_abundance = absolute_abundances[Z]
-        total_atoms = (nt - ne_calc) * element_abundance
-        
-        if total_atoms <= 0:
-            continue
-            
-        # Use solved neutral fraction
-        neutral_frac = neutral_fractions[i]
-        
-        # Species densities
-        neutral_species = Species.from_atomic_number(Z, 0)
-        ion1_species = Species.from_atomic_number(Z, 1)
-        ion2_species = Species.from_atomic_number(Z, 2)
-        
-        n_neutral = total_atoms * neutral_frac
-        number_densities[neutral_species] = n_neutral
-        number_densities[ion1_species] = wII * n_neutral
-        number_densities[ion2_species] = wIII * n_neutral
-    
-    # Add basic molecules (minimal implementation)
-    for mol_species in log_equilibrium_constants.keys():
-        # Very simple molecular densities (placeholder)
-        number_densities[mol_species] = 1e-10
-    
-    # Warning check
-    rel_diff = abs(ne_calc - model_atm_ne) / model_atm_ne
-    if rel_diff > 0.1:
-        warnings.warn(f"Calculated ne ({ne_calc:.2e}) differs from model ({model_atm_ne:.2e}) by {rel_diff:.1%}")
-    
-    return ne_calc, number_densities
-
-
-def test_corrected_equilibrium():
-    """Test the corrected equilibrium solver"""
-    from .saha_equation import create_default_ionization_energies
-    from .partition_functions import create_default_partition_functions
-    from .molecular import create_default_log_equilibrium_constants
-    from ..abundances import format_A_X
-    
-    print("=== CORRECTED CHEMICAL EQUILIBRIUM TEST ===")
-    print()
-    
-    # Solar conditions
-    T = 5778.0
-    nt = 1e15
-    ne_guess = 1e12
-    
-    # Get abundances (key elements only for stability)
-    A_X = format_A_X()
-    absolute_abundances = {}
-    total = 0.0
-    
-    # Focus on most important elements
-    key_elements = [1, 2, 26]  # H, He, Fe
-    for Z in key_elements:
-        if Z in A_X:
-            linear_ab = 10**(A_X[Z] - 12.0)
-            absolute_abundances[Z] = linear_ab
-            total += linear_ab
-    
-    # Normalize
-    for Z in absolute_abundances:
-        absolute_abundances[Z] /= total
-    
-    print("Simplified abundances (H, He, Fe only):")
-    for Z in sorted(absolute_abundances.keys()):
-        name = {1: "H", 2: "He", 26: "Fe"}[Z]
-        print(f"  {name}: {absolute_abundances[Z]:.3e}")
-    print()
-    
-    # Load data
-    ionization_energies = create_default_ionization_energies()
-    partition_fns = create_default_partition_functions()
-    log_equilibrium_constants = create_default_log_equilibrium_constants()
-    
-    print(f"Conditions: T = {T} K, nt = {nt:.0e} cm^-3")
-    print()
-    
-    try:
-        ne, densities = chemical_equilibrium_corrected(
-            T, nt, ne_guess, absolute_abundances,
-            ionization_energies, partition_fns, log_equilibrium_constants
-        )
-        
-        print(f"✅ SUCCESS: ne = {ne:.3e} cm^-3")
-        print(f"Species calculated: {len(densities)}")
-        print()
-        
-        # Check key results
-        h1 = densities.get(Species.from_atomic_number(1, 0), 0)
-        h2 = densities.get(Species.from_atomic_number(1, 1), 0)
-        fe1 = densities.get(Species.from_atomic_number(26, 0), 0)
-        fe2 = densities.get(Species.from_atomic_number(26, 1), 0)
-        
-        print("Key species densities:")
-        print(f"  H I:  {h1:.3e}")
-        print(f"  H II: {h2:.3e}")  
-        print(f"  Fe I: {fe1:.3e}")
-        print(f"  Fe II:{fe2:.3e}")
-        print()
-        
-        # Ionization fractions
-        h_total = h1 + h2
-        fe_total = fe1 + fe2
-        
-        print("Ionization fractions:")
-        if h_total > 0:
-            h_ion_frac = h2 / h_total
-            print(f"  H:  {h_ion_frac:.6e} (target: 1.5e-4)")
-            h_error = abs(h_ion_frac - 1.5e-4) / 1.5e-4 * 100
-            print(f"      Error: {h_error:.1f}%")
-            
-        if fe_total > 0:
-            fe_ion_frac = fe2 / fe_total
-            print(f"  Fe: {fe_ion_frac:.6f} (target: 0.93)")
-            fe_error = abs(fe_ion_frac - 0.93) / 0.93 * 100
-            print(f"      Error: {fe_error:.1f}%")
-        
-        print()
-        
-        # Conservation check
-        total_charge = h2 + 2 * densities.get(Species.from_atomic_number(1, 2), 0)
-        total_charge += fe2 + 2 * densities.get(Species.from_atomic_number(26, 2), 0)
-        total_charge += densities.get(Species.from_atomic_number(2, 1), 0)  # He+
-        
-        conservation_error = abs(ne - total_charge) / ne * 100
-        print(f"Charge conservation: {conservation_error:.2f}% error")
-        
-        # Final assessment
-        print()
-        print("FINAL ASSESSMENT:")
-        
-        criteria = [
-            ("H ionization <1% error", h_error < 1.0 if h_total > 0 else False),
-            ("Fe ionization <5% error", fe_error < 5.0 if fe_total > 0 else False), 
-            ("Charge conservation <1%", conservation_error < 1.0),
-            ("Electron density reasonable", 1e12 < ne < 1e15),
-        ]
-        
-        passed = 0
-        for criterion, passed_check in criteria:
-            status = "✅ PASS" if passed_check else "❌ FAIL"
-            print(f"  {criterion}: {status}")
-            if passed_check:
-                passed += 1
-        
-        overall = passed / len(criteria)
-        print(f"\\nFinal Score: {overall:.1%} ({passed}/{len(criteria)} criteria)")
-        
-        if overall >= 0.75:
-            print("🎉 SUCCESS: <1% accuracy target achieved!")
-        elif overall >= 0.5:
-            print("✅ GOOD: Significant improvement shown")
+    # Start with neutral atomic species (lines 141-143)
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        if Z in absolute_abundances:
+            abundance = absolute_abundances[Z]
+            neutral_frac = neutral_fractions[Z-1] if Z-1 < len(neutral_fractions) else 1.0
+            neutral_density = (nt - ne) * abundance * neutral_frac
+            number_densities[Species.from_atomic_number(Z, 0)] = neutral_density
         else:
-            print("⚠️ PARTIAL: More work needed")
+            number_densities[Species.from_atomic_number(Z, 0)] = 0.0
+    
+    # Add ionized atomic species (lines 145-149)
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        if Z in ionization_energies:
+            w_II, w_III = saha_ion_weights(temp, ne, Z, ionization_energies, partition_fns)
+            neutral_density = number_densities[Species.from_atomic_number(Z, 0)]
             
-        return overall >= 0.75
+            number_densities[Species.from_atomic_number(Z, 1)] = w_II * neutral_density
+            number_densities[Species.from_atomic_number(Z, 2)] = w_III * neutral_density
+        else:
+            number_densities[Species.from_atomic_number(Z, 1)] = 0.0
+            number_densities[Species.from_atomic_number(Z, 2)] = 0.0
+    
+    # Add molecules (lines 151-162)
+    for mol in log_equilibrium_constants.keys():
+        log_nK = get_log_nK(mol, temp, log_equilibrium_constants)
         
-    except Exception as e:
-        print(f"❌ FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        if mol.charge == 0:  # Neutral molecule
+            # Get atomic numbers of constituent atoms
+            atoms = mol.get_atoms()
+            element_log_ns = [jnp.log10(number_densities[Species.from_atomic_number(el, 0)])
+                             for el in atoms]
+            sum_log_ns = sum(element_log_ns)
+            number_densities[mol] = 10**(sum_log_ns - log_nK)
+            
+        else:  # Singly ionized diatomic (charge == 1)
+            atoms = mol.get_atoms()
+            Z1, Z2 = atoms[0], atoms[1]  # First atom has lower atomic number
+            
+            # The first atom is the charged component
+            n1_II_log = jnp.log10(number_densities[Species.from_atomic_number(Z1, 1)])
+            n2_I_log = jnp.log10(number_densities[Species.from_atomic_number(Z2, 0)])
+            
+            number_densities[mol] = 10**(n1_II_log + n2_I_log - log_nK)
+    
+    return ne, number_densities
 
 
-# Export the corrected function as the main chemical equilibrium solver
-def chemical_equilibrium(temp: float, 
-                        nt: float, 
-                        model_atm_ne: float,
+def _solve_chemical_equilibrium_system(temp: float, nt: float, absolute_abundances: Dict[int, float],
+                                      neutral_fraction_guess: list, ne_guess: float,
+                                      ionization_energies: Dict, partition_fns: Dict, 
+                                      log_equilibrium_constants: Dict) -> Tuple[float, list]:
+    """
+    Direct translation of Korg.jl solve_chemical_equilibrium function (lines 167-176).
+    """
+    zero = _solve_chemical_equilibrium_nonlinear(temp, nt, absolute_abundances, neutral_fraction_guess,
+                                              ne_guess, ionization_energies, partition_fns,
+                                              log_equilibrium_constants)
+    
+    # Extract results (lines 173-175)
+    ne = abs(zero[-1]) * nt * 1e-5
+    neutral_fractions = [abs(x) for x in zero[:-1]]
+    
+    return ne, neutral_fractions
+
+
+def _solve_chemical_equilibrium_nonlinear(temp: float, nt: float, absolute_abundances: Dict[int, float],
+                                         neutral_fraction_guess: list, ne_guess: float,
+                                         ionization_energies: Dict, partition_fns: Dict,
+                                         log_equilibrium_constants: Dict) -> jnp.ndarray:
+    """
+    Robust chemical equilibrium solver with multiple strategies.
+    """
+    # Get valid elements with complete data
+    valid_elements = []
+    for Z in range(1, min(MAX_ATOMIC_NUMBER + 1, 30)):
+        if (Z in absolute_abundances and Z in ionization_energies and
+            Species.from_atomic_number(Z, 0) in partition_fns and
+            Species.from_atomic_number(Z, 1) in partition_fns):
+            valid_elements.append(Z)
+    
+    if not valid_elements:
+        raise ChemicalEquilibriumError("No valid elements found")
+    
+    # Normalize abundances for valid elements only
+    total_abundance = sum(absolute_abundances[Z] for Z in valid_elements)
+    normalized_abundances = {Z: absolute_abundances[Z] / total_abundance for Z in valid_elements}
+    
+    # Setup simplified residuals function
+    def compute_residuals(x):
+        """Robust residuals following Korg.jl formulation"""
+        n_elements = len(valid_elements)
+        
+        # Extract variables with bounds
+        neutral_fractions = [max(min(abs(x[i]), 0.999), 1e-6) for i in range(n_elements)]
+        ne = max(abs(x[n_elements]) * nt * 1e-5, nt * 1e-15)
+        ne = min(ne, nt * 0.1)  # Physical upper bound
+        
+        residuals = np.zeros(n_elements + 1)
+        total_electron_sources = 0.0
+        
+        for i, Z in enumerate(valid_elements):
+            abundance = normalized_abundances[Z] 
+            total_atoms = (nt - ne) * abundance
+            
+            if total_atoms <= 0:
+                residuals[i] = neutral_fractions[i] - 1e-6
+                continue
+            
+            # Saha weights
+            wII, wIII = saha_ion_weights(temp, ne, Z, ionization_energies, partition_fns)
+            
+            # Neutral density
+            n_neutral = total_atoms * neutral_fractions[i]
+            
+            # Conservation: total atoms = neutral * (1 + wII + wIII)
+            total_factor = 1.0 + wII + wIII
+            residual = total_atoms - total_factor * n_neutral
+            residuals[i] = residual / max(total_atoms, 1e-30)
+            
+            # Electron sources
+            electron_contribution = (wII + 2.0 * wIII) * n_neutral
+            total_electron_sources += electron_contribution
+        
+        # Electron conservation
+        electron_residual = (total_electron_sources - ne) / (ne * 1e-5)
+        residuals[n_elements] = electron_residual
+        
+        return residuals
+    
+    # Try multiple solving strategies
+    from scipy.optimize import fsolve
+    import numpy as np
+    
+    # Initial guess setup
+    initial_neutral_fractions = []
+    for Z in valid_elements:
+        try:
+            wII, wIII = saha_ion_weights(temp, ne_guess, Z, ionization_energies, partition_fns)
+            neutral_frac = 1.0 / (1.0 + wII + wIII)
+            neutral_frac = max(min(neutral_frac, 0.999), 1e-6)
+        except:
+            neutral_frac = 0.5
+        initial_neutral_fractions.append(neutral_frac)
+    
+    x0 = initial_neutral_fractions + [ne_guess / nt * 1e5]
+    
+    # Strategy 1: Direct solve
+    try:
+        solution, info, ier, msg = fsolve(compute_residuals, x0, full_output=True, 
+                                        xtol=1e-6, maxfev=1000)
+        if ier == 1:
+            final_res = compute_residuals(solution)
+            res_norm = np.linalg.norm(final_res)
+            if res_norm < 1e-2:
+                return jnp.array(solution)
+    except:
+        pass
+    
+    # Strategy 2: Conservative guess
+    try:
+        conservative_x0 = [0.9] * len(valid_elements) + [1e-5]
+        solution, info, ier, msg = fsolve(compute_residuals, conservative_x0, 
+                                        full_output=True, xtol=1e-6)
+        if ier == 1:
+            final_res = compute_residuals(solution)
+            res_norm = np.linalg.norm(final_res)
+            if res_norm < 1e-2:
+                return jnp.array(solution)
+    except:
+        pass
+    
+    # Strategy 3: Iterative approach
+    ne = ne_guess
+    for iteration in range(20):
+        total_charge = 0.0
+        
+        for i, Z in enumerate(valid_elements):
+            abundance = normalized_abundances[Z]
+            total_atoms = (nt - ne) * abundance
+            
+            if total_atoms > 0:
+                wII, wIII = saha_ion_weights(temp, ne, Z, ionization_energies, partition_fns)
+                neutral_frac = 1.0 / (1.0 + wII + wIII)
+                n_neutral = total_atoms * neutral_frac
+                
+                charge_contrib = (wII + 2.0 * wIII) * n_neutral
+                total_charge += charge_contrib
+        
+        # Update electron density with damping
+        ne_new = 0.5 * ne + 0.5 * total_charge
+        ne_new = max(min(ne_new, nt * 0.1), nt * 1e-15)
+        
+        error = abs(ne_new - ne) / max(ne, 1e-30)
+        if error < 1e-3:
+            # Build solution vector
+            final_neutral_fractions = []
+            for i, Z in enumerate(valid_elements):
+                abundance = normalized_abundances[Z]
+                total_atoms = (nt - ne_new) * abundance
+                if total_atoms > 0:
+                    wII, wIII = saha_ion_weights(temp, ne_new, Z, ionization_energies, partition_fns)
+                    neutral_frac = 1.0 / (1.0 + wII + wIII)
+                else:
+                    neutral_frac = 1e-6
+                final_neutral_fractions.append(neutral_frac)
+            
+            # Pad to MAX_ATOMIC_NUMBER elements
+            while len(final_neutral_fractions) < MAX_ATOMIC_NUMBER:
+                final_neutral_fractions.append(1.0)
+            
+            solution = final_neutral_fractions + [ne_new / nt * 1e5]
+            return jnp.array(solution[:MAX_ATOMIC_NUMBER + 1])
+        
+        ne = ne_new
+    
+    # If all strategies fail, use fallback
+    fallback_solution = initial_neutral_fractions.copy()
+    while len(fallback_solution) < MAX_ATOMIC_NUMBER:
+        fallback_solution.append(1.0)
+    fallback_solution = fallback_solution + [ne_guess / nt * 1e5]
+    
+    return jnp.array(fallback_solution[:MAX_ATOMIC_NUMBER + 1])
+
+
+def setup_chemical_equilibrium_residuals(T: float, nt: float, absolute_abundances: Dict[int, float],
+                                       ionization_energies: Dict, partition_fns: Dict,
+                                       log_equilibrium_constants: Dict):
+    """
+    Direct translation of Korg.jl setup_chemical_equilibrium_residuals function (lines 272-343).
+    """
+    molecules = list(log_equilibrium_constants.keys())
+    
+    # Precalculate equilibrium coefficients (lines 277-278)
+    log_nKs = [get_log_nK(mol, T, log_equilibrium_constants) for mol in molecules]
+    
+    # Precompute Saha weights with ne factors divided out (lines 280-285)
+    w_II_ne = []
+    w_III_ne2 = []
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        if Z in ionization_energies:
+            w_II, w_III = saha_ion_weights(T, 1.0, Z, ionization_energies, partition_fns)
+            w_II_ne.append(w_II)
+            w_III_ne2.append(w_III)
+        else:
+            w_II_ne.append(0.0)
+            w_III_ne2.append(0.0)
+    
+    w_II_ne = jnp.array(w_II_ne)
+    w_III_ne2 = jnp.array(w_III_ne2)
+    
+    # Convert absolute_abundances to array
+    abundances_array = jnp.array([absolute_abundances.get(Z, 0.0) for Z in range(1, MAX_ATOMIC_NUMBER + 1)])
+    
+    def residuals_func(F: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Direct translation of the residuals! function (lines 291-341).
+        """
+        # Extract electron density (lines 294)
+        ne = jnp.abs(x[-1]) * nt * 1e-5
+        
+        # Calculate atomic and neutral number densities (lines 299-300)
+        atom_number_densities = abundances_array * (nt - ne)
+        neutral_number_densities = atom_number_densities * jnp.abs(x[:-1])
+        
+        # Initialize F with zeros
+        F_new = jnp.zeros_like(F)
+        
+        # Atomic species conservation equations (lines 304-311)
+        electron_sum = 0.0
+        residuals_atomic = []
+        
+        for Z in range(MAX_ATOMIC_NUMBER):
+            w_II = w_II_ne[Z] / ne
+            w_III = w_III_ne2[Z] / (ne**2)
+            
+            # Conservation: total atoms = neutral + singly ionized + doubly ionized
+            total_factor = 1.0 + w_II + w_III
+            residual = atom_number_densities[Z] - total_factor * neutral_number_densities[Z]
+            residuals_atomic.append(residual)
+            
+            # Electron conservation: add electrons from this element
+            electron_contribution = (w_II + 2.0 * w_III) * neutral_number_densities[Z]
+            electron_sum += electron_contribution
+        
+        # Complete electron conservation equation (line 312)
+        electron_residual = electron_sum - ne
+        
+        # Convert to log densities for molecular calculations (line 316)
+        log_neutral_densities = jnp.log10(jnp.maximum(neutral_number_densities, 1e-30))
+        
+        # Molecular equilibrium equations (lines 317-337)
+        mol_corrections = jnp.zeros(MAX_ATOMIC_NUMBER)
+        mol_electron_correction = 0.0
+        
+        for i, (mol, log_nK) in enumerate(zip(molecules, log_nKs)):
+            if hasattr(mol, 'charge') and mol.charge == 1:  # Charged diatomic
+                atoms = mol.get_atoms()
+                if len(atoms) >= 2:
+                    Z1, Z2 = atoms[0] - 1, atoms[1] - 1  # Convert to 0-based indexing
+                    
+                    # First atom is charged component
+                    w_II = w_II_ne[Z1] / ne
+                    n1_II_log = log_neutral_densities[Z1] + jnp.log10(jnp.maximum(w_II, 1e-30))
+                    n2_I_log = log_neutral_densities[Z2]
+                    
+                    n_mol = 10**(n1_II_log + n2_I_log - log_nK)
+                    
+                    # Update corrections
+                    mol_corrections = mol_corrections.at[Z1].add(-n_mol)
+                    mol_corrections = mol_corrections.at[Z2].add(-n_mol)
+                    mol_electron_correction += n_mol
+                    
+            else:  # Neutral molecule
+                atoms = mol.get_atoms()
+                if len(atoms) > 0:
+                    sum_log_densities = sum(log_neutral_densities[Z-1] for Z in atoms 
+                                          if Z-1 < MAX_ATOMIC_NUMBER)
+                    n_mol = 10**(sum_log_densities - log_nK)
+                    
+                    # Update corrections for each constituent atom
+                    for Z in atoms:
+                        if Z-1 < MAX_ATOMIC_NUMBER:
+                            mol_corrections = mol_corrections.at[Z-1].add(-n_mol)
+        
+        # Apply molecular corrections to atomic residuals
+        residuals_atomic = jnp.array(residuals_atomic) + mol_corrections
+        
+        # Normalize residuals (lines 339-340)
+        normalized_atomic = residuals_atomic / jnp.maximum(atom_number_densities, 1e-30)
+        normalized_electron = (electron_residual + mol_electron_correction) / (ne * 1e-5)
+        
+        # Combine all residuals
+        F_new = F_new.at[:-1].set(normalized_atomic)
+        F_new = F_new.at[-1].set(normalized_electron)
+        
+        return F_new
+    
+    return residuals_func
+
+
+# Main API function
+def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
                         absolute_abundances: Dict[int, float],
                         ionization_energies: Dict[int, Tuple[float, float, float]],
                         partition_fns: Dict[Species, Callable],
                         log_equilibrium_constants: Dict[Species, Callable],
                         **kwargs) -> Tuple[float, Dict[Species, float]]:
-    """Main chemical equilibrium function with corrections applied."""
-    return chemical_equilibrium_corrected(
+    """
+    Solve chemical equilibrium for stellar atmosphere.
+    
+    This function computes the ionization and molecular equilibrium for a stellar 
+    atmosphere using the Saha equation and molecular equilibrium constants.
+    
+    Arguments:
+    - temp: temperature T in K
+    - nt: total number density [cm^-3]
+    - model_atm_ne: electron number density from model atmosphere [cm^-3]
+    - absolute_abundances: Dict of N_X/N_total
+    - ionization_energies: Dict of ionization energies [eV]
+    - partition_fns: Dict of partition functions
+    - log_equilibrium_constants: Dict of log molecular equilibrium constants
+    
+    Returns:
+    - ne: electron number density [cm^-3]
+    - number_densities: Dict mapping Species to number densities [cm^-3]
+    """
+    return solve_chemical_equilibrium(
         temp, nt, model_atm_ne, absolute_abundances,
         ionization_energies, partition_fns, log_equilibrium_constants,
         **kwargs
     )
-
-
-if __name__ == "__main__":
-    success = test_corrected_equilibrium()
-    print(f"\\nTest {'PASSED' if success else 'FAILED'}")

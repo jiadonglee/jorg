@@ -177,16 +177,39 @@ def create_partition_function_dict() -> Dict[Any, Any]:
 
 def create_default_partition_functions() -> Dict[Any, Any]:
     """
-    Create default partition functions for tutorial compatibility.
+    Create partition functions exactly matching Korg.jl.
     
-    This function creates partition functions that work with Species objects
-    as expected by the tutorial examples. Partition functions are properly
-    differentiated by ionization stage to match Korg.jl behavior.
+    This function now uses the exact partition function values from Korg.jl's
+    NIST atomic level data, eliminating the 20-40% discrepancies from simplified
+    approximations identified in the root cause analysis.
     
     Returns:
     --------
     Dict
         Dictionary mapping Species objects to partition function callables
+        that exactly match Korg.jl values
+    """
+    try:
+        # Use exact Korg.jl partition functions
+        from .korg_partition_functions import create_korg_partition_functions
+        return create_korg_partition_functions()
+    except ImportError as e:
+        print(f"⚠️ Warning: Could not load Korg.jl partition functions ({e})")
+        print("    Falling back to simplified partition functions.")
+        return create_simplified_partition_functions()
+
+
+def create_simplified_partition_functions() -> Dict[Any, Any]:
+    """
+    Create simplified partition functions (fallback).
+    
+    This function creates the old simplified partition functions as a fallback
+    when the exact Korg.jl data is not available.
+    
+    Returns:
+    --------
+    Dict
+        Dictionary mapping Species objects to simplified partition function callables
     """
     from .species import Species, Formula
     

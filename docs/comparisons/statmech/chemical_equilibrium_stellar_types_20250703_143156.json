@@ -1,0 +1,198 @@
+{
+  "M_dwarf": {
+    "stellar_type": "M_dwarf",
+    "conditions": {
+      "temp": 3500.0,
+      "nt": 1000000000000000.0,
+      "ne_guess": 50000000000.0,
+      "description": "M dwarf (cool main sequence)",
+      "expected_h_ion": 2.625e-10,
+      "expected_fe_ion": 0.0401
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": "109939554.21867473",
+    "species_densities": {
+      "H_I": "920830003212435.2",
+      "H_II": "109939542.13196915",
+      "Fe_I": "475425753.2148756",
+      "Fe_II": "28643779202.382954"
+    },
+    "ionization_fractions": {
+      "H": "1.1939177548793335e-07",
+      "Fe": "0.9836731204049073"
+    },
+    "errors": {
+      "H_ionization": "45382.58113826031",
+      "Fe_ionization": "2353.050175573335"
+    }
+  },
+  "K_star": {
+    "stellar_type": "K_star",
+    "conditions": {
+      "temp": 4500.0,
+      "nt": 1000000000000000.0,
+      "ne_guess": 1000000000000.0,
+      "description": "K star (orange main sequence)",
+      "expected_h_ion": 1e-06,
+      "expected_fe_ion": 0.5
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": "19890967264.08649",
+    "species_densities": {
+      "H_I": "920792007612377.1",
+      "H_II": "19890571613.507793",
+      "Fe_I": "176885506.96147075",
+      "Fe_II": "28941742624.2002"
+    },
+    "ionization_fractions": {
+      "H": "2.1601123587494512e-05",
+      "Fe": "0.9939253488809737"
+    },
+    "errors": {
+      "H_ionization": "2060.1123587494512",
+      "Fe_ionization": "98.78506977619475"
+    }
+  },
+  "solar": {
+    "stellar_type": "solar",
+    "conditions": {
+      "temp": 5778.0,
+      "nt": 1000000000000000.0,
+      "ne_guess": 1000000000000.0,
+      "description": "Solar type (G2V)",
+      "expected_h_ion": 0.000146,
+      "expected_fe_ion": 0.9314
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": "1158975879276.3625",
+    "species_densities": {
+      "H_I": "918605361726069.0",
+      "H_II": "1157632654187.6182",
+      "Fe_I": "81740050.73306337",
+      "Fe_II": "29003524925.19491"
+    },
+    "ionization_fractions": {
+      "H": "0.0012586206025473334",
+      "Fe": "0.9971896405000706"
+    },
+    "errors": {
+      "H_ionization": "762.0689058543379",
+      "Fe_ionization": "7.06352163410679"
+    }
+  },
+  "F_star": {
+    "stellar_type": "F_star",
+    "conditions": {
+      "temp": 6500.0,
+      "nt": 1000000000000000.0,
+      "ne_guess": 50000000000000.0,
+      "description": "F star (hot main sequence)",
+      "expected_h_ion": 0.005,
+      "expected_fe_ion": 0.98
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": "5755466335660.996",
+    "species_densities": {
+      "H_I": "909808066144953.1",
+      "H_II": "5722340942920.069",
+      "Fe_I": "60386911.07356426",
+      "Fe_II": "28889559916.834793"
+    },
+    "ionization_fractions": {
+      "H": "0.006250301353858622",
+      "Fe": "0.9979140925048142"
+    },
+    "errors": {
+      "H_ionization": "25.006027077172433",
+      "Fe_ionization": "1.8279686229402285"
+    }
+  },
+  "A_star": {
+    "stellar_type": "A_star",
+    "conditions": {
+      "temp": 9000.0,
+      "nt": 1000000000000000.0,
+      "ne_guess": 200000000000000.0,
+      "description": "A star (hot main sequence)",
+      "expected_h_ion": 0.2002,
+      "expected_fe_ion": 0.9974
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": "191117513613179.47",
+    "species_densities": {
+      "H_I": "590251823750488.1",
+      "H_II": "154591609603495.66",
+      "Fe_I": "23613289.2972588",
+      "Fe_II": "23345202984.636715"
+    },
+    "ionization_fractions": {
+      "H": "0.20754913406080422",
+      "Fe": "0.9989895384935009"
+    },
+    "errors": {
+      "H_ionization": "3.6708961342678474",
+      "Fe_ionization": "0.15936820668748386"
+    }
+  },
+  "B_star": {
+    "stellar_type": "B_star",
+    "conditions": {
+      "temp": 15000.0,
+      "nt": 1000000000000000.0,
+      "ne_guess": 500000000000000.0,
+      "description": "B star (very hot main sequence)",
+      "expected_h_ion": 0.85,
+      "expected_fe_ion": 0.999
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": 482175736950730.4,
+    "species_densities": {
+      "H_I": 1926398633166.4758,
+      "H_II": "474901828897094.75",
+      "Fe_I": 19157.31123910964,
+      "Fe_II": "570559902.4372051"
+    },
+    "ionization_fractions": {
+      "H": "0.99595997358809",
+      "Fe": "0.9999664247909"
+    },
+    "errors": {
+      "H_ionization": "17.171761598598824",
+      "Fe_ionization": "0.09673921830831166"
+    }
+  },
+  "white_dwarf": {
+    "stellar_type": "white_dwarf",
+    "conditions": {
+      "temp": 25000.0,
+      "nt": 1e+18,
+      "ne_guess": 1e+16,
+      "description": "Hot white dwarf",
+      "expected_h_ion": 0.99,
+      "expected_fe_ion": 0.999
+    },
+    "success": true,
+    "error": null,
+    "ne_calculated": 4.8043523192181094e+17,
+    "species_densities": {
+      "H_I": 1.7312976870181878e+16,
+      "H_II": "4.611179601958158e+17",
+      "Fe_I": 4109476401.0196614,
+      "Fe_II": "1899579137704.9634"
+    },
+    "ionization_fractions": {
+      "H": "0.9638130072098711",
+      "Fe": "0.9978413085151798"
+    },
+    "errors": {
+      "H_ionization": "2.6451507868817097",
+      "Fe_ionization": "0.11598513361563297"
+    }
+  }
+}
