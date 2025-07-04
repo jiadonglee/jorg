@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from jax import jit
 from typing import Dict, Any
 from ..constants import kboltz_cgs, RYDBERG, ELECTRON_MASS, EV_TO_ERG
+from .species import Species, Formula
 
 
 @jit

@@ -35,7 +35,7 @@ from .partition_functions import (
 from .molecular import (
     create_default_log_equilibrium_constants,
     get_log_nk,
-    create_default_equilibrium_constants
+    get_log_nK
 )
 
 # Species definitions
@@ -66,7 +66,7 @@ __all__ = [
     # Molecular equilibrium
     'create_default_log_equilibrium_constants',
     'get_log_nk',
-    'create_default_equilibrium_constants',
+    'get_log_nK',
     
     # Species and data structures
     'Species',

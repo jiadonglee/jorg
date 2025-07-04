@@ -501,6 +501,102 @@ def calculate_continuum_opacity_complete(
     return alpha_continuum
 
 
+def calculate_total_continuum_opacity(
+    frequencies: np.ndarray,
+    temperature: float,
+    electron_density: float,
+    number_densities: Dict
+) -> np.ndarray:
+    """
+    Calculate total continuum opacity from chemical equilibrium results.
+    
+    This function provides the interface needed for opacity comparison tests.
+    
+    Parameters:
+    -----------
+    frequencies : np.ndarray
+        Frequencies in Hz
+    temperature : float
+        Temperature in K
+    electron_density : float
+        Electron density in cm⁻³
+    number_densities : Dict
+        Dictionary mapping species to number densities
+        
+    Returns:
+    --------
+    np.ndarray
+        Continuum opacity per unit mass in cm²/g
+    """
+    from ..statmech.species import Species, Formula
+    
+    # Extract species densities from number_densities dict
+    h_i_density = 0.0
+    h_ii_density = 0.0
+    he_i_density = 0.0
+    he_ii_density = 0.0
+    
+    # Convert Species objects to densities
+    for species, density in number_densities.items():
+        if hasattr(species, 'formula') and hasattr(species, 'charge'):
+            if len(species.formula.atoms) == 1:  # Atomic species
+                Z = species.formula.atoms[0]
+                charge = species.charge
+                
+                if Z == 1:  # Hydrogen
+                    if charge == 0:
+                        h_i_density = density
+                    elif charge == 1:
+                        h_ii_density = density
+                elif Z == 2:  # Helium
+                    if charge == 0:
+                        he_i_density = density
+                    elif charge == 1:
+                        he_ii_density = density
+    
+    # Metal densities (simplified - just include what we have)
+    metal_densities = {}
+    for species, density in number_densities.items():
+        if hasattr(species, 'formula') and hasattr(species, 'charge'):
+            if len(species.formula.atoms) == 1:  # Atomic species
+                Z = species.formula.atoms[0]
+                if Z > 2:  # Metals (Z > 2)
+                    # Create simple key for metal species
+                    element_symbols = {
+                        26: 'Fe', 12: 'Mg', 14: 'Si', 20: 'Ca', 11: 'Na', 13: 'Al'
+                    }
+                    if Z in element_symbols:
+                        element = element_symbols[Z]
+                        charge = species.charge
+                        key = f"{element}_{'I' * (charge + 1)}"
+                        metal_densities[key] = density
+    
+    # Convert frequencies to JAX array
+    frequencies_jax = jnp.array(frequencies)
+    
+    # Calculate continuum absorption coefficient (cm⁻¹)
+    alpha_continuum = total_continuum_absorption_jorg(
+        frequencies_jax,
+        temperature,
+        electron_density,
+        h_i_density,
+        h_ii_density,
+        he_i_density,
+        he_ii_density,
+        metal_densities
+    )
+    
+    # Convert to opacity per unit mass (cm²/g)
+    # Divide by mass density (approximated by total particle density * mean molecular weight)
+    total_particle_density = sum(number_densities.values())
+    mean_molecular_weight = 1.3  # Approximate mean molecular weight in AMU for stellar material
+    mass_density = total_particle_density * mean_molecular_weight * AMU_CGS  # g/cm³
+    
+    opacity_per_mass = np.array(alpha_continuum) / mass_density
+    
+    return opacity_per_mass
+
+
 if __name__ == "__main__":
     # Test the complete continuum implementation
     print("Testing complete continuum absorption implementation...")

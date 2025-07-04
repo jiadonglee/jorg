@@ -152,12 +152,52 @@ class Formula:
             if formula_str in ATOMIC_NUMBERS:
                 atoms = [ATOMIC_NUMBERS[formula_str]]
             else:
-                raise ValueError(f"Cannot parse formula: {formula_str}. "
-                               f"Supported formats: element symbols (e.g., 'H', 'Fe'), "
-                               f"molecule names (e.g., 'CO', 'H2O'), "
-                               f"or MOOG-style codes (e.g., '0608' for CO)")
+                # Try general molecular parser for Barklem & Collet data
+                atoms = cls._parse_general_molecular_formula(formula_str)
+                if not atoms:
+                    raise ValueError(f"Cannot parse formula: {formula_str}. "
+                                   f"Supported formats: element symbols (e.g., 'H', 'Fe'), "
+                                   f"molecule names (e.g., 'CO', 'H2O'), "
+                                   f"or MOOG-style codes (e.g., '0608' for CO)")
         
         return cls.from_atomic_numbers(atoms)
+    
+    @classmethod
+    def _parse_general_molecular_formula(cls, formula_str: str) -> List[int]:
+        """
+        Parse general molecular formula for Barklem & Collet data.
+        
+        Handles cases like:
+        - "ClCl" -> [Cl, Cl]
+        - "ONa" -> [Na, O] (reordered)
+        - "OO" -> [O, O]
+        - "HC" -> [H, C]
+        
+        Returns list of atomic numbers, or empty list if parsing fails.
+        """
+        atoms = []
+        
+        # Use regex to find all element symbols (with optional numbers)
+        pattern = r'([A-Z][a-z]?)(\d*)'
+        matches = re.findall(pattern, formula_str)
+        
+        if not matches:
+            return []
+        
+        for element, count_str in matches:
+            if element not in ATOMIC_NUMBERS:
+                return []  # Unknown element
+            
+            count = int(count_str) if count_str else 1
+            Z = ATOMIC_NUMBERS[element]
+            atoms.extend([Z] * count)
+        
+        if len(atoms) == 0:
+            return []
+        
+        # Sort atoms by atomic number for consistent representation
+        atoms.sort()
+        return atoms
     
     @cached_property
     def is_atom(self) -> bool:
