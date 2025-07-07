@@ -79,10 +79,16 @@ def run_korg_opacity_calculation():
     # Use model atmosphere electron density
     nₑ = nₑ_model
     
-    # Calculate total continuum opacity
+    # Calculate total continuum opacity (returns absorption coefficient in cm⁻¹)
     α_continuum = Korg.total_continuum_absorption(
         νs, T, nₑ, number_densities, Korg.default_partition_funcs
     )
+    
+    # Convert to opacity per unit mass (cm²/g)
+    # Approximate mass density from number density and mean molecular weight
+    mean_molecular_weight = 1.4  # AMU (typical for stellar atmosphere)
+    mass_density = nₜ * mean_molecular_weight * 1.66054e-24  # g/cm³
+    opacity_per_mass = α_continuum ./ mass_density  # cm²/g
     
     # Results to export
     results = Dict(
@@ -91,7 +97,9 @@ def run_korg_opacity_calculation():
         "temperature_k" => T,
         "electron_density_cm3" => nₑ,
         "total_density_cm3" => nₜ,
-        "continuum_opacity_cm2_g" => collect(α_continuum),
+        "mass_density_g_cm3" => mass_density,
+        "continuum_absorption_cm_inv" => collect(α_continuum),  # Original Korg result
+        "continuum_opacity_cm2_g" => collect(opacity_per_mass),  # Converted to per mass
         "layer_number" => layer_index,
         "stellar_params" => Dict(
             "Teff" => Teff,
@@ -111,7 +119,8 @@ def run_korg_opacity_calculation():
     println("Electron density: ", nₑ, " cm⁻³")
     println("Total density: ", nₜ, " cm⁻³")
     println("Wavelength range: ", minimum(λs), "-", maximum(λs), " Å")
-    println("Continuum opacity range: ", minimum(α_continuum), "-", maximum(α_continuum), " cm²/g")
+    println("Continuum absorption range: ", minimum(α_continuum), "-", maximum(α_continuum), " cm⁻¹")
+    println("Continuum opacity range: ", minimum(opacity_per_mass), "-", maximum(opacity_per_mass), " cm²/g")
     """
     
     # Write Julia script
@@ -197,13 +206,28 @@ def calculate_jorg_opacity(korg_results):
         print(f"Korg electron density: {korg_results['electron_density_cm3']:.2e} cm⁻³")
         print(f"Electron density ratio (Jorg/Korg): {nₑ/korg_results['electron_density_cm3']:.3f}")
         
-        # Calculate continuum opacity
+        # Debug: Print density values
+        print(f"Debug: H I density: {number_densities[Species(Formula([1]), 0)]:.2e} cm⁻³")
+        print(f"Debug: Total number density: {sum(number_densities.values()):.2e} cm⁻³")
+        
+        # Calculate continuum absorption coefficient (cm⁻¹)
         α_continuum = calculate_total_continuum_opacity(
             frequencies, T, nₑ, number_densities
         )
         
-        # Calculate total density from number densities
+        # Convert to opacity per unit mass for comparison with Korg
         total_density = sum(number_densities.values())
+        mean_molecular_weight = 1.4  # AMU (same as Korg calculation)
+        mass_density = total_density * mean_molecular_weight * 1.66054e-24  # g/cm³
+        opacity_per_mass = α_continuum / mass_density  # cm²/g
+        
+        # Debug: Check a single frequency calculation
+        single_freq = frequencies[len(frequencies)//2]  # Middle frequency
+        mid_idx = len(frequencies)//2
+        print(f"Debug: Middle frequency: {single_freq:.2e} Hz")
+        print(f"Debug: Middle absorption coeff: {α_continuum[mid_idx]:.2e} cm⁻¹")
+        print(f"Debug: Middle opacity per mass: {opacity_per_mass[mid_idx]:.2e} cm²/g")
+        print(f"Debug: Mass density: {mass_density:.2e} g/cm³")
         
         jorg_results = {
             "wavelengths_angstrom": wavelengths,
@@ -211,13 +235,16 @@ def calculate_jorg_opacity(korg_results):
             "temperature_k": T,
             "electron_density_cm3": nₑ,
             "total_density_cm3": total_density,
-            "continuum_opacity_cm2_g": α_continuum,
+            "mass_density_g_cm3": mass_density,
+            "continuum_absorption_cm_inv": α_continuum,  # Raw absorption coefficient
+            "continuum_opacity_cm2_g": opacity_per_mass,  # Converted to per mass
             "number_densities": {str(species): float(density) 
                                for species, density in number_densities.items()},
             "stellar_params": stellar_params
         }
         
-        print(f"Jorg continuum opacity range: {np.min(α_continuum):.2e}-{np.max(α_continuum):.2e} cm²/g")
+        print(f"Jorg continuum absorption range: {np.min(α_continuum):.2e}-{np.max(α_continuum):.2e} cm⁻¹")
+        print(f"Jorg continuum opacity range: {np.min(opacity_per_mass):.2e}-{np.max(opacity_per_mass):.2e} cm²/g")
         print("✅ Jorg opacity calculation successful!")
         
         return jorg_results

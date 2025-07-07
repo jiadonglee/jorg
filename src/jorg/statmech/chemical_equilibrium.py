@@ -10,6 +10,7 @@ the exact same mathematical formulation and numerical approach.
 import jax
 import jax.numpy as jnp
 from jax.scipy.optimize import minimize
+from jax import jacfwd, jacrev
 import numpy as np
 from typing import Dict, Tuple, Callable, Any
 from functools import partial
@@ -101,6 +102,7 @@ def solve_chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
                               log_equilibrium_constants: Dict[Species, Callable],
                               electron_number_density_warn_threshold: float = 0.1,
                               electron_number_density_warn_min_value: float = 1e-4,
+                              use_jax_solver: bool = True,
                               **kwargs) -> Tuple[float, Dict[Species, float]]:
     """
     Solve chemical equilibrium for stellar atmosphere.
@@ -122,6 +124,16 @@ def solve_chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
     - number_densities: Dict mapping Species to number densities [cm^-3]
     """
     
+    # Ensure all required partition functions exist
+    # Add missing doubly ionized species (bare nuclei)
+    for Z in absolute_abundances.keys():
+        species_2 = Species.from_atomic_number(Z, 2)
+        if species_2 not in partition_fns:
+            # Create partition function for bare nucleus (U = 1)
+            def bare_nucleus_U(log_T):
+                return 1.0
+            partition_fns[species_2] = bare_nucleus_U
+    
     # Compute good first guess by neglecting molecules (lines 125-128)
     neutral_fraction_guess = []
     for Z in range(1, MAX_ATOMIC_NUMBER + 1):
@@ -135,7 +147,8 @@ def solve_chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
     # Solve chemical equilibrium (lines 130-133)
     ne, neutral_fractions = _solve_chemical_equilibrium_system(
         temp, nt, absolute_abundances, neutral_fraction_guess, model_atm_ne,
-        ionization_energies, partition_fns, log_equilibrium_constants
+        ionization_energies, partition_fns, log_equilibrium_constants,
+        use_jax_solver=use_jax_solver
     )
     
     # Warning check (lines 135-138)
@@ -198,19 +211,189 @@ def solve_chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
 def _solve_chemical_equilibrium_system(temp: float, nt: float, absolute_abundances: Dict[int, float],
                                       neutral_fraction_guess: list, ne_guess: float,
                                       ionization_energies: Dict, partition_fns: Dict, 
-                                      log_equilibrium_constants: Dict) -> Tuple[float, list]:
+                                      log_equilibrium_constants: Dict,
+                                      use_jax_solver: bool = True) -> Tuple[float, list]:
     """
-    Direct translation of Korg.jl solve_chemical_equilibrium function (lines 167-176).
+    Enhanced chemical equilibrium solver with JAX autodiff support.
+    
+    By default, uses JAX-based solver with automatic differentiation for better
+    numerical stability and gradient computation, similar to Korg.jl's ForwardDiff integration.
+    Falls back to scipy-based solver if needed.
     """
-    zero = _solve_chemical_equilibrium_nonlinear(temp, nt, absolute_abundances, neutral_fraction_guess,
-                                              ne_guess, ionization_energies, partition_fns,
-                                              log_equilibrium_constants)
+    if use_jax_solver:
+        try:
+            zero = _solve_chemical_equilibrium_jax(temp, nt, absolute_abundances, neutral_fraction_guess,
+                                                 ne_guess, ionization_energies, partition_fns,
+                                                 log_equilibrium_constants)
+        except Exception as e:
+            print(f"JAX solver failed ({e}), using scipy fallback")
+            zero = _solve_chemical_equilibrium_nonlinear(temp, nt, absolute_abundances, neutral_fraction_guess,
+                                                      ne_guess, ionization_energies, partition_fns,
+                                                      log_equilibrium_constants)
+    else:
+        zero = _solve_chemical_equilibrium_nonlinear(temp, nt, absolute_abundances, neutral_fraction_guess,
+                                                  ne_guess, ionization_energies, partition_fns,
+                                                  log_equilibrium_constants)
     
     # Extract results (lines 173-175)
     ne = abs(zero[-1]) * nt * 1e-5
     neutral_fractions = [abs(x) for x in zero[:-1]]
     
     return ne, neutral_fractions
+
+
+def _solve_chemical_equilibrium_jax(temp: float, nt: float, absolute_abundances: Dict[int, float],
+                                  neutral_fraction_guess: list, ne_guess: float,
+                                  ionization_energies: Dict, partition_fns: Dict,
+                                  log_equilibrium_constants: Dict) -> jnp.ndarray:
+    """
+    JAX-based chemical equilibrium solver with automatic differentiation.
+    
+    This provides better numerical stability and autodiff capabilities
+    similar to Korg.jl's ForwardDiff.jl integration.
+    """
+    # Get valid elements with complete data
+    valid_elements = []
+    for Z in range(1, min(MAX_ATOMIC_NUMBER + 1, 30)):
+        if (Z in absolute_abundances and Z in ionization_energies):
+            # Check that required partition functions exist
+            species_0 = Species.from_atomic_number(Z, 0)
+            species_1 = Species.from_atomic_number(Z, 1)
+            species_2 = Species.from_atomic_number(Z, 2)
+            
+            # Only require neutral and singly ionized to be present
+            # Doubly ionized is optional (some species like He III aren't in Korg data)
+            if species_0 in partition_fns and species_1 in partition_fns:
+                # Add doubly ionized if missing (bare nucleus, U=1)
+                if species_2 not in partition_fns:
+                    # Create a simple partition function for bare nucleus
+                    def bare_nucleus_U(log_T):
+                        return 1.0
+                    partition_fns[species_2] = bare_nucleus_U
+                
+                valid_elements.append(Z)
+    
+    if not valid_elements:
+        raise ChemicalEquilibriumError("No valid elements found")
+    
+    # Normalize abundances for valid elements only
+    total_abundance = sum(absolute_abundances[Z] for Z in valid_elements)
+    normalized_abundances = jnp.array([absolute_abundances[Z] / total_abundance for Z in valid_elements])
+    
+    # Define JAX-compatible residuals function
+    @jax.jit
+    def residuals_jax(x):
+        """JAX-compatible residuals function for chemical equilibrium"""
+        n_elements = len(valid_elements)
+        
+        # Extract variables with bounds
+        neutral_fractions = jnp.abs(x[:n_elements])
+        neutral_fractions = jnp.clip(neutral_fractions, 1e-6, 0.999)
+        ne = jnp.abs(x[n_elements]) * nt * 1e-5
+        ne = jnp.clip(ne, nt * 1e-15, nt * 0.1)
+        
+        residuals = jnp.zeros(n_elements + 1)
+        total_electron_sources = 0.0
+        
+        for i, Z in enumerate(valid_elements):
+            abundance = normalized_abundances[i]
+            total_atoms = (nt - ne) * abundance
+            
+            # Saha weights
+            wII, wIII = saha_ion_weights(temp, ne, Z, ionization_energies, partition_fns)
+            
+            # Neutral density
+            n_neutral = total_atoms * neutral_fractions[i]
+            
+            # Conservation: total atoms = neutral * (1 + wII + wIII)
+            total_factor = 1.0 + wII + wIII
+            residual = total_atoms - total_factor * n_neutral
+            residuals = residuals.at[i].set(residual / jnp.maximum(total_atoms, 1e-30))
+            
+            # Electron sources
+            electron_contribution = (wII + 2.0 * wIII) * n_neutral
+            total_electron_sources += electron_contribution
+        
+        # Electron conservation
+        electron_residual = (total_electron_sources - ne) / (ne * 1e-5)
+        residuals = residuals.at[n_elements].set(electron_residual)
+        
+        return residuals
+    
+    # Initial guess setup
+    initial_neutral_fractions = []
+    for Z in valid_elements:
+        try:
+            wII, wIII = saha_ion_weights(temp, ne_guess, Z, ionization_energies, partition_fns)
+            neutral_frac = 1.0 / (1.0 + wII + wIII)
+            neutral_frac = max(min(neutral_frac, 0.999), 1e-6)
+        except:
+            neutral_frac = 0.5
+        initial_neutral_fractions.append(neutral_frac)
+    
+    x0 = jnp.array(initial_neutral_fractions + [ne_guess / nt * 1e5])
+    
+    # Try JAX-based Newton solver with automatic differentiation
+    try:
+        # Compute Jacobian using automatic differentiation
+        jacobian_func = jacfwd(residuals_jax)
+        
+        # Newton's method with JAX autodiff
+        x = x0
+        for iteration in range(50):
+            f = residuals_jax(x)
+            J = jacobian_func(x)
+            
+            # Check for convergence
+            f_norm = jnp.linalg.norm(f)
+            if f_norm < 1e-6:
+                break
+            
+            # Newton step with regularization for numerical stability
+            try:
+                # Add small regularization to diagonal for stability
+                J_reg = J + 1e-8 * jnp.eye(len(x))
+                dx = jnp.linalg.solve(J_reg, -f)
+                
+                # Line search for stability
+                alpha = 1.0
+                x_new = x + alpha * dx
+                f_new_norm = jnp.linalg.norm(residuals_jax(x_new))
+                
+                # Simple backtracking line search
+                while f_new_norm > f_norm and alpha > 1e-4:
+                    alpha *= 0.5
+                    x_new = x + alpha * dx
+                    f_new_norm = jnp.linalg.norm(residuals_jax(x_new))
+                
+                x = x_new
+                
+            except:
+                # If linear solve fails, try steepest descent
+                dx = -f * 0.1
+                x = x + dx
+        
+        # Validate solution
+        final_residuals = residuals_jax(x)
+        final_norm = jnp.linalg.norm(final_residuals)
+        
+        if final_norm < 1e-3:
+            # Pad to MAX_ATOMIC_NUMBER elements
+            neutral_fractions_padded = list(x[:len(valid_elements)])
+            while len(neutral_fractions_padded) < MAX_ATOMIC_NUMBER:
+                neutral_fractions_padded.append(1.0)
+            
+            solution = neutral_fractions_padded + [x[len(valid_elements)]]
+            return jnp.array(solution[:MAX_ATOMIC_NUMBER + 1])
+    
+    except Exception as e:
+        print(f"JAX solver failed: {e}, falling back to scipy")
+    
+    # Fallback to scipy solver
+    return _solve_chemical_equilibrium_nonlinear(
+        temp, nt, absolute_abundances, neutral_fraction_guess, ne_guess,
+        ionization_energies, partition_fns, log_equilibrium_constants
+    )
 
 
 def _solve_chemical_equilibrium_nonlinear(temp: float, nt: float, absolute_abundances: Dict[int, float],
@@ -223,10 +406,21 @@ def _solve_chemical_equilibrium_nonlinear(temp: float, nt: float, absolute_abund
     # Get valid elements with complete data
     valid_elements = []
     for Z in range(1, min(MAX_ATOMIC_NUMBER + 1, 30)):
-        if (Z in absolute_abundances and Z in ionization_energies and
-            Species.from_atomic_number(Z, 0) in partition_fns and
-            Species.from_atomic_number(Z, 1) in partition_fns):
-            valid_elements.append(Z)
+        if (Z in absolute_abundances and Z in ionization_energies):
+            # Check that required partition functions exist
+            species_0 = Species.from_atomic_number(Z, 0)
+            species_1 = Species.from_atomic_number(Z, 1)
+            species_2 = Species.from_atomic_number(Z, 2)
+            
+            # Only require neutral and singly ionized to be present
+            if species_0 in partition_fns and species_1 in partition_fns:
+                # Add doubly ionized if missing (bare nucleus, U=1)
+                if species_2 not in partition_fns:
+                    def bare_nucleus_U(log_T):
+                        return 1.0
+                    partition_fns[species_2] = bare_nucleus_U
+                
+                valid_elements.append(Z)
     
     if not valid_elements:
         raise ChemicalEquilibriumError("No valid elements found")

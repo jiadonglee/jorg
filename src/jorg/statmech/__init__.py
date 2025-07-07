@@ -41,6 +41,12 @@ from .molecular import (
 # Species definitions
 from .species import Species, Formula, MAX_ATOMIC_NUMBER
 
+# Hummer-Mihalas occupation probability formalism
+from .hummer_mihalas import (
+    hummer_mihalas_w,
+    hummer_mihalas_U_H
+)
+
 __all__ = [
     # Core functions
     'chemical_equilibrium',
@@ -72,6 +78,10 @@ __all__ = [
     'Species',
     'Formula', 
     'MAX_ATOMIC_NUMBER',
+    
+    # Hummer-Mihalas occupation probability
+    'hummer_mihalas_w',
+    'hummer_mihalas_U_H',
 ]
 
 # Version info

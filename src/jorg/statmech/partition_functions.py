@@ -193,8 +193,24 @@ def create_default_partition_functions() -> Dict[Any, Any]:
     try:
         # Use exact Korg.jl partition functions
         from .korg_partition_functions import create_korg_partition_functions
-        return create_korg_partition_functions()
-    except ImportError as e:
+        partition_funcs = create_korg_partition_functions()
+        
+        # Add missing species that aren't in Korg.jl data but are needed
+        # H II (bare proton) always has U = 1.0
+        from .species import Species, Formula
+        h_ii_species = Species.from_atomic_number(1, 1)
+        if h_ii_species not in partition_funcs:
+            partition_funcs[h_ii_species] = lambda log_T: 1.0
+        
+        # Add H III (impossible but avoid errors)
+        h_iii_species = Species.from_atomic_number(1, 2)
+        if h_iii_species not in partition_funcs:
+            partition_funcs[h_iii_species] = lambda log_T: 1.0
+            
+        print(f"✅ Loaded {len(partition_funcs)} exact Korg.jl partition functions")
+        return partition_funcs
+        
+    except Exception as e:
         print(f"⚠️ Warning: Could not load Korg.jl partition functions ({e})")
         print("    Falling back to simplified partition functions.")
         return create_simplified_partition_functions()

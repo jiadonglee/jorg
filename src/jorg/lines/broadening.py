@@ -5,7 +5,7 @@ Broadening mechanisms for stellar spectral lines
 import jax
 import jax.numpy as jnp
 from typing import Union, Tuple
-from ..constants import c_cgs, kboltz_cgs
+from ..constants import c_cgs, kboltz_cgs, bohr_radius_cgs
 
 
 @jax.jit

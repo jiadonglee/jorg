@@ -31,14 +31,14 @@ def load_korg_partition_data():
     if _partition_data_loaded:
         return _partition_interpolators
     
-    # Path to the extracted partition function data
+    # Path to the extracted partition function data (in Jorg/data/)
     data_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data')
     data_file = os.path.join(data_dir, 'korg_partition_functions.json')
     
     if not os.path.exists(data_file):
         raise FileNotFoundError(
             f"Korg.jl partition function data not found at {data_file}. "
-            f"Run extract_korg_partition_functions.py first."
+            f"Run extract_korg_partition_functions.py from the Korg.jl root directory first."
         )
     
     # Load the JSON data

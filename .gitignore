@@ -187,3 +187,7 @@ jax_cache/
 
 # CUDA cache (if using GPU)
 .nv/
+
+archive/
+debugging_archive
+project_archive/

@@ -273,6 +273,39 @@ def gaussian_profile(lambda_0: float,
     return normalization * jnp.exp(-0.5 * (delta_lambda / sigma)**2)
 
 
+@jax.jit
+def doppler_width(lambda_0: float, T: float, mass: float, xi: float = 0.0) -> float:
+    """
+    Calculate Doppler width for thermal and microturbulent broadening.
+    
+    Parameters
+    ----------
+    lambda_0 : float
+        Rest wavelength in cm
+    T : float
+        Temperature in K
+    mass : float
+        Atomic mass in grams
+    xi : float
+        Microturbulent velocity in cm/s
+        
+    Returns
+    -------
+    float
+        Doppler width (standard deviation) in cm
+    """
+    from ..constants import kboltz_cgs, c_cgs
+    
+    # Thermal velocity
+    v_thermal = jnp.sqrt(2.0 * kboltz_cgs * T / mass)
+    
+    # Total velocity including microturbulence
+    v_total = jnp.sqrt(v_thermal**2 + xi**2)
+    
+    # Doppler width in wavelength units
+    return lambda_0 * v_total / c_cgs
+
+
 # Simplified functions for testing compatibility
 @jax.jit
 def gaussian_profile(wavelengths: jnp.ndarray, line_center: float, sigma: float) -> jnp.ndarray:
