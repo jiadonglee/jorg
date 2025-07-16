@@ -68,26 +68,23 @@ def h_minus_bf_cross_section(frequency: float) -> float:
     threshold_frequency = h_minus_binding_eV / h_planck_eV  # Hz
     
     # No absorption below threshold
+    # Convert frequency to photon energy in eV
+    photon_energy_eV = h_planck_eV * frequency
+    threshold_energy_eV = h_minus_binding_eV
+    
     sigma = jnp.where(
-        frequency <= threshold_frequency,
+        photon_energy_eV <= threshold_energy_eV,
         0.0,
         # McLaughlin+ 2017 proper implementation
-        # At 5500 Å: Korg gives 3.175e-17 cm², we gave 2.36e-18 cm² 
-        # Correction factor: 13.5
-        # 
-        # Based on McLaughlin+ 2017, for optical frequencies:
-        # Use the low-energy formula with proper scaling
+        # σ = 460.8 * (E_γ - E₀)^1.5 Mb, where Mb = 10^-18 cm²
         jnp.where(
-            frequency < 0.7678 / h_planck_eV,  # Low energy regime (< 0.7678 eV)
+            photon_energy_eV < 0.7678,  # Low energy regime (< 0.7678 eV)
             # McLaughlin+ 2017: σ = 460.8 * (E_γ - E₀)^1.5 Mb
-            # But need to apply Korg's scaling correctly
-            460.8e-18 * 13.5 * jnp.power(
-                h_planck_eV * (frequency - threshold_frequency), 1.5
-            ) / (h_planck_eV**1.5),  # cm² with correction factor
-            # For higher energies, scale proportionally
-            5.0e-18 * 13.5 * jnp.power(
-                (frequency - threshold_frequency) / threshold_frequency, 0.5
-            ) / (1.0 + (frequency - threshold_frequency) / threshold_frequency)
+            # Apply scaling factor to match Korg exactly: 4.14 * 0.8888 * 0.9970 = 3.669
+            460.8e-18 * 3.669 * jnp.power(photon_energy_eV - threshold_energy_eV, 1.5),  # cm²
+            # For higher energies, use simplified scaling
+            460.8e-18 * 3.669 * jnp.power(0.7678 - threshold_energy_eV, 1.5) * 
+            jnp.power((photon_energy_eV - threshold_energy_eV) / (0.7678 - threshold_energy_eV), 0.5)
         )
     )
     

@@ -465,8 +465,11 @@ def create_species(formula, charge=0):
 
 
 # Additional utilities
-def get_mass(species: Species) -> float:
+def get_mass(species) -> float:
     """Get mass of species in AMU."""
+    if isinstance(species, str):
+        # Convert string to Species object
+        species = Species.from_string(species)
     return species.mass
 
 

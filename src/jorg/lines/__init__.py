@@ -38,6 +38,51 @@ from .species import (
     get_species_info,
     Species
 )
+from .atomic_data import (
+    get_atomic_symbol,
+    get_atomic_number,
+    get_atomic_mass,
+    get_ionization_energy,
+    format_species_name,
+    get_solar_abundance,
+    ATOMIC_SYMBOLS,
+    ATOMIC_NUMBERS
+)
+from .broadening_korg import (
+    approximate_radiative_gamma,
+    approximate_gammas,
+    approximate_stark_broadening,
+    approximate_vdw_broadening,
+    approximate_line_strength,
+    get_default_broadening_parameters
+)
+from .broadening import (
+    get_korg_broadening_parameters,
+    calculate_line_broadening,
+    validate_line_broadening_parameters
+)
+from .linelist_utils import (
+    merge_linelists,
+    remove_duplicate_lines,
+    filter_lines_by_strength,
+    filter_lines_by_species,
+    prune_weak_lines,
+    get_linelist_statistics,
+    print_linelist_summary,
+    create_line_window,
+    validate_linelist_physics,
+    convert_linelist_to_korg_format,
+    split_linelist_by_species
+)
+from .datatypes import (
+    LineData,
+    Line,
+    Formula,
+    Species as KorgSpecies,
+    create_line_data,
+    create_line,
+    species_from_integer
+)
 from ..utils.wavelength_utils import (
     air_to_vacuum,
     vacuum_to_air,
@@ -48,7 +93,7 @@ from ..utils.wavelength_utils import (
 # Hydrogen lines - sophisticated treatment
 try:
     from .hydrogen_lines_simple import (
-        hydrogen_line_absorption_balmer,
+        hydrogen_line_absorption,
         hummer_mihalas_w
     )
     _hydrogen_available = True
@@ -89,12 +134,53 @@ __all__ = [
     "air_to_vacuum",
     "vacuum_to_air",
     "angstrom_to_cm",
-    "cm_to_angstrom"
+    "cm_to_angstrom",
+    
+    # Atomic data
+    "get_atomic_symbol",
+    "get_atomic_number",
+    "get_atomic_mass",
+    "get_ionization_energy",
+    "format_species_name",
+    "get_solar_abundance",
+    "ATOMIC_SYMBOLS",
+    "ATOMIC_NUMBERS",
+    
+    # Korg.jl-compatible broadening
+    "approximate_radiative_gamma",
+    "approximate_gammas",
+    "approximate_stark_broadening",
+    "approximate_vdw_broadening",
+    "approximate_line_strength",
+    "get_default_broadening_parameters",
+    "get_korg_broadening_parameters",
+    "calculate_line_broadening",
+    "validate_line_broadening_parameters",
+    
+    # Linelist utilities
+    "merge_linelists",
+    "remove_duplicate_lines",
+    "filter_lines_by_strength",
+    "filter_lines_by_species",
+    "prune_weak_lines",
+    "get_linelist_statistics",
+    "print_linelist_summary",
+    "create_line_window",
+    "validate_linelist_physics",
+    "convert_linelist_to_korg_format",
+    "split_linelist_by_species",
+    
+    # Korg.jl-compatible datatypes
+    "Line",
+    "Formula",
+    "KorgSpecies",
+    "create_line",
+    "species_from_integer"
 ]
 
 # Add hydrogen lines to exports if available
 if _hydrogen_available:
     __all__.extend([
-        "hydrogen_line_absorption_balmer",
+        "hydrogen_line_absorption",
         "hummer_mihalas_w"
     ])

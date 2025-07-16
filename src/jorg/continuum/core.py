@@ -110,7 +110,6 @@ def total_continuum_absorption(
     return alpha_total
 
 
-@jax.jit
 def _total_continuum_absorption_jit(
     frequencies: jnp.ndarray,
     temperature: float,

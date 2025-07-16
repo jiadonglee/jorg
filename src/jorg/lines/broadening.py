@@ -1,11 +1,26 @@
 """
 Broadening mechanisms for stellar spectral lines
+
+This module provides both JAX-optimized broadening functions and exact
+Korg.jl-compatible broadening parameter calculations.
 """
 
 import jax
 import jax.numpy as jnp
 from typing import Union, Tuple
 from ..constants import c_cgs, kboltz_cgs, bohr_radius_cgs
+
+# Import exact Korg.jl broadening functions
+from .broadening_korg import (
+    approximate_radiative_gamma,
+    approximate_gammas,
+    approximate_stark_broadening,
+    approximate_vdw_broadening,
+    approximate_line_strength,
+    get_default_broadening_parameters,
+    validate_broadening_parameters,
+    process_vdw_parameter
+)
 
 
 @jax.jit
@@ -306,3 +321,140 @@ def vdw_broadening(wavelength: float, temperature: float, neutral_density: float
     # vdW broadening scales with neutral density and temperature^0.3
     gamma_vdw = vdw_constant * neutral_density * (temperature / 10000.0)**0.3
     return gamma_vdw
+
+
+# Korg.jl-compatible broadening parameter calculation
+def get_korg_broadening_parameters(species, wl_cm: float, log_gf: float, E_lower: float,
+                                  provided_gamma_rad: float = None,
+                                  provided_gamma_stark: float = None,
+                                  provided_vdw: Union[float, Tuple[float, float]] = None):
+    """
+    Calculate broadening parameters using exact Korg.jl methodology.
+    
+    This function implements the same logic as Korg.jl's Line constructor,
+    providing default approximations when parameters are not provided.
+    
+    Parameters
+    ----------
+    species : Species
+        Chemical species object
+    wl_cm : float
+        Wavelength in cm
+    log_gf : float
+        log₁₀(gf) oscillator strength
+    E_lower : float
+        Lower energy level in eV
+    provided_gamma_rad : float, optional
+        Provided radiative broadening parameter
+    provided_gamma_stark : float, optional
+        Provided Stark broadening parameter
+    provided_vdw : float or tuple, optional
+        Provided van der Waals parameter(s)
+        
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary with broadening parameters
+    """
+    # Start with defaults
+    broadening_params = get_default_broadening_parameters(species, wl_cm, log_gf, E_lower)
+    
+    # Override with provided values if available
+    if provided_gamma_rad is not None:
+        broadening_params['gamma_rad'] = provided_gamma_rad
+    
+    if provided_gamma_stark is not None:
+        broadening_params['gamma_stark'] = provided_gamma_stark
+    
+    if provided_vdw is not None:
+        if isinstance(provided_vdw, tuple):
+            broadening_params['vdw_param1'] = provided_vdw[0]
+            broadening_params['vdw_param2'] = provided_vdw[1]
+        else:
+            # Process according to Korg.jl rules
+            vdw_param1, vdw_param2 = process_vdw_parameter(provided_vdw, species, E_lower, wl_cm)
+            broadening_params['vdw_param1'] = vdw_param1
+            broadening_params['vdw_param2'] = vdw_param2
+    
+    return broadening_params
+
+
+@jax.jit
+def calculate_line_broadening(wl_cm: float, temperature: float, electron_density: float,
+                             neutral_density: float, gamma_rad: float, gamma_stark: float,
+                             vdw_param1: float, vdw_param2: float, mass: float) -> float:
+    """
+    Calculate total line broadening parameter for given conditions.
+    
+    This JAX-optimized function scales the broadening parameters to the
+    given atmospheric conditions.
+    
+    Parameters
+    ----------
+    wl_cm : float
+        Wavelength in cm
+    temperature : float
+        Temperature in K
+    electron_density : float
+        Electron density in cm⁻³
+    neutral_density : float
+        Neutral atom density in cm⁻³
+    gamma_rad : float
+        Radiative broadening parameter
+    gamma_stark : float
+        Stark broadening parameter (at 10,000 K)
+    vdw_param1 : float
+        van der Waals parameter 1
+    vdw_param2 : float
+        van der Waals parameter 2
+    mass : float
+        Atomic mass in grams
+        
+    Returns
+    -------
+    float
+        Total line broadening parameter
+    """
+    # Radiative broadening (temperature independent)
+    gamma_rad_scaled = gamma_rad
+    
+    # Stark broadening (temperature and electron density dependent)
+    gamma_stark_scaled = scaled_stark(gamma_stark, temperature) * electron_density
+    
+    # van der Waals broadening - use JAX-compatible conditional
+    gamma_vdw_simple_scaled = scaled_vdw_simple(vdw_param1, temperature) * neutral_density
+    gamma_vdw_abo_scaled = scaled_vdw_abo(vdw_param1, vdw_param2, mass, temperature) * neutral_density
+    
+    # JAX-compatible conditional
+    gamma_vdw_scaled = jnp.where(
+        vdw_param2 == -1.0,
+        gamma_vdw_simple_scaled,
+        gamma_vdw_abo_scaled
+    )
+    
+    # Total broadening
+    gamma_total = gamma_rad_scaled + gamma_stark_scaled + gamma_vdw_scaled
+    
+    return gamma_total
+
+
+def validate_line_broadening_parameters(broadening_params: dict) -> bool:
+    """
+    Validate broadening parameters for physical reasonableness.
+    
+    Parameters
+    ----------
+    broadening_params : dict
+        Dictionary containing broadening parameters
+        
+    Returns
+    -------
+    bool
+        True if parameters are valid
+    """
+    return validate_broadening_parameters(
+        broadening_params['gamma_rad'],
+        broadening_params['gamma_stark'],
+        broadening_params['vdw_param1'],
+        broadening_params['vdw_param2']
+    )

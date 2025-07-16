@@ -522,18 +522,24 @@ def load_stark_profiles(data_file: Optional[Path] = None) -> Dict:
                 delta_nu_grid = np.concatenate([[-np.finfo(float).max], 
                                               np.log(delta_nu_over_F0[1:])])
                 
+                # The data shape is (delta_nu, ne, temp) but RegularGridInterpolator expects (temp, ne, delta_nu)
+                # So we need to transpose the data: (40, 11, 10) -> (10, 11, 40)
+                logP_transposed = logP.transpose(2, 1, 0)
+                
                 # Create scipy interpolator (converted to JAX when called)
                 profile_interpolator = RegularGridInterpolator(
                     (temps, nes, delta_nu_grid),
-                    logP,
+                    logP_transposed,
                     bounds_error=False,
                     fill_value=-700.0  # Match Korg.jl's -700 clipping
                 )
                 
                 # Lambda0 interpolator
+                # lambda0_data shape is (ne, temp) but we need (temp, ne)
+                lambda0_transposed = lambda0_data.T  # (11, 10) -> (10, 11)
                 lambda0_interpolator = RegularGridInterpolator(
                     (temps, nes),
-                    lambda0_data * 1e-8,  # Convert to cm like Korg.jl
+                    lambda0_transposed * 1e-8,  # Convert to cm like Korg.jl
                     bounds_error=False,
                     fill_value=None
                 )
@@ -592,13 +598,16 @@ def calculate_adaptive_window_size(lambda0: float, T: float, ne: float, xi: floa
     sigma_doppler = doppler_width(lambda0, T, H_mass, xi)
     
     # Calculate Stark width (for Brackett lines)
-    if n_lower == 4:  # Brackett series
-        F0 = 1.25e-9 * ne**(2.0/3.0)  # Holtsmark field
-        Knm = griem_1960_Knm(n_lower, n_upper)
-        stark_width = 1.6678e-18 * Knm * F0 * c_cgs
-    else:
-        # For other series, use simplified Stark width estimate
-        stark_width = sigma_doppler * (ne / 1e13)**(1.0/6.0)
+    # Use JAX-compatible conditional logic
+    F0 = 1.25e-9 * ne**(2.0/3.0)  # Holtsmark field
+    Knm = griem_1960_Knm(n_lower, n_upper)
+    brackett_stark_width = 1.6678e-18 * Knm * F0 * c_cgs
+    
+    # For other series, use simplified Stark width estimate
+    general_stark_width = sigma_doppler * (ne / 1e13)**(1.0/6.0)
+    
+    # Use jnp.where for JAX compatibility
+    stark_width = jnp.where(n_lower == 4, brackett_stark_width, general_stark_width)
     
     # Use maximum of Stark and Doppler widths
     characteristic_width = jnp.maximum(sigma_doppler, stark_width)
