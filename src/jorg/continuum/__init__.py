@@ -16,6 +16,7 @@ from .helium import he_minus_ff_absorption
 from .scattering import thomson_scattering, rayleigh_scattering
 from .metals_bf import metal_bf_absorption
 from .utils import frequency_to_wavelength, wavelength_to_frequency
+from .h_i_bf_api import H_I_bf, H_I_bf_fast, H_I_bf_stellar
 
 __all__ = [
     "total_continuum_absorption",
@@ -28,5 +29,8 @@ __all__ = [
     "thomson_scattering",
     "rayleigh_scattering",
     "frequency_to_wavelength",
-    "wavelength_to_frequency"
+    "wavelength_to_frequency",
+    "H_I_bf",
+    "H_I_bf_fast", 
+    "H_I_bf_stellar"
 ]

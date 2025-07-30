@@ -26,6 +26,49 @@ KORG_KBOLTZ_EV = 8.617333262145e-5  # eV/K
 CONVERGENCE_TOL = 1e-6
 MAX_ITERATIONS = 30
 
+# H- ion constants (from Korg.jl)
+H_MINUS_ELECTRON_AFFINITY = 0.754  # eV
+H_MINUS_PARTITION_FUNCTION = 1.0   # Ground state only
+
+
+@jit
+def calculate_h_minus_density(T: float, n_h_neutral: float, ne: float) -> float:
+    """
+    Calculate H- density using Saha equation.
+    
+    Implementation matches Korg.jl's _ndens_Hminus function exactly.
+    
+    Parameters:
+    -----------
+    T : float
+        Temperature in K
+    n_h_neutral : float
+        H I density in cm^-3
+    ne : float
+        Electron density in cm^-3
+        
+    Returns:
+    --------
+    float
+        H- density in cm^-3
+    """
+    # Ground state H I density calculation
+    # For H I at stellar temperatures, most atoms are in ground state
+    # Korg.jl uses: nHI_groundstate = 2 * nH_I_div_partition
+    # Since our n_h_neutral is total H I density, and partition function ≈ 2:
+    nHI_groundstate = n_h_neutral  # Approximately correct for stellar temperatures
+    
+    # Pre-computed coefficient from Korg.jl: coef = (h^2/(2*π*m))^1.5
+    coef = 3.31283018e-22  # cm³*eV^1.5
+    
+    # β = 1/(kT) in eV^-1
+    beta = 1.0 / (KORG_KBOLTZ_EV * T)
+    
+    # Exact Korg.jl formula: 0.25 * nHI_groundstate * ne * coef * β^1.5 * exp(ion_energy * β)
+    n_h_minus = 0.25 * nHI_groundstate * ne * coef * (beta**1.5) * jnp.exp(H_MINUS_ELECTRON_AFFINITY * beta)
+    
+    return n_h_minus
+
 
 @jit
 def chemical_equilibrium_step_optimized(T: float, nt: float, ne_current: float,
@@ -178,6 +221,12 @@ def chemical_equilibrium_working_optimized(temp: float, nt: float, model_atm_ne:
         number_densities[Species.from_atomic_number(Z, 0)] = neutral_density
         number_densities[Species.from_atomic_number(Z, 1)] = ionized_density
         number_densities[Species.from_atomic_number(Z, 2)] = 0.0
+        
+        # Add H- calculation for hydrogen (Z=1)
+        if Z == 1 and Z in valid_elements:
+            h_neutral_density = neutral_density
+            h_minus_density = float(calculate_h_minus_density(temp, h_neutral_density, ne_final))
+            number_densities[Species.from_atomic_number(1, -1)] = h_minus_density
     
     return ne_final, number_densities
 

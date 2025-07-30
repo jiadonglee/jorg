@@ -87,7 +87,9 @@ class MetalBoundFreeData:
                     species = Species.from_string(species_name)
                     
                     # Load cross-section data (log10 values)
-                    log_sigma_data = np.array(cs_group[species_name], dtype=np.float64)
+                    # HDF5 stores as (n_temp, n_freq) in Python but (n_freq, n_temp) in Julia
+                    # We need to transpose to get (n_freq, n_temp) = (60185, 31)
+                    log_sigma_data = np.array(cs_group[species_name], dtype=np.float64).T
                     
                     # Store as JAX arrays for efficient computation
                     self.cross_sections[species] = jnp.array(log_sigma_data)
@@ -189,13 +191,15 @@ def _interpolate_metal_cross_section(nu: float, logT: float,
     logT_grid : jnp.ndarray  
         log10(Temperature) grid
     log_sigma_data : jnp.ndarray
-        log10(cross-section) data, shape (len(logT_grid), len(nu_grid))
+        log10(cross-section) data, shape (len(nu_grid), len(logT_grid))
         
     Returns:
     --------
     float
-        log10(cross-section in cm^2 * 1e18) - note the 1e18 factor as in Korg.jl
+        ln(cross-section in Mb) - Korg.jl stores cross-sections as natural log of Mb
     """
+    # Data is stored as (n_freq, n_temp), ready for bilinear interpolation
+    # where x=nu and y=logT
     return _bilinear_interpolate_2d(nu, logT, nu_grid, logT_grid, log_sigma_data)
 
 
@@ -279,14 +283,16 @@ def metal_bf_absorption(frequencies: jnp.ndarray,
         # When σ = 0, log(σ) = -∞, which causes issues
         mask = jnp.isfinite(log_sigma_interp)
         
-        # Calculate absorption: α = n * σ
-        # log_sigma_interp is log10(σ in cm^2 * 1e18), so we need to convert
-        sigma_cm2 = 10**log_sigma_interp * 1e-18  # Convert back to cm^2
+        # Calculate absorption exactly as in Korg.jl: α = exp(log(n) + log_σ) * 1e-18
+        # log_sigma_interp is ln(σ in Mb), not log10 - this is the key insight!
+        ln_sigma_mb = log_sigma_interp  # Data is already in natural log
+        ln_n = jnp.log(number_density)
         
         # Add contribution (using mask to avoid NaN propagation)
+        # This exactly matches Korg.jl: exp(log(n) + log_σ) * 1e-18
         alpha_contribution = jnp.where(
             mask,
-            number_density * sigma_cm2,
+            jnp.exp(ln_n + ln_sigma_mb) * 1e-18,  # Convert Mb to cm^2
             0.0
         )
         
@@ -363,11 +369,12 @@ def _compute_single_species_absorption(frequencies: jnp.ndarray,
     # Apply mask for finite values
     mask = jnp.isfinite(log_sigma_interp)
     
-    # Convert to linear cross-section in cm^2
-    sigma_cm2 = 10**log_sigma_interp * 1e-18
+    # Calculate absorption exactly as in Korg.jl: α = exp(log(n) + log_σ) * 1e-18
+    ln_sigma_mb = log_sigma_interp  # Data is already in natural log
+    ln_n = jnp.log(number_density)
     
     # Calculate absorption with masking
-    return jnp.where(mask, number_density * sigma_cm2, 0.0)
+    return jnp.where(mask, jnp.exp(ln_n + ln_sigma_mb) * 1e-18, 0.0)
 
 
 def validate_metal_bf_implementation():

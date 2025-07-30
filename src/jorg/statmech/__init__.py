@@ -12,7 +12,7 @@ available for high-performance applications.
 """
 
 # Core chemical equilibrium (production-ready implementation)
-from .chemical_equilibrium import chemical_equilibrium
+from .chemical_equilibrium import chemical_equilibrium_fast as chemical_equilibrium
 
 # Performance optimized versions with JIT and vectorization
 from .fast_kernels import (
@@ -28,21 +28,11 @@ from .fast_kernels import (
     simple_benchmark
 )
 
-# Optimized chemical equilibrium with full JIT and vectorization
-from .chemical_equilibrium_optimized import (
-    chemical_equilibrium_optimized,
-    create_optimized_chemical_equilibrium_solver,
-    OptimizedChemicalEquilibrium,
-    chemical_equilibrium_batch,
-    saha_ion_weights_optimized,
-    get_log_nK_optimized as get_log_nK_chem_optimized
-)
-
 # Optimized molecular equilibrium with JIT and vectorization
-from .molecular_optimized import (
+from .molecular import (
     create_optimized_molecular_equilibrium,
-    create_default_log_equilibrium_constants_optimized,
-    get_log_nK_optimized as get_log_nK_mol_optimized,
+    create_default_log_equilibrium_constants_optimized as create_default_log_equilibrium_constants,
+    get_log_nK_optimized as get_log_nK,
     OptimizedMolecularEquilibrium,
     molecular_equilibrium_batch,
     benchmark_molecular_performance
@@ -50,29 +40,20 @@ from .molecular_optimized import (
 
 # Saha equation and ionization (exact Korg.jl implementation)
 from .saha_equation import (
-    saha_ion_weights,
-    translational_U,
+    saha_ion_weights_fast as saha_ion_weights,
+    translational_U_fast as translational_U,
     create_default_ionization_energies,
-    create_simple_partition_functions,
-    get_log_nK,
     KORG_KBOLTZ_EV,
     KORG_ELECTRON_MASS_CGS
 )
 
 # Partition functions
 from .partition_functions import (
-    create_default_partition_functions,
-    hydrogen_partition_function,
-    simple_partition_function,
-    atomic_partition_function,
-    partition_function
-)
-
-# Molecular equilibrium
-from .molecular import (
-    create_default_log_equilibrium_constants,
-    get_log_nk,
-    get_log_nK
+    create_default_partition_functions_fast as create_default_partition_functions,
+    hydrogen_partition_function_fast as hydrogen_partition_function,
+    simple_atom_partition_function_fast as simple_partition_function,
+    simple_atom_partition_function_fast as atomic_partition_function,
+    simple_atom_partition_function_fast as partition_function
 )
 
 # Species definitions
@@ -108,18 +89,10 @@ __all__ = [
     'create_optimized_functions_for_existing_code',
     'simple_benchmark',
     
-    # Optimized chemical equilibrium
-    'chemical_equilibrium_optimized',
-    'create_optimized_chemical_equilibrium_solver',
-    'OptimizedChemicalEquilibrium',
-    'chemical_equilibrium_batch',
-    'saha_ion_weights_optimized',
-    'get_log_nK_chem_optimized',
-    
     # Optimized molecular equilibrium
     'create_optimized_molecular_equilibrium',
-    'create_default_log_equilibrium_constants_optimized',
-    'get_log_nK_mol_optimized',
+    'create_default_log_equilibrium_constants',
+    'get_log_nK',
     'OptimizedMolecularEquilibrium',
     'molecular_equilibrium_batch',
     'benchmark_molecular_performance',
@@ -128,8 +101,6 @@ __all__ = [
     'saha_ion_weights',
     'translational_U', 
     'create_default_ionization_energies',
-    'create_simple_partition_functions',
-    'get_log_nK',
     
     # Constants
     'KORG_KBOLTZ_EV',
@@ -141,11 +112,6 @@ __all__ = [
     'simple_partition_function',
     'atomic_partition_function',
     'partition_function',
-    
-    # Molecular equilibrium
-    'create_default_log_equilibrium_constants',
-    'get_log_nk',
-    'get_log_nK',
     
     # Species and data structures
     'Species',

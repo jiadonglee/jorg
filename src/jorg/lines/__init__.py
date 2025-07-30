@@ -90,9 +90,9 @@ from ..utils.wavelength_utils import (
     cm_to_angstrom
 )
 
-# Hydrogen lines - sophisticated treatment
+# Hydrogen lines - sophisticated treatment  
 try:
-    from .hydrogen_lines_simple import (
+    from .hydrogen_lines import (
         hydrogen_line_absorption,
         hummer_mihalas_w
     )

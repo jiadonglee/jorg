@@ -290,6 +290,10 @@ class Species:
         """Parse Species from string representation."""
         species_str = species_str.strip()
         
+        # Handle H- (H minus) specifically
+        if species_str == "H-" or species_str == "H minus":
+            return cls(Formula.from_atomic_number(1), -1)
+        
         # Handle Roman numeral notation (e.g., "H I", "Fe II")
         roman_match = re.match(r'^([A-Z][a-z]?)\s+([IVX]+)$', species_str)
         if roman_match:

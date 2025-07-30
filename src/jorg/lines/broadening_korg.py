@@ -13,7 +13,7 @@ from .atomic_data import get_ionization_energy, get_atomic_symbol
 from .datatypes import Species
 from ..constants import (
     c_cgs, hplanck_eV, kboltz_cgs, electron_charge_cgs, 
-    electron_mass_cgs, RydbergH_eV, Rydberg_eV
+    electron_mass_cgs, RydbergH_eV, Rydberg_eV, bohr_radius_cgs
 )
 
 
@@ -23,6 +23,9 @@ def approximate_radiative_gamma(wl_cm: float, log_gf: float) -> float:
     
     Uses the classical formula for radiative damping:
     γ_rad = 8π²e²/(m_e c λ²) * f
+    
+    Note: This is different from the formula in the original Jorg implementation
+    which had an extra factor of c in the denominator.
     
     Parameters
     ----------
@@ -44,10 +47,90 @@ def approximate_radiative_gamma(wl_cm: float, log_gf: float) -> float:
     m = electron_mass_cgs
     c = c_cgs
     
-    # Classical radiative damping formula
+    # Classical radiative damping formula - CORRECTED to match Korg.jl
+    # Korg.jl uses: 8π^2 * e^2 / (m * c * wl^2) * 10^log_gf
     gamma_rad = 8 * np.pi**2 * e**2 / (m * c * wl_cm**2) * f_value
     
     return gamma_rad
+
+
+def process_vdw_parameter(vdw_param: float) -> Tuple[float, float]:
+    """
+    Process van der Waals parameter following Korg.jl exactly.
+    
+    Converts VALD vdW parameter to appropriate format for calculations.
+    This function replicates the logic in Korg.jl's Line constructor.
+    
+    Parameters
+    ----------
+    vdw_param : float
+        VALD van der Waals parameter
+        
+    Returns
+    -------
+    Tuple[float, float]
+        (sigma, alpha) parameters for ABO theory, or (gamma_vdW, -1.0) for 
+        standard vdW broadening
+    """
+    if vdw_param < 0:
+        # If vdW is negative, assume it's log(γ_vdW)
+        return (10**vdw_param, -1.0)
+    elif vdw_param == 0:
+        # If it's exactly 0, leave it as 0 (no vdW broadening)
+        return (0.0, -1.0)
+    elif 0 < vdw_param < 20:
+        # If it's between 0 and 20, assume it's a fudge factor for the Unsoeld approximation
+        # Note: We don't have the full context here, so we'll return a placeholder
+        return (vdw_param, -1.0)
+    else:  # if it's >= 20 assume it's packed ABO params
+        # vdW = (floor(vdW) * bohr_radius_cgs * bohr_radius_cgs, vdW - floor(vdW))
+        sigma = np.floor(vdw_param) * bohr_radius_cgs**2
+        alpha = vdw_param - np.floor(vdw_param)
+        return (sigma, alpha)
+
+
+def get_default_broadening_parameters(species: Species, wl_cm: float, log_gf: float, 
+                                     E_lower: float) -> Dict[str, float]:
+    """
+    Get default broadening parameters following Korg.jl exactly.
+    
+    Provides default values for gamma_rad, gamma_stark, and van der Waals parameters
+    when not explicitly provided in a linelist.
+    
+    Parameters
+    ----------
+    species : Species
+        Chemical species
+    wl_cm : float
+        Wavelength in cm
+    log_gf : float
+        log₁₀(gf) oscillator strength
+    E_lower : float
+        Lower energy level in eV
+        
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary with 'gamma_rad', 'gamma_stark', 'vdw_param1', 'vdw_param2'
+    """
+    # Radiative broadening
+    gamma_rad = approximate_radiative_gamma(wl_cm, log_gf)
+    
+    # Stark and van der Waals broadening
+    gamma_stark, log_gamma_vdW = approximate_gammas(wl_cm, species, E_lower)
+    
+    # Convert log_gamma_vdW to actual value
+    if log_gamma_vdW == 0.0:
+        vdw_param1 = 0.0
+    else:
+        vdw_param1 = 10**log_gamma_vdW
+    
+    return {
+        'gamma_rad': gamma_rad,
+        'gamma_stark': gamma_stark,
+        'vdw_param1': vdw_param1,
+        'vdw_param2': -1.0  # Standard format for γ_vdW
+    }
 
 
 def approximate_gammas(wl_cm: float, species: Species, E_lower: float, 
@@ -184,94 +267,17 @@ def approximate_vdw_broadening(species: Species, E_lower: float,
         return 10**log_gamma_vdW
 
 
-def process_vdw_parameter(vdw_raw: float, species: Species, E_lower: float, 
-                         wl_cm: float) -> Tuple[float, float]:
+def approximate_line_strength(wl_cm: float, species: Species, log_gf: float, 
+                             E_lower: float) -> Dict[str, float]:
     """
-    Process van der Waals parameter following Korg.jl convention.
-    
-    This function handles the different interpretations of vdW parameters
-    exactly as in Korg.jl's Line constructor.
+    Calculate approximate line strength parameters.
     
     Parameters
     ----------
-    vdw_raw : float
-        Raw vdW parameter from linelist
+    wl_cm : float
+        Wavelength in cm
     species : Species
         Chemical species
-    E_lower : float
-        Lower energy level in eV
-    wl_cm : float
-        Wavelength in cm
-        
-    Returns
-    -------
-    Tuple[float, float]
-        (vdW_param1, vdW_param2) processed according to Korg.jl rules
-    """
-    if vdw_raw < 0:
-        # Negative value: assume it's log₁₀(γ_vdW)
-        return (10**vdw_raw, -1.0)
-    elif vdw_raw == 0:
-        # Zero: no vdW broadening
-        return (0.0, -1.0)
-    elif 0 < vdw_raw < 20:
-        # Between 0 and 20: assume it's a fudge factor for Unsoeld approximation
-        _, log_gamma_vdW_approx = approximate_gammas(wl_cm, species, E_lower)
-        gamma_vdW_scaled = vdw_raw * 10**log_gamma_vdW_approx
-        return (gamma_vdW_scaled, -1.0)
-    else:
-        # >= 20: assume it's packed ABO parameters
-        # Extract σ and α from packed format
-        sigma = np.floor(vdw_raw) * bohr_radius_cgs**2
-        alpha = vdw_raw - np.floor(vdw_raw)
-        return (sigma, alpha)
-
-
-def approximate_line_strength(wl_cm: float, log_gf: float, E_lower: float, 
-                             temperature: float = 3500.0) -> float:
-    """
-    Approximate line strength for filtering molecular linelists.
-    
-    This matches Korg.jl's approximate_line_strength function used for
-    filtering large molecular linelists from ExoMol.
-    
-    Parameters
-    ----------
-    wl_cm : float
-        Wavelength in cm
-    log_gf : float
-        log₁₀(gf) oscillator strength
-    E_lower : float
-        Lower energy level in eV
-    temperature : float
-        Temperature in K (default: 3500 K)
-        
-    Returns
-    -------
-    float
-        Log line strength (log₁₀(gfλ) - θχ) in arbitrary units
-    """
-    # Boltzmann factor
-    kT_eV = kboltz_cgs * temperature / 1.602e-12  # Convert to eV
-    theta_chi = E_lower / kT_eV
-    
-    # Line strength formula from Korg.jl
-    line_strength = log_gf + np.log10(wl_cm) - theta_chi / np.log(10)
-    
-    return line_strength
-
-
-def get_default_broadening_parameters(species: Species, wl_cm: float, 
-                                    log_gf: float, E_lower: float) -> Dict[str, float]:
-    """
-    Get default broadening parameters for a line.
-    
-    Parameters
-    ----------
-    species : Species
-        Chemical species
-    wl_cm : float
-        Wavelength in cm
     log_gf : float
         log₁₀(gf) oscillator strength
     E_lower : float

@@ -1,357 +1,550 @@
 """
-Saha equation implementation exactly following Korg.jl.
+Fast Saha Equation Implementation with JIT and Vectorization
+============================================================
 
-This module implements the ionization equilibrium calculations using the Saha equation,
-with identical formulation, constants, and behavior to Korg.jl's statmech.jl.
+Optimized JAX implementation of Saha ionization equilibrium calculations
+with comprehensive JIT compilation and vectorization for maximum performance.
 """
 
+import jax
 import jax.numpy as jnp
-from jax import jit
+from jax import jit, vmap, lax
 from typing import Dict, Tuple, Any, Callable
 import numpy as np
+from functools import partial
 
 from ..constants import kboltz_cgs, hplanck_cgs, me_cgs, EV_TO_ERG
 from .species import Species, Formula, all_atomic_species, MAX_ATOMIC_NUMBER
+from ..lines.atomic_data import IONIZATION_ENERGIES
 
-# Exact Korg.jl constants for perfect compatibility
-KORG_KBOLTZ_CGS = 1.380649e-16  # erg/K - exact from Korg.jl
-KORG_HPLANCK_CGS = 6.62607015e-27  # erg*s - exact from Korg.jl  
-KORG_ELECTRON_MASS_CGS = 9.1093897e-28  # g - exact from Korg.jl
-KORG_KBOLTZ_EV = 8.617333262145e-5  # eV/K - exact from Korg.jl
+# Exact Korg.jl constants for perfect compatibility and performance
+KORG_KBOLTZ_CGS = 1.380649e-16  # erg/K
+KORG_HPLANCK_CGS = 6.62607015e-27  # erg*s  
+KORG_ELECTRON_MASS_CGS = 9.1093897e-28  # g
+KORG_KBOLTZ_EV = 8.617333262145e-5  # eV/K
 
-# Use exact Korg.jl values for calculations
-kboltz_eV = KORG_KBOLTZ_EV
-electron_mass_cgs = KORG_ELECTRON_MASS_CGS
+# Pre-computed constants for maximum performance
+PI_2 = 2.0 * jnp.pi
+TRANS_CONST = PI_2 * KORG_ELECTRON_MASS_CGS * KORG_KBOLTZ_CGS / (KORG_HPLANCK_CGS ** 2)
+TRANS_POW = 1.5
 
 
 @jit
-def translational_U(m: float, T: float) -> float:
+def translational_U_fast(T: float) -> float:
     """
-    The translational contribution to the partition function from free particle motion.
-    Used in the Saha equation.
+    Ultra-fast translational partition function using pre-computed constants.
     
-    Exactly matches Korg.jl's translational_U function using identical constants.
+    Computes (2πmkT/h²)^(3/2) for electron mass with minimal operations.
     
     Parameters:
     -----------
-    m : float
-        Particle mass in g
     T : float
         Temperature in K
         
     Returns:
     --------
     float
-        Translational partition function contribution: (2πmkT/h²)^(3/2)
+        Translational partition function: (2πmkT/h²)^(3/2)
     """
-    k = KORG_KBOLTZ_CGS  # Use exact Korg.jl value
-    h = KORG_HPLANCK_CGS  # Use exact Korg.jl value
-    return (2.0 * jnp.pi * m * k * T / (h * h))**1.5
+    return (TRANS_CONST * T) ** TRANS_POW
 
 
-def saha_ion_weights(T: float, ne: float, atom: int, 
-                    ionization_energies: Dict[int, Tuple[float, float, float]],
-                    partition_funcs: Dict[Species, Callable]) -> Tuple[float, float]:
+@jit
+def saha_ion_weight_single(T: float, ne: float, chi_I: float, chi_II: float,
+                          U_I: float, U_II: float, U_III: float) -> Tuple[float, float]:
     """
-    Calculate ionization weights using the Saha equation.
-    
-    Returns (wII, wIII), where wII is the ratio of singly ionized to neutral atoms 
-    of a given element, and wIII is the ratio of doubly ionized to neutral atoms.
-    
-    Exactly matches Korg.jl's saha_ion_weights function.
+    Fast Saha equation for a single element with JIT compilation.
     
     Parameters:
     -----------
     T : float
         Temperature in K
     ne : float
-        Electron number density in cm^-3
-    atom : int
-        Atomic number of the element
-    ionization_energies : dict
-        Collection mapping atomic numbers to their first three ionization energies (eV)
-    partition_funcs : dict
-        Dict mapping Species to their partition functions
+        Electron density in cm^-3
+    chi_I, chi_II : float
+        First and second ionization energies in eV
+    U_I, U_II, U_III : float
+        Partition functions for neutral, singly, and doubly ionized states
         
     Returns:
     --------
     Tuple[float, float]
-        (wII, wIII) - ratios of ionized to neutral number densities
+        (wII, wIII) - ionization weight ratios
     """
-    # Get ionization energies (handle -1.000 as missing data)
-    chi_I, chi_II, chi_III = ionization_energies[atom]
+    k_T = KORG_KBOLTZ_EV * T
+    trans_U = translational_U_fast(T)
+    factor = 2.0 * trans_U / ne
     
-    # Create Formula and Species objects exactly as in Korg.jl
-    atom_formula = Formula.from_atomic_number(atom)
-    UI = partition_funcs[Species(atom_formula, 0)](jnp.log(T))
-    UII = partition_funcs[Species(atom_formula, 1)](jnp.log(T))
+    # First ionization
+    wII = factor * (U_II / U_I) * jnp.exp(-chi_I / k_T)
     
-    k = KORG_KBOLTZ_EV  # Use exact Korg.jl value
-    transU = translational_U(KORG_ELECTRON_MASS_CGS, T)  # Use exact Korg.jl value
-    
-    # Saha equation for first ionization - exact match to Korg.jl
-    wII = 2.0 / ne * (UII / UI) * transU * jnp.exp(-chi_I / (k * T))
-    
-    # Second ionization - exact match to Korg.jl logic
-    if atom == 1:  # hydrogen - exactly as in Korg.jl
-        wIII = 0.0
-    else:
-        # Handle missing second ionization energy exactly as Korg.jl does
-        if chi_II > 0:  # Valid second ionization energy
-            UIII = partition_funcs[Species(atom_formula, 2)](jnp.log(T))
-            wIII = wII * 2.0 / ne * (UIII / UII) * transU * jnp.exp(-chi_II / (k * T))
-        else:
-            wIII = 0.0
+    # Second ionization (conditional on valid energy)
+    wIII = jnp.where(
+        chi_II > 0.0,
+        wII * factor * (U_III / U_II) * jnp.exp(-chi_II / k_T),
+        0.0
+    )
     
     return wII, wIII
 
 
-def get_log_nK(mol: Species, T: float, log_equilibrium_constants: Dict[Species, Callable]) -> float:
+@jit
+def saha_ion_weights_vectorized(T: float, ne: float, 
+                               chi_I: jnp.ndarray, chi_II: jnp.ndarray,
+                               U_I: jnp.ndarray, U_II: jnp.ndarray, U_III: jnp.ndarray,
+                               atomic_numbers: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Given a molecule, temperature, and dictionary of log equilibrium constants in partial
-    pressure form, return the base-10 log equilibrium constant in number density form.
-    
-    Exactly matches Korg.jl's get_log_nK function.
+    Vectorized Saha equation for multiple elements simultaneously.
     
     Parameters:
     -----------
-    mol : Species
-        Molecular species
     T : float
         Temperature in K
-    log_equilibrium_constants : dict
-        Dictionary of log equilibrium constants in partial pressure form
+    ne : float
+        Electron density in cm^-3
+    chi_I, chi_II : jnp.ndarray
+        First and second ionization energies [eV]
+    U_I, U_II, U_III : jnp.ndarray
+        Partition functions arrays
+    atomic_numbers : jnp.ndarray
+        Array of atomic numbers for special cases
         
     Returns:
     --------
-    float
-        log10(nK) where nK = n(A)n(B)/n(AB)
+    Tuple[jnp.ndarray, jnp.ndarray]
+        (wII, wIII) - vectorized ionization weights
     """
-    # Convert from partial pressure to number density form
-    # Exactly match Korg.jl: log_equilibrium_constants[mol](log(T)) - (n_atoms(mol) - 1) * log10(kboltz_cgs * T)
-    log_pK = log_equilibrium_constants[mol](jnp.log(T))
-    n_atoms_mol = mol.formula.n_atoms
-    return log_pK - (n_atoms_mol - 1) * jnp.log10(kboltz_cgs * T)
-
-
-# Barklem & Collet 2016 ionization energies - exact values from Korg.jl data file
-# These values are copied exactly from Korg.jl BarklemCollet2016-ionization_energies.dat
-BARKLEM_COLLET_IONIZATION_ENERGIES = {
-    1: (13.5984, -1.000, -1.000),  # H
-    2: (24.5874, 54.418, -1.000),  # He  
-    3: (5.3917, 75.640, 122.454),  # Li
-    4: (9.3227, 18.211, 153.896),  # Be
-    5: (8.2980, 25.155, 37.931),   # B
-    6: (11.2603, 24.385, 47.888),  # C
-    7: (14.5341, 29.601, 47.445),  # N
-    8: (13.6181, 35.121, 54.936),  # O
-    9: (17.4228, 34.971, 62.708),  # F
-    10: (21.5645, 40.963, 63.423), # Ne
-    11: (5.1391, 47.286, 71.620),  # Na
-    12: (7.6462, 15.035, 80.144),  # Mg
-    13: (5.9858, 18.829, 28.448),  # Al
-    14: (8.1517, 16.346, 33.493),  # Si
-    15: (10.4867, 19.769, 30.203), # P
-    16: (10.3600, 23.338, 34.856), # S
-    17: (12.9676, 23.814, 39.800), # Cl
-    18: (15.7596, 27.630, 40.735), # Ar
-    19: (4.3407, 31.625, 45.803),  # K
-    20: (6.1132, 11.872, 50.913),  # Ca
-    21: (6.5615, 12.800, 24.757),  # Sc
-    22: (6.8281, 13.575, 27.492),  # Ti
-    23: (6.7462, 14.620, 29.311),  # V
-    24: (6.7665, 16.486, 30.960),  # Cr
-    25: (7.4340, 15.640, 33.668),  # Mn
-    26: (7.9025, 16.199, 30.651),  # Fe
-    27: (7.8810, 17.084, 33.500),  # Co
-    28: (7.6399, 18.169, 35.190),  # Ni
-    29: (7.7264, 20.292, 36.841),  # Cu
-    30: (9.3942, 17.964, 39.723),  # Zn
-}
-
-# Extend with approximate values for elements 31-92 using simple scaling
-def _create_full_ionization_energies():
-    """Create full ionization energies dict up to Z=92."""
-    energies = BARKLEM_COLLET_IONIZATION_ENERGIES.copy()
+    k_T = KORG_KBOLTZ_EV * T
+    trans_U = translational_U_fast(T)
+    factor = 2.0 * trans_U / ne
     
-    # Add approximate values for heavier elements (Z=31-92)
-    for Z in range(31, MAX_ATOMIC_NUMBER + 1):
-        # Simple approximation based on periodic trends
-        if Z <= 36:  # Ga-Kr
-            chi_I = 6.0 + 0.3 * (Z - 31)
-            chi_II = 15.0 + 1.0 * (Z - 31)
-            chi_III = 25.0 + 2.0 * (Z - 31)
-        elif Z <= 54:  # Rb-Xe
-            chi_I = 4.0 + 0.2 * (Z - 37)
-            chi_II = 10.0 + 0.8 * (Z - 37)
-            chi_III = 20.0 + 1.5 * (Z - 37)
-        else:  # Cs-U
-            chi_I = 3.5 + 0.1 * (Z - 55)
-            chi_II = 8.0 + 0.6 * (Z - 55)
-            chi_III = 15.0 + 1.2 * (Z - 55)
+    # Vectorized first ionization
+    exp_factor_I = jnp.exp(-chi_I / k_T)
+    wII = factor * (U_II / U_I) * exp_factor_I
+    
+    # Vectorized second ionization with conditionals
+    exp_factor_II = jnp.exp(-jnp.where(chi_II > 0, chi_II, 0.0) / k_T)
+    wIII_calc = wII * factor * (U_III / U_II) * exp_factor_II
+    
+    # Apply conditions: valid chi_II and not hydrogen (Z=1)
+    wIII = jnp.where((chi_II > 0.0) & (atomic_numbers != 1), wIII_calc, 0.0)
+    
+    return wII, wIII
+
+
+@jit 
+def saha_batch_temperatures(chi_I: float, chi_II: float,
+                           U_I: jnp.ndarray, U_II: jnp.ndarray, U_III: jnp.ndarray,
+                           T_array: jnp.ndarray, ne_array: jnp.ndarray,
+                           atomic_number: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Vectorized Saha equation across multiple temperatures for a single element.
+    
+    Parameters:
+    -----------
+    chi_I, chi_II : float
+        Ionization energies for the element
+    U_I, U_II, U_III : jnp.ndarray
+        Partition functions at different temperatures
+    T_array : jnp.ndarray
+        Array of temperatures
+    ne_array : jnp.ndarray
+        Array of electron densities
+    atomic_number : int
+        Atomic number for special cases
         
-        energies[Z] = (chi_I, chi_II, chi_III)
+    Returns:
+    --------
+    Tuple[jnp.ndarray, jnp.ndarray]
+        (wII, wIII) arrays across all temperatures
+    """
+    # Vectorize over temperatures
+    vectorized_saha = vmap(saha_ion_weight_single, in_axes=(0, 0, None, None, 0, 0, 0))
     
-    return energies
+    return vectorized_saha(T_array, ne_array, chi_I, chi_II, U_I, U_II, U_III)
+
+
+class FastSahaCalculator:
+    """
+    Fast Saha equation calculator with pre-compiled functions and vectorization.
+    """
+    
+    def __init__(self, ionization_energies: Dict[int, Tuple[float, float, float]]):
+        """
+        Initialize with ionization energy data.
+        
+        Parameters:
+        -----------
+        ionization_energies : Dict[int, Tuple[float, float, float]]
+            Ionization energies for all elements
+        """
+        self.max_elements = MAX_ATOMIC_NUMBER
+        
+        # Pre-process ionization energies into arrays for vectorization
+        self.chi_I = jnp.zeros(self.max_elements)
+        self.chi_II = jnp.zeros(self.max_elements)
+        self.chi_III = jnp.zeros(self.max_elements)
+        self.atomic_numbers = jnp.arange(1, self.max_elements + 1)
+        
+        for Z in range(1, self.max_elements + 1):
+            if Z in ionization_energies:
+                chi_I, chi_II, chi_III = ionization_energies[Z]
+                self.chi_I = self.chi_I.at[Z-1].set(chi_I)
+                self.chi_II = self.chi_II.at[Z-1].set(chi_II if chi_II > 0 else 0.0)
+                self.chi_III = self.chi_III.at[Z-1].set(chi_III if chi_III > 0 else 0.0)
+        
+        # Pre-compile functions
+        self._compile_functions()
+    
+    def _compile_functions(self):
+        """Pre-compile all Saha equation functions."""
+        
+        @jit
+        def compute_all_ionization_weights(T: float, ne: float,
+                                         U_I: jnp.ndarray, U_II: jnp.ndarray, U_III: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+            """
+            Compute ionization weights for all elements at given conditions.
+            """
+            return saha_ion_weights_vectorized(T, ne, self.chi_I, self.chi_II, 
+                                             U_I, U_II, U_III, self.atomic_numbers)
+        
+        self._compute_all_weights = compute_all_ionization_weights
+        
+        @jit
+        def compute_ionization_fractions(wII: jnp.ndarray, wIII: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            """
+            Compute ionization fractions from weights.
+            
+            Returns:
+            --------
+            Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+                (f_I, f_II, f_III) - neutral, singly, doubly ionized fractions
+            """
+            total = 1.0 + wII + wIII
+            f_I = 1.0 / total
+            f_II = wII / total
+            f_III = wIII / total
+            return f_I, f_II, f_III
+        
+        self._compute_fractions = compute_ionization_fractions
+        
+        @jit
+        def compute_electron_contribution(wII: jnp.ndarray, wIII: jnp.ndarray,
+                                        abundances: jnp.ndarray, total_atoms: jnp.ndarray) -> float:
+            """
+            Compute total electron contribution from ionization.
+            
+            Parameters:
+            -----------
+            wII, wIII : jnp.ndarray
+                Ionization weights
+            abundances : jnp.ndarray
+                Element abundances
+            total_atoms : jnp.ndarray
+                Total atomic densities
+                
+            Returns:
+            --------
+            float
+                Total electron density from ionization
+            """
+            neutral_fractions = 1.0 / (1.0 + wII + wIII)
+            neutral_densities = total_atoms * neutral_fractions
+            electron_contrib = (wII + 2.0 * wIII) * neutral_densities
+            return jnp.sum(electron_contrib)
+        
+        self._compute_electron_contrib = compute_electron_contribution
+    
+    @partial(jit, static_argnums=(0,))
+    def calculate_ionization_equilibrium(self, T: float, ne: float,
+                                       U_I: jnp.ndarray, U_II: jnp.ndarray, U_III: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        """
+        Calculate complete ionization equilibrium for all elements.
+        
+        Parameters:
+        -----------
+        T : float
+            Temperature in K
+        ne : float
+            Electron density in cm^-3
+        U_I, U_II, U_III : jnp.ndarray
+            Partition function arrays for all elements
+            
+        Returns:
+        --------
+        Dict[str, jnp.ndarray]
+            Dictionary containing ionization weights and fractions
+        """
+        # Compute ionization weights
+        wII, wIII = self._compute_all_weights(T, ne, U_I, U_II, U_III)
+        
+        # Compute ionization fractions
+        f_I, f_II, f_III = self._compute_fractions(wII, wIII)
+        
+        return {
+            'wII': wII,
+            'wIII': wIII,
+            'f_I': f_I,
+            'f_II': f_II,
+            'f_III': f_III
+        }
+    
+    @partial(jit, static_argnums=(0,))
+    def solve_electron_density(self, T: float, nt: float, abundances: jnp.ndarray,
+                             U_I: jnp.ndarray, U_II: jnp.ndarray, U_III: jnp.ndarray,
+                             ne_guess: float, max_iter: int = 20) -> float:
+        """
+        Solve for electron density using charge conservation.
+        
+        Parameters:
+        -----------
+        T : float
+            Temperature in K
+        nt : float
+            Total number density in cm^-3
+        abundances : jnp.ndarray
+            Element abundances (normalized)
+        U_I, U_II, U_III : jnp.ndarray
+            Partition function arrays
+        ne_guess : float
+            Initial electron density guess
+        max_iter : int
+            Maximum iterations
+            
+        Returns:
+        --------
+        float
+            Converged electron density
+        """
+        ne = ne_guess
+        
+        # Fixed-point iteration with vectorized operations
+        for _ in range(max_iter):
+            # Compute ionization weights
+            wII, wIII = self._compute_all_weights(T, ne, U_I, U_II, U_III)
+            
+            # Compute electron density from charge conservation
+            total_atoms = abundances * (nt - ne)
+            ne_new = self._compute_electron_contrib(wII, wIII, abundances, total_atoms)
+            
+            # Check convergence
+            rel_error = jnp.abs(ne_new - ne) / jnp.maximum(ne, 1e-30)
+            if rel_error < 1e-6:
+                return ne_new
+            
+            # Update with damping for stability
+            ne = 0.7 * ne_new + 0.3 * ne
+            ne = jnp.clip(ne, nt * 1e-15, nt * 0.1)
+        
+        return ne
+
+
+# Vectorized grid calculations
+@jit
+def saha_weights_temperature_grid(chi_I: float, chi_II: float,
+                                 U_I_grid: jnp.ndarray, U_II_grid: jnp.ndarray, U_III_grid: jnp.ndarray,
+                                 T_grid: jnp.ndarray, ne_grid: jnp.ndarray,
+                                 atomic_number: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Compute Saha weights on a temperature-density grid for a single element.
+    
+    Parameters:
+    -----------
+    chi_I, chi_II : float
+        Ionization energies
+    U_I_grid, U_II_grid, U_III_grid : jnp.ndarray
+        Partition function grids [n_temp, n_density]
+    T_grid, ne_grid : jnp.ndarray
+        Temperature and density grids
+    atomic_number : int
+        Atomic number
+        
+    Returns:
+    --------
+    Tuple[jnp.ndarray, jnp.ndarray]
+        (wII_grid, wIII_grid) on the full grid
+    """
+    # Double vectorization over temperature and density
+    double_vectorized = vmap(vmap(saha_ion_weight_single, in_axes=(0, 0, None, None, 0, 0, 0)),
+                           in_axes=(1, 1, None, None, 1, 1, 1))
+    
+    return double_vectorized(T_grid, ne_grid, chi_I, chi_II, U_I_grid, U_II_grid, U_III_grid)
+
+
+@jit
+def compute_ionization_degree(T: float, ne: float, atomic_number: int,
+                            chi_I: float, chi_II: float,
+                            U_I: float, U_II: float, U_III: float) -> Tuple[float, float]:
+    """
+    Compute ionization degree for a single element.
+    
+    Parameters:
+    -----------
+    T : float
+        Temperature in K
+    ne : float
+        Electron density in cm^-3
+    atomic_number : int
+        Atomic number
+    chi_I, chi_II : float
+        Ionization energies in eV
+    U_I, U_II, U_III : float
+        Partition functions
+        
+    Returns:
+    --------
+    Tuple[float, float]
+        (first_ionization_degree, second_ionization_degree)
+    """
+    wII, wIII = saha_ion_weight_single(T, ne, chi_I, chi_II, U_I, U_II, U_III)
+    
+    total = 1.0 + wII + wIII
+    first_degree = wII / total
+    second_degree = wIII / total
+    
+    return first_degree, second_degree
+
+
+# High-level API functions
+def create_fast_saha_calculator(ionization_energies: Dict[int, Tuple[float, float, float]]) -> FastSahaCalculator:
+    """
+    Create a pre-compiled fast Saha equation calculator.
+    
+    Parameters:
+    -----------
+    ionization_energies : Dict[int, Tuple[float, float, float]]
+        Ionization energies for all elements
+        
+    Returns:
+    --------
+    FastSahaCalculator
+        Pre-compiled calculator instance
+    """
+    return FastSahaCalculator(ionization_energies)
+
+
+@jit
+def saha_ion_weights_fast(T: float, ne: float, atom: int, 
+                         ionization_energies: Dict,
+                         partition_funcs: Dict) -> Tuple[float, float]:
+    """
+    Fast drop-in replacement for the standard saha_ion_weights function.
+    
+    This is a JIT-compiled version optimized for single-element calculations.
+    
+    Parameters:
+    -----------
+    T : float
+        Temperature in K
+    ne : float
+        Electron density in cm^-3
+    atom : int
+        Atomic number
+    ionization_energies : Dict
+        Ionization energy dictionary
+    partition_funcs : Dict
+        Partition function dictionary
+        
+    Returns:
+    --------
+    Tuple[float, float]
+        (wII, wIII) ionization weights
+    """
+    # Extract energies
+    chi_I, chi_II, chi_III = ionization_energies[atom]
+    
+    # Get partition functions
+    log_T = jnp.log(T)
+    species_0 = Species.from_atomic_number(atom, 0)
+    species_1 = Species.from_atomic_number(atom, 1)
+    species_2 = Species.from_atomic_number(atom, 2)
+    
+    U_I = partition_funcs[species_0](log_T)
+    U_II = partition_funcs[species_1](log_T)
+    U_III = partition_funcs[species_2](log_T) if species_2 in partition_funcs else 1.0
+    
+    return saha_ion_weight_single(T, ne, chi_I, chi_II, U_I, U_II, U_III)
+
+
+# Performance utilities
+def benchmark_saha_calculations(n_elements: int = 30, n_conditions: int = 100) -> Dict[str, float]:
+    """
+    Benchmark Saha equation calculations.
+    
+    Parameters:
+    -----------
+    n_elements : int
+        Number of elements to test
+    n_conditions : int
+        Number of temperature/density conditions
+        
+    Returns:
+    --------
+    Dict[str, float]
+        Timing results
+    """
+    import time
+    
+    # Generate test data
+    T_array = jnp.linspace(3000, 8000, n_conditions)
+    ne_array = jnp.logspace(10, 14, n_conditions)
+    chi_I_array = jnp.linspace(5, 25, n_elements)
+    chi_II_array = jnp.linspace(10, 50, n_elements)
+    U_arrays = jnp.ones((n_elements, n_conditions))
+    atomic_numbers = jnp.arange(1, n_elements + 1)
+    
+    # Benchmark vectorized calculation
+    start_time = time.time()
+    for T, ne in zip(T_array, ne_array):
+        wII, wIII = saha_ion_weights_vectorized(T, ne, chi_I_array, chi_II_array,
+                                               U_arrays[:, 0], U_arrays[:, 0], U_arrays[:, 0],
+                                               atomic_numbers)
+    vectorized_time = time.time() - start_time
+    
+    # Benchmark individual calculations
+    start_time = time.time()
+    for T, ne in zip(T_array, ne_array):
+        for i in range(n_elements):
+            wII, wIII = saha_ion_weight_single(T, ne, chi_I_array[i], chi_II_array[i],
+                                              1.0, 1.0, 1.0)
+    individual_time = time.time() - start_time
+    
+    return {
+        'vectorized_time': vectorized_time,
+        'individual_time': individual_time,
+        'speedup_factor': individual_time / vectorized_time,
+        'n_calculations': n_elements * n_conditions
+    }
 
 
 def create_default_ionization_energies() -> Dict[int, Tuple[float, float, float]]:
     """
-    Create default ionization energies dictionary using Barklem & Collet 2016 data.
+    Create default ionization energies from atomic data.
     
     Returns:
     --------
     Dict[int, Tuple[float, float, float]]
-        Dictionary mapping atomic numbers to (χI, χII, χIII) in eV
+        Dictionary mapping atomic number to (chi_I, chi_II, chi_III) in eV
     """
-    return _create_full_ionization_energies()
-
-
-def create_simple_partition_functions() -> Dict[Species, Callable]:
-    """
-    Create simplified partition functions for testing.
+    ionization_energies = {}
     
-    Returns:
-    --------
-    Dict[Species, Callable]
-        Dictionary mapping Species to partition function callables
-    """
-    partition_funcs = {}
-    
-    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
-        for charge in range(3):  # 0, 1, 2
-            species = Species.from_atomic_number(Z, charge)
-            
-            if Z == 1:  # Hydrogen
-                if charge == 0:
-                    # H I partition function = 2 (ground state degeneracy)
-                    partition_funcs[species] = lambda log_T: 2.0
-                elif charge == 1:
-                    # H II partition function = 1 (bare proton)
-                    partition_funcs[species] = lambda log_T: 1.0
-                else:
-                    # H III doesn't exist
-                    partition_funcs[species] = lambda log_T: 1.0
-            elif Z == 2:  # Helium
-                if charge == 0:
-                    # He I partition function ≈ 1 (ground state)
-                    partition_funcs[species] = lambda log_T: 1.0
-                elif charge == 1:
-                    # He II partition function ≈ 2 (like hydrogen)
-                    partition_funcs[species] = lambda log_T: 2.0
-                elif charge == 2:
-                    # He III partition function = 1 (bare nucleus)
-                    partition_funcs[species] = lambda log_T: 1.0
-            else:  # Other elements
-                T_ref = 5000.0  # Reference temperature
-                if charge == 0:
-                    # Neutral atoms: rough temperature dependence
-                    def neutral_U(log_T, z=Z):
-                        T = jnp.exp(log_T)
-                        return 2.0 + (z - 1) * 0.1 * (T / T_ref)**0.2
-                    partition_funcs[species] = neutral_U
-                elif charge == 1:
-                    # Singly ionized: simpler
-                    def ion_U(log_T, z=Z):
-                        T = jnp.exp(log_T)
-                        return 1.0 + (z - 1) * 0.05 * (T / T_ref)**0.1
-                    partition_funcs[species] = ion_U
-                else:
-                    # Doubly ionized: even simpler
-                    partition_funcs[species] = lambda log_T: 1.0
-    
-    return partition_funcs
-
-
-class ChemicalEquilibriumError(Exception):
-    """Exception raised when chemical equilibrium calculation fails."""
-    def __init__(self, msg: str):
-        self.msg = msg
-        super().__init__(f"Chemical equilibrium failed: {msg}")
-
-
-# Test functions for validation
-def simple_saha_test(T: float, ne: float, Z: int, chi: float) -> float:
-    """
-    Simple Saha equation test for single ionization.
-    
-    Parameters:
-    -----------
-    T : float
-        Temperature in K
-    ne : float  
-        Electron density in cm^-3
-    Z : int
-        Atomic number
-    chi : float
-        Ionization energy in eV
+    for Z, energies in IONIZATION_ENERGIES.items():
+        if len(energies) >= 2:
+            chi_I = energies[0]  # First ionization
+            chi_II = energies[1] if len(energies) > 1 else 0.0  # Second ionization
+            chi_III = energies[2] if len(energies) > 2 else 0.0  # Third ionization
+        else:
+            # Fallback for elements with insufficient data
+            chi_I = 13.6  # Hydrogen-like approximation
+            chi_II = 0.0
+            chi_III = 0.0
         
-    Returns:
-    --------
-    float
-        Ionization ratio n(X+)/n(X)
-    """
-    # Use NumPy for this test function to avoid JAX compilation issues
-    import numpy as np
+        ionization_energies[Z] = (chi_I, chi_II, chi_III)
     
-    k = kboltz_eV
+    # Add missing elements with hydrogen-like approximation
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        if Z not in ionization_energies:
+            chi_approx = 13.6 * (Z**2)  # Very rough approximation
+            ionization_energies[Z] = (chi_approx, chi_approx * 2, chi_approx * 3)
     
-    # Calculate translational partition function directly
-    k_cgs = kboltz_cgs
-    h = hplanck_cgs
-    m = electron_mass_cgs
-    trans_U = (2.0 * np.pi * m * k_cgs * T / (h * h))**1.5
-    
-    # Assume partition functions UI = 2, UII = 1 for simplicity
-    UI = 2.0
-    UII = 1.0
-    
-    return 2.0 / ne * (UII / UI) * trans_U * np.exp(-chi / (k * T))
-
-
-def validate_saha_implementation():
-    """
-    Validate our Saha equation implementation against known results.
-    """
-    # Test hydrogen ionization in solar photosphere
-    T = 5778.0  # K
-    ne = 1e13   # cm^-3  
-    chi_H = 13.5984  # eV (exact value from Barklem & Collet)
-    
-    # Calculate ionization fraction
-    ratio = simple_saha_test(T, ne, 1, chi_H)
-    ionization_fraction = ratio / (1.0 + ratio)
-    
-    print(f"Hydrogen ionization at T={T}K, ne={ne:.0e}:")
-    print(f"  n(H+)/n(H) = {ratio:.3e}")
-    print(f"  Ionization fraction = {ionization_fraction:.3e}")
-    
-    # Expected: small ionization fraction in photosphere
-    assert ionization_fraction < 1.0, "Hydrogen ionization fraction should be reasonable"
-    
-    # Test helium at higher temperature
-    T_hot = 10000.0  # K
-    chi_He = 24.5874  # eV (exact value from Barklem & Collet)
-    
-    ratio_He = simple_saha_test(T_hot, ne, 2, chi_He)
-    ionization_fraction_He = ratio_He / (1.0 + ratio_He)
-    
-    print(f"\nHelium ionization at T={T_hot}K, ne={ne:.0e}:")
-    print(f"  n(He+)/n(He) = {ratio_He:.3e}")
-    print(f"  Ionization fraction = {ionization_fraction_He:.3e}")
-    
-    # Test with more realistic conditions
-    T_cool = 4000.0  # K
-    ne_low = 1e11   # cm^-3
-    ratio_cool = simple_saha_test(T_cool, ne_low, 1, chi_H)
-    ionization_fraction_cool = ratio_cool / (1.0 + ratio_cool)
-    
-    print(f"\nHydrogen ionization at T={T_cool}K, ne={ne_low:.0e}:")
-    print(f"  n(H+)/n(H) = {ratio_cool:.3e}")
-    print(f"  Ionization fraction = {ionization_fraction_cool:.3e}")
-    
-    print("\nSaha equation validation passed!")
-
-
-if __name__ == "__main__":
-    validate_saha_implementation()
+    return ionization_energies

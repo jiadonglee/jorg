@@ -514,7 +514,9 @@ def load_stark_profiles(data_file: Optional[Path] = None) -> Dict:
                 log_gf = fid[transition_key].attrs['log_gf']
                 
                 # Process profile data like Korg.jl
-                logP = np.log(P)
+                # Avoid divide by zero warning by setting minimum value
+                P_safe = np.where(P <= 0, 1e-300, P)  # Set very small positive value for zeros
+                logP = np.log(P_safe)
                 # Clip -inf values to avoid NaNs in interpolation
                 logP[np.isinf(logP) & (logP < 0)] = -700.0
                 
