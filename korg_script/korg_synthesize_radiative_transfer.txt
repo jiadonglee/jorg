@@ -1,0 +1,10 @@
+# Korg.jl synthesize() Result - Radiative Transfer Data
+# Generated: 2025-07-31T22:04:12.287
+# Intensity array shape: (1, 20001)
+#
+# μ grid (values and weights):
+# Index    μ_value      Weight
+    1    1.000000    1.000000
+#
+# Subspectra ranges:
+# Range 1: 1:20001
