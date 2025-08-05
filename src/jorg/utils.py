@@ -399,7 +399,7 @@ def vacuum_to_air(wavelength: jnp.ndarray, cgs: bool = None) -> jnp.ndarray:
     for _ in range(3):  # Usually converges in 2-3 iterations
         vacuum_calc = air_to_vacuum(air_wl, cgs=cgs)
         correction = wavelength - vacuum_calc
-        air_wl += correction * 0.999  # Damping factor for stability
+        air_wl += correction  # CRITICAL FIX: Remove 0.999 damping factor to match Korg.jl exactly
     
     return air_wl
 

@@ -292,17 +292,17 @@ def parse_vald_line(line_text: str,
         # Parse species
         species_id = parse_species(species_str)
         
-        # Parse wavelength
+        # Parse wavelength - VALD format uses Angstroms, create_line_data converts to cm
         wavelength = float(wavelength_str)
         if wavelength_unit == "auto":
             if wavelength > 1000:  # Assume Angstroms
-                wavelength_cm = wavelength * 1e-8
+                wavelength_angstroms = wavelength
             else:
-                wavelength_cm = wavelength  # Assume cm
+                wavelength_angstroms = wavelength * 1e8  # Convert cm to Angstroms
         elif wavelength_unit == "angstrom":
-            wavelength_cm = wavelength * 1e-8
+            wavelength_angstroms = wavelength
         else:
-            wavelength_cm = wavelength
+            wavelength_angstroms = wavelength * 1e8  # Convert cm to Angstroms
         
         # Convert air to vacuum if needed - but only if the file specifies air wavelengths
         # This is handled in the parse_vald_linelist function which should detect the header
@@ -331,14 +331,14 @@ def parse_vald_line(line_text: str,
         
         # Apply default broadening if not provided
         if gamma_rad == 0.0:
-            gamma_rad = approximate_radiative_gamma(log_gf, wavelength_cm)
+            gamma_rad = approximate_radiative_gamma(log_gf, wavelength_angstroms * 1e-8)
         if gamma_stark == 0.0:
             gamma_stark = approximate_stark_gamma(species_id)
         if vdw_param1 == 0.0:
             vdw_param1 = approximate_vdw_gamma(species_id)
         
         return create_line_data(
-            wavelength=wavelength_cm,
+            wavelength=wavelength_angstroms,
             species=species_id,
             log_gf=log_gf,
             E_lower=E_lower,
@@ -603,7 +603,7 @@ def parse_turbospectrum_line(line_text: str, wavelength_unit: str) -> Optional[L
         
         # Apply defaults if needed
         if gamma_rad == 0.0:
-            gamma_rad = approximate_radiative_gamma(log_gf, wavelength_cm)
+            gamma_rad = approximate_radiative_gamma(log_gf, wavelength_angstroms * 1e-8)
         if gamma_stark == 0.0:
             gamma_stark = approximate_stark_gamma(species_id)
         if vdw_param1 == 0.0:

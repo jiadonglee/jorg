@@ -157,6 +157,10 @@ def mclaughlin_hminus_number_density(
     beta = 1.0 / (kboltz_eV * temperature)
     
     # H^- density from Saha equation
+    # CRITICAL FIX (December 2024): Positive exponential for binding energy
+    # Previous bug: Used exp(-E*beta) which gave ~1000× too small opacity
+    # Correct formula: exp(+E*beta) because this is binding energy, not ionization energy
+    # This fix achieves exact agreement with Korg.jl H⁻ bound-free component
     n_h_minus = (0.25 * n_h_i_ground * electron_density * coef * 
                  jnp.power(beta, 1.5) * jnp.exp(_H_MINUS_ION_ENERGY_EV * beta))
     

@@ -504,12 +504,21 @@ def estimate_molecular_fraction(
         # H, He molecules
         metal_factor = 1.0
     
-    # Empirical scaling factors
+    # CRITICAL FIX: Remove hardcoded molecular abundances to match Korg.jl
+    # Korg.jl uses proper chemical equilibrium with equilibrium constants (log_nK)
+    # See Korg.jl/src/statmech.jl:317-337 for proper molecular equilibrium calculation
+    #
+    # For production use, molecular abundances should come from:
+    # 1. Chemical equilibrium solver (statmech.chemical_equilibrium)  
+    # 2. Equilibrium constants from thermodynamic databases
+    # 3. Mass action law: n_mol = 10^(sum(n_atoms) - log_nK)
+    #
+    # These hardcoded values are rough approximations only for development/testing
     base_fractions = {
-        'H2O': 1e-4, 'TiO': 1e-8, 'VO': 1e-9, 'OH': 1e-7,
-        'CO': 1e-4, 'CH': 1e-8, 'CN': 1e-8, 'NH': 1e-8,
-        'FeH': 1e-9, 'CaH': 1e-10, 'MgH': 1e-10,
-        'H2': 1e-6, 'SiO': 1e-8
+        'H2O': 0.0, 'TiO': 0.0, 'VO': 0.0, 'OH': 0.0,     # Use chemical equilibrium instead
+        'CO': 0.0, 'CH': 0.0, 'CN': 0.0, 'NH': 0.0,       # Use chemical equilibrium instead  
+        'FeH': 0.0, 'CaH': 0.0, 'MgH': 0.0,               # Use chemical equilibrium instead
+        'H2': 0.0, 'SiO': 0.0                              # Use chemical equilibrium instead
     }
     
     base_fraction = base_fractions.get(molecule_name.upper(), 1e-12)

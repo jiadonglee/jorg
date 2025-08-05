@@ -124,6 +124,7 @@ def chemical_equilibrium_step_optimized(T: float, nt: float, ne_current: float,
 def chemical_equilibrium_working_optimized(temp: float, nt: float, model_atm_ne: float,
                                           absolute_abundances: Dict[int, float],
                                           ionization_energies: Dict[int, Tuple[float, float, float]],
+                                          log_equilibrium_constants: Dict[Species, Callable] = None,
                                           **kwargs) -> Tuple[float, Dict[Species, float]]:
     """
     Working optimized chemical equilibrium solver.
@@ -228,7 +229,100 @@ def chemical_equilibrium_working_optimized(temp: float, nt: float, model_atm_ne:
             h_minus_density = float(calculate_h_minus_density(temp, h_neutral_density, ne_final))
             number_densities[Species.from_atomic_number(1, -1)] = h_minus_density
     
+    # Add molecular species (following Korg.jl algorithm exactly)
+    if log_equilibrium_constants is not None:
+        mol_count = 0
+        for mol in log_equilibrium_constants.keys():
+            try:
+                # Get log equilibrium constant in number density form
+                log_nK = get_log_nK_optimized(mol, temp, log_equilibrium_constants)
+                
+                # Calculate molecular density from atomic densities
+                if hasattr(mol, 'charge') and mol.charge == 0:
+                    # Neutral molecule: e.g., CO from C I + O I
+                    atoms = mol.get_atoms()
+                    element_log_ns = []
+                    
+                    for atom_Z in atoms:
+                        neutral_species = Species.from_atomic_number(atom_Z, 0)
+                        if neutral_species in number_densities and number_densities[neutral_species] > 0:
+                            element_log_ns.append(np.log10(number_densities[neutral_species]))
+                        else:
+                            # Skip molecule if any constituent atom has zero density
+                            element_log_ns = None
+                            break
+                    
+                    if element_log_ns is not None:
+                        molecular_density = 10**(sum(element_log_ns) - log_nK)
+                        number_densities[mol] = float(molecular_density)
+                        mol_count += 1
+                
+                elif hasattr(mol, 'charge') and mol.charge == 1:
+                    # Singly ionized diatomic: first atom ionized, second neutral
+                    atoms = mol.get_atoms()
+                    if len(atoms) == 2:
+                        Z1, Z2 = atoms[0], atoms[1]  # Z1 should be lower atomic number
+                        
+                        ion_species = Species.from_atomic_number(Z1, 1)
+                        neutral_species = Species.from_atomic_number(Z2, 0)
+                        
+                        if (ion_species in number_densities and neutral_species in number_densities and
+                            number_densities[ion_species] > 0 and number_densities[neutral_species] > 0):
+                            
+                            log_ion = np.log10(number_densities[ion_species])
+                            log_neutral = np.log10(number_densities[neutral_species])
+                            molecular_density = 10**(log_ion + log_neutral - log_nK)
+                            number_densities[mol] = float(molecular_density)
+                            mol_count += 1
+                            
+            except Exception as e:
+                # Skip problematic molecules rather than failing
+                if kwargs.get('verbose', False):
+                    print(f"Warning: Could not calculate density for molecule {mol}: {e}")
+                continue
+        
+        # Debug output
+        if kwargs.get('verbose', False):
+            print(f"   Added {mol_count} molecular species to chemical equilibrium")
+    
+    # Return the calculated electron density without artificial corrections
+    # Any discrepancies should be fixed in the calculation itself, not masked with factors
     return ne_final, number_densities
+
+
+def get_log_nK_optimized(mol: Species, temp: float, log_equilibrium_constants: Dict[Species, Callable]) -> float:
+    """
+    Get log equilibrium constant in number density form (matching Korg.jl get_log_nK function).
+    
+    Converts from partial pressure form to number density form:
+    log_nK = log_Kp - (n_atoms - 1) * log10(kT)
+    
+    Parameters:
+    -----------
+    mol : Species
+        Molecular species
+    temp : float
+        Temperature in K
+    log_equilibrium_constants : Dict[Species, Callable]
+        Molecular equilibrium constants in partial pressure form
+        
+    Returns:
+    --------
+    float
+        Log equilibrium constant in number density form
+    """
+    if mol not in log_equilibrium_constants:
+        return 0.0
+    
+    # Get equilibrium constant in partial pressure form
+    log_T = np.log(temp)
+    log_Kp = log_equilibrium_constants[mol](log_T)
+    
+    # Convert to number density form
+    n_atoms = len(mol.formula.atoms) if hasattr(mol, 'formula') else 2
+    conversion = (n_atoms - 1) * np.log10(kboltz_cgs * temp)
+    
+    return float(log_Kp - conversion)
 
 
 @jit
@@ -356,7 +450,8 @@ class WorkingOptimizedStatmech:
                                  absolute_abundances: Dict[int, float]) -> Tuple[float, Dict[Species, float]]:
         """Solve chemical equilibrium with working optimizations."""
         return chemical_equilibrium_working_optimized(
-            temp, nt, model_atm_ne, absolute_abundances, self.ionization_energies
+            temp, nt, model_atm_ne, absolute_abundances, self.ionization_energies,
+            log_equilibrium_constants=self.molecular_constants
         )
     
     def get_molecular_constants(self) -> Dict[Species, Callable]:

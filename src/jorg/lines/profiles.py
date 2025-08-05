@@ -14,8 +14,8 @@ def harris_series(v: float) -> jnp.ndarray:
     """
     Compute Harris series coefficients H₀, H₁, H₂ for Voigt profile calculation.
     
-    This is the exact implementation from Korg.jl following Hunger 1965.
-    Assumes v < 5.
+    Exact implementation from Korg.jl src/line_absorption.jl lines 235-249
+    following Hunger 1965. Assumes v < 5.
     
     Parameters
     ----------
@@ -30,7 +30,7 @@ def harris_series(v: float) -> jnp.ndarray:
     v2 = v * v
     H0 = jnp.exp(-v2)
     
-    # H1 calculation with piecewise polynomials exactly as in Korg.jl
+    # H1 calculation with exact Korg.jl piecewise polynomials
     def h1_case1():  # v < 1.3
         return (-1.12470432 + (-0.15516677 + (3.288675912 + (-2.34357915 + 0.42139162 * v) * v) * v) * v)
     
@@ -52,7 +52,7 @@ def harris_series(v: float) -> jnp.ndarray:
         )
     )
     
-    # H2 calculation exactly as in Korg.jl
+    # H2 calculation exactly as in Korg.jl: H₂ = (1 - 2v²) * H₀
     H2 = (1.0 - 2.0 * v2) * H0
     
     return jnp.array([H0, H1, H2])
@@ -63,15 +63,15 @@ def voigt_hjerting(alpha: float, v: float) -> float:
     """
     Compute the Hjerting function H(α, v) for Voigt profile calculation.
     
-    This is the exact implementation from Korg.jl following Hunger 1965.
-    Approximation from Hunger 1965: https://ui.adsabs.harvard.edu/abs/1956ZA.....39...36H/abstract
+    Exact implementation from Korg.jl src/line_absorption.jl lines 270-294
+    following Hunger 1965 approximation with four regimes.
     
     Parameters
     ----------
     alpha : float
-        Damping parameter (ratio of Lorentz to Doppler width)
+        Damping parameter α = γ/(σ√2)
     v : float
-        Dimensionless frequency offset from line center
+        Dimensionless frequency offset v = |λ-λ₀|/(σ√2)
         
     Returns
     -------
@@ -82,33 +82,34 @@ def voigt_hjerting(alpha: float, v: float) -> float:
     sqrt_pi = jnp.sqrt(pi)
     
     def case_small_alpha_large_v():
-        # α <= 0.2 && v >= 5
+        # Regime 1: α ≤ 0.2 && v ≥ 5
         invv2 = 1.0 / v2
-        return (alpha / sqrt_pi * invv2) * (1.0 + 1.5 * invv2 + 3.75 * invv2**2)
+        return (alpha / sqrt_pi * invv2) * (1.0 + 1.5 * invv2 + 3.75 * invv2 * invv2)
     
     def case_small_alpha_small_v():
-        # α <= 0.2 && v < 5
+        # Regime 2: α ≤ 0.2 && v < 5
         H = harris_series(v)
         H0, H1, H2 = H[0], H[1], H[2]
         return H0 + (H1 + H2 * alpha) * alpha
     
     def case_intermediate():
-        # α <= 1.4 && α + v < 3.2
-        # Modified Harris series: M_i is H'_i in the source text
+        # Regime 3: α ≤ 1.4 && α + v < 3.2
+        # Modified Harris series with M coefficients
         H = harris_series(v)
         H0, H1, H2 = H[0], H[1], H[2]
         
         M0 = H0
         M1 = H1 + 2.0 / sqrt_pi * M0
         M2 = H2 - M0 + 2.0 / sqrt_pi * M1
-        M3 = 2.0 / (3.0 * sqrt_pi) * (1.0 - H2) - (2.0 / 3.0) * v2 * M1 + 2.0 / sqrt_pi * M2
-        M4 = 2.0 / 3.0 * v2 * v2 * M0 - 2.0 / (3.0 * sqrt_pi) * M1 + 2.0 / sqrt_pi * M3
+        M3 = (2.0 / (3.0 * sqrt_pi)) * (1.0 - H2) - (2.0 / 3.0) * v2 * M1 + (2.0 / sqrt_pi) * M2
+        M4 = (2.0 / 3.0) * v2 * v2 * M0 - (2.0 / (3.0 * sqrt_pi)) * M1 + (2.0 / sqrt_pi) * M3
         
+        # Exact Korg.jl polynomial for ψ
         psi = 0.979895023 + (-0.962846325 + (0.532770573 - 0.122727278 * alpha) * alpha) * alpha
         return psi * (M0 + (M1 + (M2 + (M3 + M4 * alpha) * alpha) * alpha) * alpha)
     
     def case_large_alpha():
-        # α > 1.4 or (α > 0.2 and α + v > 3.2)
+        # Regime 4: α > 1.4 or (α > 0.2 and α + v > 3.2)
         alpha2 = alpha * alpha
         r2 = v2 / alpha2
         alpha_invu = 1.0 / (jnp.sqrt(2.0) * ((r2 + 1.0) * alpha))
@@ -117,7 +118,7 @@ def voigt_hjerting(alpha: float, v: float) -> float:
         return (jnp.sqrt(2.0 / pi) * alpha_invu * 
                 (1.0 + (3.0 * r2 - 1.0 + ((r2 - 2.0) * 15.0 * r2 + 2.0) * alpha2_invu2) * alpha2_invu2))
     
-    # Apply the exact same logic as Korg.jl
+    # Apply exact Korg.jl regime selection logic
     return jnp.where(
         (alpha <= 0.2) & (v >= 5.0),
         case_small_alpha_large_v(),

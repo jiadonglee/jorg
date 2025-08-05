@@ -17,6 +17,10 @@ from .profiles import (
     voigt_hjerting,
     harris_series
 )
+from .voigt import (
+    voigt_profile,
+    voigt_profile_wavelength
+)
 from .broadening import (
     doppler_width,
     scaled_stark,
@@ -110,6 +114,8 @@ __all__ = [
     "line_profile",
     "voigt_hjerting", 
     "harris_series",
+    "voigt_profile",
+    "voigt_profile_wavelength",
     "doppler_width",
     "scaled_stark",
     "scaled_vdw",

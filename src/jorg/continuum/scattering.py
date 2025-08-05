@@ -41,8 +41,11 @@ def rayleigh_scattering(
     """
     Calculate Rayleigh scattering opacity by neutral atoms and molecules
     
-    Rayleigh scattering has a ν^4 frequency dependence and is important
-    at short wavelengths (UV).
+    Implements proper Rayleigh scattering formulations from Korg.jl:
+    - H I and He I: Colgan+ 2016 formulation
+    - H2: Dalgarno & Williams 1962 formulation
+    
+    Direct port from Korg.jl/src/ContinuumAbsorption/scattering.jl
     
     Parameters
     ----------
@@ -60,31 +63,36 @@ def rayleigh_scattering(
     jnp.ndarray
         Rayleigh scattering opacity in cm^-1
     """
-    # Convert frequency to wavelength in cm
-    wavelength = c_cgs / frequencies
+    from ..constants import hplanck_eV, Rydberg_eV
     
-    # Rayleigh scattering cross sections (approximate values)
-    # These are rough approximations - real implementation needs proper formulas
+    # Thompson scattering cross section (from Korg.jl)
+    sigma_thomson = 6.65246e-25  # cm^2
     
-    # H I Rayleigh scattering cross section
-    # σ_H ≈ 4.5e-26 * (λ₀/λ)^4 cm^2, where λ₀ = 1215 Å (Lyman alpha)
-    lambda_0_h = 1215e-8  # cm
-    sigma_h_rayleigh = 4.5e-26 * (lambda_0_h / wavelength)**4
+    # Colgan+ 2016 formulation for H I and He I
+    # (ħω/2E_H)^2 = (photon energy / 2 Rydberg)^2
+    E_2Ryd_2 = (hplanck_eV * frequencies / (2 * Rydberg_eV))**2
+    E_2Ryd_4 = E_2Ryd_2**2
+    E_2Ryd_6 = E_2Ryd_2 * E_2Ryd_4
+    E_2Ryd_8 = E_2Ryd_4**2
     
-    # He I Rayleigh scattering cross section (smaller than H I)
-    lambda_0_he = 584e-8  # cm (He I resonance line)
-    sigma_he_rayleigh = 1.0e-26 * (lambda_0_he / wavelength)**4
+    # Colgan+ 2016 equation 6 for H I
+    sigma_H_over_sigma_th = 20.24 * E_2Ryd_4 + 239.2 * E_2Ryd_6 + 2256 * E_2Ryd_8
     
-    # H2 Rayleigh scattering cross section
-    # Molecular cross sections are typically larger
-    lambda_0_h2 = 1000e-8  # cm (approximate)
-    sigma_h2_rayleigh = 8.0e-26 * (lambda_0_h2 / wavelength)**4
+    # Colgan+ 2016 equation 7 for He I  
+    sigma_He_over_sigma_th = 1.913 * E_2Ryd_4 + 4.52 * E_2Ryd_6 + 7.90 * E_2Ryd_8
     
-    # Total Rayleigh scattering opacity
-    alpha_rayleigh = (
-        n_h_i * sigma_h_rayleigh +
-        n_he_i * sigma_he_rayleigh +
-        n_h2 * sigma_h2_rayleigh
-    )
+    # H I and He I contribution
+    alpha_H_He = (n_h_i * sigma_H_over_sigma_th + n_he_i * sigma_He_over_sigma_th) * sigma_thomson
     
-    return alpha_rayleigh
+    # Dalgarno & Williams 1962 equation 3 for H2 (assumes λ in Å)
+    # Convert frequency to wavelength in Angstroms for this formula
+    inv_lambda_A = frequencies / (1e8 * c_cgs)  # 1/λ where λ is in Å
+    inv_lambda2 = inv_lambda_A**2
+    inv_lambda4 = inv_lambda2**2
+    inv_lambda6 = inv_lambda2 * inv_lambda4
+    inv_lambda8 = inv_lambda4**2
+    
+    # H2 Rayleigh scattering (Dalgarno & Williams 1962)
+    alpha_H2 = (8.14e-13 * inv_lambda4 + 1.28e-6 * inv_lambda6 + 1.61 * inv_lambda8) * n_h2
+    
+    return alpha_H_He + alpha_H2

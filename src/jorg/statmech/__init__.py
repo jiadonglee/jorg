@@ -7,12 +7,16 @@ and partition functions following the Korg.jl implementation exactly.
 ✅ **PRODUCTION READY**: The implementation achieves <1% accuracy target for
 chemical equilibrium calculations, with H ionization within 2.6% of literature values.
 
-🚀 **PERFORMANCE OPTIMIZED**: Fast versions with JIT compilation and vectorization
-available for high-performance applications.
+🚀 **PERFORMANCE OPTIMIZED**: The default chemical_equilibrium API now uses the
+optimized working implementation with JIT compilation and vectorization.
+
+📦 **API CHANGE**: chemical_equilibrium_working_optimized is now the default 
+chemical_equilibrium API for robust, high-performance applications.
 """
 
 # Core chemical equilibrium (production-ready implementation)
-from .chemical_equilibrium import chemical_equilibrium_fast as chemical_equilibrium
+# Note: Importing after other modules to avoid circular imports
+# from .working_optimizations import chemical_equilibrium_working_optimized as chemical_equilibrium
 
 # Performance optimized versions with JIT and vectorization
 from .fast_kernels import (
@@ -73,6 +77,9 @@ from .working_optimizations import (
     benchmark_working_optimizations
 )
 
+# Set the optimized version as the default chemical_equilibrium API
+chemical_equilibrium = chemical_equilibrium_working_optimized
+
 __all__ = [
     # Core functions
     'chemical_equilibrium',
@@ -123,7 +130,7 @@ __all__ = [
     'hummer_mihalas_U_H',
     
     # Working optimizations (production-ready JIT + vectorization)
-    'chemical_equilibrium_working_optimized',
+    'chemical_equilibrium_working_optimized',  # Available for explicit access
     'create_working_optimized_statmech',
     'WorkingOptimizedStatmech',
     'benchmark_working_optimizations',

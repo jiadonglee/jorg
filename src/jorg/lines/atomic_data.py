@@ -205,8 +205,9 @@ def get_ionization_energy(atomic_number: int, ionization_stage: int) -> float:
         if ionization_stage < len(energies):
             return energies[ionization_stage]
     
-    # Default fallback for unknown species
-    return 13.6  # Hydrogen-like approximation
+    # CRITICAL FIX: Use proper ionization energies instead of hydrogen-like approximation
+    from ..statmech.proper_ionization_energies import proper_ionization_energy
+    return proper_ionization_energy(atomic_number, ionization_stage + 1)
 
 
 def get_isotopic_abundance(atomic_number: int, mass_number: int) -> float:

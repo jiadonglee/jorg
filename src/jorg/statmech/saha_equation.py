@@ -541,10 +541,17 @@ def create_default_ionization_energies() -> Dict[int, Tuple[float, float, float]
         
         ionization_energies[Z] = (chi_I, chi_II, chi_III)
     
-    # Add missing elements with hydrogen-like approximation
+    # CRITICAL FIX: Replace hydrogen-like approximation with proper ionization energies
+    # Use the proper ionization energy system instead of 13.6 * Z**2 approximation
+    from .proper_ionization_energies import get_proper_ionization_energies
+    
+    proper_ion_system = get_proper_ionization_energies()
     for Z in range(1, MAX_ATOMIC_NUMBER + 1):
         if Z not in ionization_energies:
-            chi_approx = 13.6 * (Z**2)  # Very rough approximation
-            ionization_energies[Z] = (chi_approx, chi_approx * 2, chi_approx * 3)
+            # Use proper physics-based ionization energies
+            chi_I = proper_ion_system.get_ionization_energy(Z, 1)
+            chi_II = proper_ion_system.get_ionization_energy(Z, 2) 
+            chi_III = proper_ion_system.get_ionization_energy(Z, 3)
+            ionization_energies[Z] = (chi_I, chi_II, chi_III)
     
     return ionization_energies
