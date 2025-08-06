@@ -184,6 +184,7 @@ class LayerProcessor:
             ne_guess = float(atm['electron_density'][layer_idx])
         else:
             # Estimate from temperature and pressure  
+            print("⚠️ No electron density in atmosphere, using simple estimate.")
             ne_guess = nt * 1e-4  # Simple estimate
         
         # 2. Chemical equilibrium calculation

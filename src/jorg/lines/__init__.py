@@ -36,6 +36,12 @@ from .linelist import (
     save_linelist,
     LineList
 )
+from .linelist_data import (
+    get_VALD_solar_linelist,
+    get_APOGEE_DR17_linelist,
+    get_GALAH_DR3_linelist,
+    get_GES_linelist
+)
 from .species import (
     parse_species,
     species_id_to_name,
@@ -129,6 +135,12 @@ __all__ = [
     "read_linelist",
     "save_linelist", 
     "LineList",
+    
+    # Built-in linelist functions (Korg.jl compatibility)
+    "get_VALD_solar_linelist",
+    "get_APOGEE_DR17_linelist", 
+    "get_GALAH_DR3_linelist",
+    "get_GES_linelist",
     
     # Species handling
     "parse_species",

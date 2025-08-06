@@ -336,11 +336,25 @@ class KorgLineProcessor:
             try:
                 h_neutral = Species.from_atomic_number(1, 0)  # H I
                 if h_neutral in n_densities:
-                    vdW_param = getattr(line, 'vdW', (0.0, -1))  # Default tuple
+                    # Get vdW parameters from line data
+                    if hasattr(line, 'vdW'):
+                        vdW_param = line.vdW
+                    elif hasattr(line, 'vdw_param1') and hasattr(line, 'vdw_param2'):
+                        vdW_param = (line.vdw_param1, line.vdw_param2)
+                    else:
+                        vdW_param = (0.0, -1)  # Default: no enhancement
+                    
+                    # Store line info for _scaled_vdW to access
+                    self.species = line.species
+                    self.E_lower = line.E_lower
+                    self.wavelength = line.wavelength
+                    
                     hydrogen_densities = n_densities[h_neutral]
                     Gamma += hydrogen_densities * self._scaled_vdW(vdW_param, atomic_mass, temps)
-            except Exception:
-                pass  # Skip vdW broadening if species lookup fails
+            except Exception as e:
+                if self.verbose:
+                    print(f"       Warning: vdW broadening failed: {e}")
+                pass  # Skip vdW broadening if calculation fails
         
         # Convert to wavelength HWHM (Korg.jl line 83)
         # γ = Γ * λ²/(4π*c)
@@ -358,21 +372,43 @@ class KorgLineProcessor:
     
     def _scaled_vdW(self, vdW_param: Tuple[float, float], atomic_mass: float, 
                    temps: np.ndarray) -> np.ndarray:
-        """van der Waals broadening (Korg.jl lines 192-204)"""
+        """
+        van der Waals broadening (Korg.jl lines 192-204)
+        
+        Handles different vdW parameter formats:
+        - (value, -1): log10 enhancement factor
+        - (value, -2): Unsöld fudge factor  
+        - (σ, α) where α >= 0: ABO theory parameters
+        """
         sigma, alpha = vdW_param
         
         if alpha == -1:
-            # Simple scaling
-            return sigma * (temps / 10000.0)**0.3
+            # log10 enhancement factor (most common VALD format)
+            # gamma_vdW = 10^(log_factor) * approximate_vdW
+            # Use Unsöld approximation as base
+            from ..lines.broadening_korg import approximate_vdw_broadening
+            base_log_gamma = approximate_vdw_broadening(self.species, self.E_lower, 
+                                                       self.wavelength, temps[0])[1]
+            base_gamma = 10**base_log_gamma if base_log_gamma > 0 else 1e-8
+            return 10**sigma * base_gamma * (temps / 10000.0)**0.3
+        elif alpha == -2:
+            # Unsöld fudge factor (0 < value < 20)
+            # Similar to above but with fudge factor multiplier
+            from ..lines.broadening_korg import approximate_vdw_broadening
+            base_log_gamma = approximate_vdw_broadening(self.species, self.E_lower,
+                                                       self.wavelength, temps[0])[1]
+            base_gamma = 10**base_log_gamma if base_log_gamma > 0 else 1e-8
+            return sigma * base_gamma * (temps / 10000.0)**0.3
         else:
-            # ABO theory
-            v0 = 1e6  # Reference velocity
+            # ABO theory (σ in cm², α dimensionless)
+            v0 = 1e6  # Reference velocity cm/s
             inv_mu = 1.0 / (1.008 * amu_cgs) + 1.0 / atomic_mass  # Inverse reduced mass
-            vbar = np.sqrt(8 * kboltz_cgs * temps / PI * inv_mu)  # Relative velocity
+            vbar = np.sqrt(8 * kboltz_cgs * temps / PI * inv_mu)  # Mean relative velocity
             
-            from scipy.special import gamma
-            gamma_factor = gamma((4 - alpha) / 2)
+            from scipy.special import gamma as gamma_func
+            gamma_factor = gamma_func((4 - alpha) / 2)
             
+            # ABO formula from Anstee & O'Mara (1995)
             return 2 * (4/PI)**(alpha/2) * gamma_factor * v0 * sigma * (vbar/v0)**(1-alpha)
     
     def _sigma_line(self, wavelength_cm: float) -> float:
@@ -484,7 +520,8 @@ class KorgLineProcessor:
         if rho > 1.0 / (PI * gamma):
             return min_window  # Prevent 0.0 window that excludes lines
         else:
-            return max(min_window, np.sqrt(gamma / (PI * rho) - gamma**2))
+            # CRITICAL FIX: Correct Korg.jl formula is γ/(π*ρ) - γ², not γ/(π*ρ - γ²)
+            return max(min_window, np.sqrt(gamma / (PI * rho) - gamma*gamma))
     
     def _line_profile(self, lambda0: float, sigma: float, gamma: float, 
                      amplitude: float, wavelength: float) -> float:

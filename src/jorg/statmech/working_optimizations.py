@@ -114,7 +114,9 @@ def chemical_equilibrium_step_optimized(T: float, nt: float, ne_current: float,
     neutral_fractions = 1.0 / (1.0 + wII)
     
     # Compute new electron density
-    total_atoms = abundances * (nt - ne_current)
+    # Fix: Use nt directly, not (nt - ne_current)
+    # The total number density nt already includes all particles
+    total_atoms = abundances * nt
     neutral_densities = total_atoms * neutral_fractions
     ne_new = jnp.sum(wII * neutral_densities)
     
@@ -203,9 +205,12 @@ def chemical_equilibrium_working_optimized(temp: float, nt: float, model_atm_ne:
     wII = vmap(saha_weight_kernel, in_axes=(None, None, 0, 0, 0))(temp, ne_final, chi_I_array, U_I, U_II)
     
     # Calculate final densities
-    total_atoms = abundances_array * (nt - ne_final)
+    # Fix: Use nt directly, not (nt - ne_final)
+    # The total number density nt already includes all particles
+    total_atoms = abundances_array * nt
     neutral_densities = total_atoms * neutral_fractions_final
     ionized_densities = wII * neutral_densities
+    
     
     # Build species density dictionary
     number_densities = {}
@@ -234,6 +239,10 @@ def chemical_equilibrium_working_optimized(temp: float, nt: float, model_atm_ne:
         mol_count = 0
         for mol in log_equilibrium_constants.keys():
             try:
+                # CRITICAL FIX: Skip atomic species (they're already calculated above)
+                # Only process true molecules (more than 1 atom)
+                if hasattr(mol, 'get_atoms') and len(mol.get_atoms()) == 1:
+                    continue  # Skip H I, He I, etc. - these are atomic, not molecular
                 # Get log equilibrium constant in number density form
                 log_nK = get_log_nK_optimized(mol, temp, log_equilibrium_constants)
                 
@@ -254,6 +263,7 @@ def chemical_equilibrium_working_optimized(temp: float, nt: float, model_atm_ne:
                     
                     if element_log_ns is not None:
                         molecular_density = 10**(sum(element_log_ns) - log_nK)
+                        
                         number_densities[mol] = float(molecular_density)
                         mol_count += 1
                 

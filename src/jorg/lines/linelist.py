@@ -320,9 +320,48 @@ def parse_vald_line(line_text: str,
         
         if len(parts) > 5:
             try:
-                gamma_rad = float(parts[5])
-                gamma_stark = float(parts[6])
-                vdw_param1 = float(parts[7])
+                # CRITICAL FIX: VALD gamma values are in log₁₀ form, need 10^x conversion
+                gamma_rad_log = float(parts[5])
+                gamma_stark_log = float(parts[6])
+                
+                # Convert from log₁₀ to linear scale (as Korg.jl does with tentotheOrMissing)
+                # Only convert if positive (negative values mean "not available")
+                if gamma_rad_log > 0:
+                    gamma_rad = 10.0**gamma_rad_log
+                else:
+                    gamma_rad = 0.0  # Use default approximation
+                    
+                if gamma_stark_log > 0:
+                    gamma_stark = 10.0**gamma_stark_log
+                else:
+                    gamma_stark = 0.0  # Use default approximation
+                
+                # CRITICAL FIX: VALD vdW parameter interpretation (following Korg.jl)
+                vdw_raw = float(parts[7])
+                
+                # Interpret vdW based on value range (Korg.jl linelist.jl logic):
+                if vdw_raw == 0:
+                    # No vdW broadening
+                    vdw_param1 = 0.0
+                    vdw_param2 = 0.0
+                elif vdw_raw < 0:
+                    # Negative: log10 of enhancement factor (most common in VALD)
+                    # Store as-is, will be handled in broadening calculation
+                    vdw_param1 = vdw_raw
+                    vdw_param2 = -1.0  # Marker for log enhancement factor
+                elif 0 < vdw_raw < 20:
+                    # Between 0 and 20: Unsöld approximation fudge factor
+                    vdw_param1 = vdw_raw
+                    vdw_param2 = -2.0  # Marker for Unsöld fudge factor
+                else:
+                    # >= 20: Packed ABO parameters (σ, α)
+                    # σ = floor(vdW) * bohr_radius²
+                    # α = vdW - floor(vdW)
+                    import numpy as np
+                    bohr_radius_cgs = 5.29177210903e-9  # cm
+                    vdw_param1 = np.floor(vdw_raw) * bohr_radius_cgs * bohr_radius_cgs  # σ in cm²
+                    vdw_param2 = vdw_raw - np.floor(vdw_raw)  # α (dimensionless)
+                
                 if len(parts) > 8:
                     # Lande factor is in parts[8], depth in parts[9]
                     pass

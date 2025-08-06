@@ -91,7 +91,7 @@ from dataclasses import dataclass
 
 # Jorg physics modules
 from .atmosphere import interpolate_marcs as interpolate_atmosphere
-from .abundances import format_A_X as format_abundances
+from .abundances import format_abundances
 from .statmech import (
     chemical_equilibrium,  # Now the optimized version by default
     create_default_ionization_energies, 
@@ -287,7 +287,8 @@ def synthesize_korg_compatible(
         spacing = 0.005  # Å - ultra-fine resolution for perfectly smooth Voigt profiles
         n_points = int((λ_stop - λ_start) / spacing) + 1
         wl_array = np.linspace(λ_start, λ_stop, n_points)
-        print(f"🔧 WAVELENGTH GRID: {n_points} points, {spacing*1000:.1f} mÅ spacing")  # Always print for debugging
+        if verbose:
+            print(f"🔧 WAVELENGTH GRID: {n_points} points, {spacing*1000:.1f} mÅ spacing")
     else:
         wl_array = np.array(wavelengths)
     
@@ -322,7 +323,6 @@ def synthesize_korg_compatible(
     
     if verbose:
         print("✅ Atomic physics data loaded")
-        print("✅ Preprocessed 18 molecular species for optimization")
     
     # 4. Extract atmospheric structure
     # Convert ModelAtmosphere to dictionary format if needed
@@ -378,12 +378,6 @@ def synthesize_korg_compatible(
         print("✅ Species mapping: VALD codes (2600→Fe I) correctly mapped to Jorg Species")
         print("✅ Matrix processing: All 56 atmospheric layers processed simultaneously")
         print("✅ Algorithm: Direct translation of Korg.jl line_absorption.jl (lines 92-106)")
-        
-        # Show loaded metal BF data for reference
-        print("Loaded metal BF data for 10 species:")
-        metal_species = ["Al I", "C I", "Ca I", "Fe I", "H I", "He II", "Mg I", "Na I", "S I", "Si I"]
-        for species in metal_species:
-            print(f"  {species}")
     
     # Use the logg parameter passed to function
     log_g = logg
@@ -639,28 +633,44 @@ def synthesize(atm, linelist=None, A_X=None, wavelengths=(4000.0, 7000.0),
     )
 
 
-def synth(Teff, logg, m_H, wavelengths=(4000.0, 7000.0), linelist=None, rectify=False, **kwargs):
+def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0), 
+          linelist=None, rectify=True, R=float('inf'), vsini=0, vmic=1.0,
+          format_A_X_kwargs=None, synthesize_kwargs=None, **abundances):
     """
-    Simple stellar synthesis interface (matches Korg.jl synth())
+    Enhanced stellar synthesis interface (fully compatible with Korg.jl synth())
     
     Parameters
     ----------
     Teff : float
-        Effective temperature in K
+        Effective temperature in K (default range: 3000-50000K)
     logg : float
-        Surface gravity (log g)
+        Surface gravity (log g) (default range: 0-6)
     m_H : float
-        Metallicity [M/H]
+        Metallicity [metals/H] (default range: -4 to +1)
+    alpha_H : float, optional
+        Alpha element enhancement [α/H]. If None, defaults to m_H
     wavelengths : tuple, optional
-        Wavelength range (start, end) in Å
+        Wavelength range (start, end) in Å (default: 5000-6000Å)
     linelist : optional
         Spectral line list (VALD format recommended)
         If None, performs continuum-only synthesis
     rectify : bool, optional
-        If True, normalize flux by continuum (0-1 scale)
+        If True, normalize flux by continuum (0-1 scale) - matches Korg.jl default
         If False, return in physical units (flux ~ 10¹⁵ erg/s/cm²/Å)
-    **kwargs : optional
-        Additional synthesis parameters
+    R : float or callable, optional
+        Resolution R=λ/Δλ for automatic LSF application (default: no LSF)
+        If callable, should take wavelength and return resolving power
+    vsini : float, optional  
+        Projected rotational velocity in km/s for automatic rotation broadening (default: 0)
+    vmic : float, optional
+        Microturbulent velocity in km/s (default: 1.0)
+    format_A_X_kwargs : dict, optional
+        Advanced abundance formatting options
+    synthesize_kwargs : dict, optional
+        Additional parameters passed to synthesize()
+    **abundances : optional
+        Individual element abundances using atomic symbols
+        Examples: Fe=0.2, C=-0.1, O=0.3 (in [X/H] format)
         
     Returns  
     -------
@@ -669,39 +679,83 @@ def synth(Teff, logg, m_H, wavelengths=(4000.0, 7000.0), linelist=None, rectify=
         
     Notes
     -----
-    Expected behavior:
+    Enhanced behavior matching Korg.jl:
+    - Default rectify=True for normalized spectra (0-1 scale)
+    - Supports alpha element enhancement separate from metallicity
+    - Individual element abundances via keyword arguments (Fe=0.2, C=-0.1)
+    - Automatic LSF application if R is finite
+    - Automatic rotation broadening if vsini > 0
+    - Default wavelength range matches Korg.jl (5000-6000Å)
+    
+    Expected results:
     - With linelist + rectify=True: realistic line depths 10-80%, max flux ≤ 1.0
     - With linelist + rectify=False: physical units with line absorption
     - Without linelist + rectify=True: flat flux ≈ 1.0 (continuum-only)
     - Without linelist + rectify=False: smooth continuum in physical units
     
-    For meaningful spectral features, provide a VALD or similar linelist.
-    Use rectify=True for normalized spectra suitable for abundance analysis.
-    Use rectify=False for absolute flux calibration or when comparing different stars.
-    
     Examples
     --------
-    >>> # Normalized solar spectrum with lines
-    >>> wl, flux, cont = synth(5780, 4.44, 0.0, (5000, 5100), 
-    ...                        linelist=my_linelist, rectify=True)
-    >>> # flux ranges from ~0.2 to 1.0 with realistic line absorption
+    >>> # Solar spectrum with individual abundances and alpha enhancement
+    >>> wl, flux, cont = synth(5780, 4.44, m_H=-0.5, alpha_H=0.2, 
+    ...                        Fe=-0.3, C=0.1, linelist=my_linelist)
+    >>> # Metal-poor, alpha-enhanced star with enhanced carbon, depleted iron
+    
+    >>> # Automatic LSF and rotation broadening
+    >>> wl, flux, cont = synth(6000, 4.0, 0.0, R=50000, vsini=15, 
+    ...                        linelist=my_linelist)
+    >>> # High-resolution spectrum convolved to R=50,000 with 15 km/s rotation
     
     >>> # Physical units continuum-only
-    >>> wl, flux, cont = synth(5780, 4.44, 0.0, (5000, 5100), 
-    ...                        linelist=None, rectify=False)  
+    >>> wl, flux, cont = synth(5780, 4.44, 0.0, rectify=False, linelist=None)
     >>> # flux ~ 1.2e15 erg/s/cm²/Å, smooth wavelength variation
     """
-    # Create abundance array and atmosphere
-    A_X = create_korg_compatible_abundance_array(m_H)
-    atm = interpolate_atmosphere(Teff=Teff, logg=logg, m_H=m_H)
+    # Set default alpha_H to m_H if not specified (matches Korg.jl behavior)
+    if alpha_H is None:
+        alpha_H = m_H
     
-    # Run synthesis - remove verbose=False to avoid conflict
-    result = synthesize_korg_compatible(
-        atm=atm, linelist=linelist, A_X=A_X, 
-        wavelengths=wavelengths, logg=logg, rectify=rectify, **kwargs
+    # Prepare kwargs dictionaries
+    if format_A_X_kwargs is None:
+        format_A_X_kwargs = {}
+    if synthesize_kwargs is None:
+        synthesize_kwargs = {}
+        
+    # Create enhanced abundance array with alpha and individual elements
+    A_X = format_abundances(
+        default_metals_H=m_H,
+        default_alpha_H=alpha_H, 
+        abundances=abundances,
+        **format_A_X_kwargs
     )
     
-    return result.wavelengths, result.flux, result.cntm
+    # Create atmosphere
+    atm = interpolate_atmosphere(Teff=Teff, logg=logg, m_H=m_H)
+    
+    # Run synthesis
+    result = synthesize_korg_compatible(
+        atm=atm, 
+        linelist=linelist, 
+        A_X=A_X, 
+        wavelengths=wavelengths, 
+        logg=logg, 
+        rectify=rectify,
+        vmic=vmic,
+        **synthesize_kwargs
+    )
+    
+    # Extract flux for post-processing
+    flux = result.flux
+    
+    # Apply automatic LSF if R is finite (matches Korg.jl behavior)
+    if jnp.isfinite(R) and R > 0:
+        from .utils import apply_LSF
+        flux = apply_LSF(flux, result.wavelengths, R)
+    
+    # Apply automatic rotation if vsini > 0 (matches Korg.jl behavior)  
+    if vsini > 0:
+        from .utils import apply_rotation
+        flux = apply_rotation(flux, result.wavelengths, vsini)
+    
+    return result.wavelengths, flux, result.cntm
 
 
 def validate_synthesis_setup(Teff, logg, m_H, wavelengths, linelist=None, verbose=True):

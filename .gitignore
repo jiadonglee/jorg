@@ -191,3 +191,7 @@ jax_cache/
 archive/
 debugging_archive
 project_archive/
+CLAUDE.md
+korg_script
+scripts/
+tests/

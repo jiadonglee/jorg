@@ -127,6 +127,227 @@ def get_asplund_ionization_energies() -> Dict[int, jnp.ndarray]:
     return ionization_energies
 
 
+# Alpha elements (O, Ne, Mg, Si, S, Ar, Ca, Ti) - elements with even atomic numbers from 8-22
+DEFAULT_ALPHA_ELEMENTS = [8, 10, 12, 14, 16, 18, 20, 22]  # O to Ti
+
+# Element symbol to atomic number mapping
+ELEMENT_TO_Z = {
+    'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8,
+    'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15,
+    'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22,
+    'V': 23, 'Cr': 24, 'Mn': 25, 'Fe': 26, 'Co': 27, 'Ni': 28, 'Cu': 29, 'Zn': 30,
+    'Ga': 31, 'Ge': 32, 'As': 33, 'Se': 34, 'Br': 35, 'Kr': 36, 'Rb': 37, 'Sr': 38,
+    'Y': 39, 'Zr': 40, 'Nb': 41, 'Mo': 42, 'Tc': 43, 'Ru': 44, 'Rh': 45, 'Pd': 46,
+    'Ag': 47, 'Cd': 48, 'In': 49, 'Sn': 50, 'Sb': 51, 'Te': 52, 'I': 53, 'Xe': 54,
+    'Cs': 55, 'Ba': 56, 'La': 57, 'Ce': 58, 'Pr': 59, 'Nd': 60, 'Pm': 61, 'Sm': 62,
+    'Eu': 63, 'Gd': 64, 'Tb': 65, 'Dy': 66, 'Ho': 67, 'Er': 68, 'Tm': 69, 'Yb': 70,
+    'Lu': 71, 'Hf': 72, 'Ta': 73, 'W': 74, 'Re': 75, 'Os': 76, 'Ir': 77, 'Pt': 78,
+    'Au': 79, 'Hg': 80, 'Tl': 81, 'Pb': 82, 'Bi': 83, 'Po': 84, 'At': 85, 'Rn': 86,
+    'Fr': 87, 'Ra': 88, 'Ac': 89, 'Th': 90, 'Pa': 91, 'U': 92
+}
+
+# Asplund et al. 2020 solar abundances (extended)
+ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
+    12.00,  # 1 H
+    10.91,  # 2 He  
+    1.05,   # 3 Li
+    1.38,   # 4 Be
+    2.70,   # 5 B
+    8.46,   # 6 C
+    7.83,   # 7 N
+    8.69,   # 8 O
+    4.40,   # 9 F
+    8.06,   # 10 Ne
+    6.24,   # 11 Na
+    7.60,   # 12 Mg
+    6.45,   # 13 Al
+    7.51,   # 14 Si
+    5.41,   # 15 P
+    7.12,   # 16 S
+    5.50,   # 17 Cl
+    6.40,   # 18 Ar
+    5.03,   # 19 K
+    6.34,   # 20 Ca
+    3.15,   # 21 Sc
+    4.95,   # 22 Ti
+    3.93,   # 23 V
+    5.64,   # 24 Cr
+    5.43,   # 25 Mn
+    7.50,   # 26 Fe
+    4.99,   # 27 Co
+    6.22,   # 28 Ni
+    4.19,   # 29 Cu
+    4.56,   # 30 Zn
+    3.04,   # 31 Ga
+    3.65,   # 32 Ge
+    2.30,   # 33 As
+    3.34,   # 34 Se
+    2.54,   # 35 Br
+    3.25,   # 36 Kr
+    2.52,   # 37 Rb
+    2.87,   # 38 Sr
+    2.21,   # 39 Y
+    2.58,   # 40 Zr
+    1.46,   # 41 Nb
+    1.88,   # 42 Mo
+    0.00,   # 43 Tc (no stable isotopes)
+    1.75,   # 44 Ru
+    0.91,   # 45 Rh
+    1.57,   # 46 Pd
+    0.96,   # 47 Ag
+    1.71,   # 48 Cd
+    0.80,   # 49 In
+    2.04,   # 50 Sn
+    1.01,   # 51 Sb
+    2.18,   # 52 Te
+    1.55,   # 53 I
+    2.24,   # 54 Xe
+    1.08,   # 55 Cs
+    2.18,   # 56 Ba
+    1.10,   # 57 La
+    1.58,   # 58 Ce
+    0.72,   # 59 Pr
+    1.42,   # 60 Nd
+    0.00,   # 61 Pm (no stable isotopes)
+    0.96,   # 62 Sm
+    0.52,   # 63 Eu
+    1.07,   # 64 Gd
+    0.30,   # 65 Tb
+    1.10,   # 66 Dy
+    0.48,   # 67 Ho
+    0.92,   # 68 Er
+    0.10,   # 69 Tm
+    0.84,   # 70 Yb
+    0.10,   # 71 Lu
+    0.85,   # 72 Hf
+    -0.12,  # 73 Ta
+    0.85,   # 74 W
+    0.26,   # 75 Re
+    1.40,   # 76 Os
+    1.38,   # 77 Ir
+    1.62,   # 78 Pt
+    0.92,   # 79 Au
+    1.17,   # 80 Hg
+    0.90,   # 81 Tl
+    1.95,   # 82 Pb
+    0.65,   # 83 Bi
+    0.00,   # 84 Po (no stable isotopes)
+    0.00,   # 85 At (no stable isotopes)
+    0.00,   # 86 Rn (no stable isotopes)
+    0.00,   # 87 Fr (no stable isotopes)
+    0.00,   # 88 Ra (no stable isotopes)
+    0.00,   # 89 Ac (no stable isotopes)
+    0.02,   # 90 Th
+    0.00,   # 91 Pa (no stable isotopes)
+    -0.54   # 92 U
+])
+
+
+def format_abundances(default_metals_H=0.0, default_alpha_H=None, abundances=None,
+                     solar_relative=True, solar_abundances=None, 
+                     alpha_elements=None):
+    """
+    Format abundances as 92-element A(X) array matching Korg.jl format_A_X()
+    
+    Parameters
+    ----------
+    default_metals_H : float, default 0.0
+        Metallicity [metals/H] - log10 solar-relative abundance of elements heavier than He
+    default_alpha_H : float, optional
+        Alpha element enhancement [α/H]. If None, defaults to default_metals_H
+    abundances : dict, optional
+        Individual element abundances. Keys can be atomic numbers (int) or 
+        element symbols (str). Values are [X/H] if solar_relative=True, 
+        or A(X) values if solar_relative=False
+    solar_relative : bool, default True
+        If True, interpret abundances as [X/H] format. If False, as A(X) format
+    solar_abundances : array_like, optional
+        Solar abundance reference. Defaults to Asplund 2020
+    alpha_elements : array_like, optional  
+        List of atomic numbers of alpha elements. Defaults to O, Ne, Mg, Si, S, Ar, Ca, Ti
+        
+    Returns
+    -------
+    jnp.ndarray
+        92-element array of A(X) abundances (log10(N_X/N_H) + 12)
+        
+    Notes
+    -----
+    This function exactly matches Korg.jl's format_A_X() behavior:
+    - Returns 92-element vector with A(H) = 12.0
+    - Supports separate alpha enhancement from overall metallicity
+    - Individual elements override defaults
+    - Handles both atomic numbers and element symbols as keys
+    
+    Examples
+    --------
+    >>> # Basic metallicity scaling
+    >>> A_X = format_abundances(default_metals_H=-0.5)
+    
+    >>> # Alpha-enhanced metal-poor star  
+    >>> A_X = format_abundances(default_metals_H=-1.0, default_alpha_H=-0.5)
+    
+    >>> # Individual element abundances
+    >>> A_X = format_abundances(default_metals_H=-0.3, abundances={'Fe': -0.5, 'C': 0.2})
+    >>> A_X = format_abundances(abundances={26: -0.5, 6: 0.2})  # Same as above
+    """
+    # Set defaults
+    if default_alpha_H is None:
+        default_alpha_H = default_metals_H
+    if abundances is None:
+        abundances = {}
+    if solar_abundances is None:
+        solar_abundances = ASPLUND_2020_SOLAR_ABUNDANCES  
+    if alpha_elements is None:
+        alpha_elements = DEFAULT_ALPHA_ELEMENTS
+        
+    # Initialize with solar abundances
+    A_X = jnp.array(solar_abundances[:92])  # Ensure exactly 92 elements
+    
+    # Apply metallicity scaling to metals (Z > 2)
+    for Z in range(3, 93):  # Li to U
+        if Z-1 < len(solar_abundances):
+            if Z in alpha_elements:
+                # Alpha elements get alpha enhancement
+                A_X = A_X.at[Z-1].set(solar_abundances[Z-1] + default_alpha_H)
+            else:
+                # Other metals get metallicity scaling
+                A_X = A_X.at[Z-1].set(solar_abundances[Z-1] + default_metals_H)
+    
+    # Apply individual element abundances (override defaults)
+    clean_abundances = {}
+    for key, value in abundances.items():
+        if isinstance(key, str):
+            # Convert element symbol to atomic number
+            if key in ELEMENT_TO_Z:
+                Z = ELEMENT_TO_Z[key]
+                clean_abundances[Z] = float(value)
+            else:
+                raise ValueError(f"Unknown element symbol: {key}")
+        elif isinstance(key, int):
+            # Direct atomic number
+            if 1 <= key <= 92:
+                clean_abundances[key] = float(value)  
+            else:
+                raise ValueError(f"Atomic number must be 1-92, got {key}")
+        else:
+            raise ValueError(f"Abundance keys must be int (atomic number) or str (element symbol), got {type(key)}")
+    
+    # Apply individual abundances
+    for Z, abundance_value in clean_abundances.items():
+        if solar_relative:
+            # [X/H] format: add to solar value
+            A_X = A_X.at[Z-1].set(solar_abundances[Z-1] + abundance_value)
+        else:
+            # A(X) format: use directly
+            A_X = A_X.at[Z-1].set(abundance_value)
+    
+    # Ensure A(H) = 12.0 (required by Korg.jl)
+    A_X = A_X.at[0].set(12.0)
+    
+    return A_X
+
+
 def format_A_X() -> Dict[int, float]:
     """
     Format abundances as A(X) values mapped by atomic number for tutorial compatibility.
@@ -139,19 +360,11 @@ def format_A_X() -> Dict[int, float]:
     Dict[int, float]
         Dictionary mapping atomic numbers to A(X) values
     """
-    # Map element symbols to atomic numbers
-    element_to_z = {
-        'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8,
-        'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15,
-        'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22,
-        'V': 23, 'Cr': 24, 'Mn': 25, 'Fe': 26, 'Co': 27, 'Ni': 28, 'Cu': 29, 'Zn': 30
-    }
-    
-    # Convert to atomic number keys
+    # Convert to atomic number keys  
     abundances = {}
     for element, log_abundance in ASPLUND_2009.items():
-        if element in element_to_z:
-            Z = element_to_z[element]
+        if element in ELEMENT_TO_Z:
+            Z = ELEMENT_TO_Z[element]
             abundances[Z] = log_abundance
     
     return abundances

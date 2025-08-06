@@ -163,7 +163,7 @@ def approximate_gammas(wl_cm: float, species: Species, E_lower: float,
     Z = species.charge + 1  # Z is ionization stage, not atomic number
     
     # Skip molecules and highly ionized species
-    if species.is_molecule() or Z > 3:
+    if species.is_molecule or Z > 3:
         return 0.0, 0.0
     
     # Get atomic number from species

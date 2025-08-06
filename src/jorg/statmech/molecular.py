@@ -197,7 +197,7 @@ class OptimizedMolecularEquilibrium:
         self.molecular_atoms_array = jnp.array(self.molecular_atoms)
         self.molecular_charges_array = jnp.array(self.molecular_charges)
         
-        print(f"✅ Preprocessed {len(self.molecules)} molecular species for optimization")
+        # Removed verbose print statement that was called for every layer
     
     def _compile_functions(self):
         """Compile molecular equilibrium functions."""

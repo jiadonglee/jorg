@@ -103,9 +103,8 @@ class MetalBoundFreeData:
         self.logT_grid = jnp.array(self.logT_grid)
         self.nu_grid = jnp.array(self.nu_grid)
         
-        print(f"Loaded metal BF data for {len(self.species_list)} species:")
-        for species in self.species_list:
-            print(f"  {species}")
+        # Only print once when data is first loaded (controlled by global singleton)
+        # Removed per-layer print that was cluttering output
 
 
 # Global data instance (loaded once)
