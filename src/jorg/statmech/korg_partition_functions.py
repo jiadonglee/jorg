@@ -43,21 +43,23 @@ def load_korg_partition_data():
     
     # Load the JSON data
     with open(data_file, 'r') as f:
-        partition_data = json.load(f)
+        all_data = json.load(f)
+    
+    partition_data = all_data['partition_functions']
     
     # Create interpolators for each species
     interpolators = {}
     
     for key, data in partition_data.items():
-        Z = data['atomic_number']
-        charge = data['charge']
+        Z = data['atomic_number'] 
+        charge = data['ionization']
         
         # Create species key
         species = Species.from_atomic_number(Z, charge)
         
         # Create cubic spline interpolator
-        logTs = np.array(data['logTs'])
-        partition_values = np.array(data['partition_values'])
+        logTs = np.array(data['log_T'])
+        partition_values = np.array(data['U'])
         
         # Use extrapolation for temperatures outside the range
         interpolator = CubicSpline(logTs, partition_values, extrapolate=True)
@@ -71,7 +73,6 @@ def load_korg_partition_data():
     
     return interpolators
 
-@jit  
 def korg_partition_function(species: Species, log_T: float) -> float:
     """
     Calculate partition function exactly matching Korg.jl.
@@ -92,21 +93,15 @@ def korg_partition_function(species: Species, log_T: float) -> float:
         Partition function value exactly matching Korg.jl
     """
     
-    # Get the interpolators (this will be JIT-compiled away)
+    # Get the interpolators
     interpolators = load_korg_partition_data()
     
     if species not in interpolators:
         # Fallback for species not in Korg.jl data
         return 1.0
     
-    # Use the interpolator to get exact Korg.jl value
-    interpolator = interpolators[species]
-    
-    # Convert to numpy for scipy interpolation, then back to JAX
-    log_T_np = float(log_T)
-    U_value = interpolator(log_T_np)
-    
-    return jnp.array(U_value, dtype=jnp.float64)
+    # Get partition function from interpolator
+    return float(interpolators[species](log_T))
 
 def create_korg_partition_functions() -> Dict[Species, Callable]:
     """
@@ -118,25 +113,20 @@ def create_korg_partition_functions() -> Dict[Species, Callable]:
         Dictionary mapping Species to partition function callables that
         exactly match Korg.jl's values
     """
-    
     # Load the interpolators
     interpolators = load_korg_partition_data()
     
-    partition_funcs = {}
+    # Create callable dictionary
+    partition_functions = {}
     
     for species, interpolator in interpolators.items():
-        # Create a function that uses the interpolator
-        def make_partition_func(interp):
-            def partition_func(log_T):
-                # Convert JAX array to float for scipy, then back to JAX
-                log_T_val = float(log_T) if hasattr(log_T, 'item') else log_T
-                U_val = interp(log_T_val)
-                return jnp.array(U_val, dtype=jnp.float64)
-            return partition_func
+        # Create a closure that captures the interpolator
+        def make_pf_func(interp):
+            return lambda log_T: float(interp(log_T))
         
-        partition_funcs[species] = make_partition_func(interpolator)
+        partition_functions[species] = make_pf_func(interpolator)
     
-    return partition_funcs
+    return partition_functions
 
 def validate_against_korg_values():
     """

@@ -1,0 +1,7 @@
+# Korg.jl Stellar Type Comparison Summary
+# Generated: 2025-08-07T11:56:23.640
+#
+# Star Type           Teff(K)  logg   [M/H]  SynthTime(s)  MinFlux  MaxAbsorption(%)
+Metal-poor K giant   4500   1.50   -2.5        0.46    1.000            0.0
+Solar-like           5771   4.44    0.0       15.26    1.000            0.0
+Arcturus-like        4250   1.40   -0.5        1.08    1.000            0.0

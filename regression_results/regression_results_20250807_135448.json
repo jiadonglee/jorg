@@ -1,0 +1,137 @@
+{
+  "overall_precision": 1.0,
+  "component_precisions": {
+    "wavelength_grid": 1.0
+  },
+  "production_ready": false,
+  "critical_failures": [
+    "Solar Reference: ERROR - 'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'",
+    "Hot A-type: ERROR - 'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'",
+    "Cool K-dwarf: ERROR - 'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'",
+    "Metal-poor Giant: ERROR - 'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'",
+    "Metal-rich Dwarf: ERROR - 'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'"
+  ],
+  "precision_regressions": [],
+  "test_results": [
+    {
+      "test_name": "Solar Reference",
+      "stellar_params": {
+        "Teff": 5780,
+        "logg": 4.44,
+        "m_H": 0.0
+      },
+      "component_results": {},
+      "overall_precision": 0.0,
+      "runtime": 5.0067901611328125e-06,
+      "status": "ERROR",
+      "error": "'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'"
+    },
+    {
+      "test_name": "Hot A-type",
+      "stellar_params": {
+        "Teff": 8500,
+        "logg": 4.0,
+        "m_H": 0.0
+      },
+      "component_results": {},
+      "overall_precision": 0.0,
+      "runtime": 1.9073486328125e-06,
+      "status": "ERROR",
+      "error": "'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'"
+    },
+    {
+      "test_name": "Cool K-dwarf",
+      "stellar_params": {
+        "Teff": 4500,
+        "logg": 4.5,
+        "m_H": 0.0
+      },
+      "component_results": {},
+      "overall_precision": 0.0,
+      "runtime": 9.5367431640625e-07,
+      "status": "ERROR",
+      "error": "'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'"
+    },
+    {
+      "test_name": "Metal-poor Giant",
+      "stellar_params": {
+        "Teff": 4800,
+        "logg": 2.5,
+        "m_H": -1.5
+      },
+      "component_results": {},
+      "overall_precision": 0.0,
+      "runtime": 1.1920928955078125e-06,
+      "status": "ERROR",
+      "error": "'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'"
+    },
+    {
+      "test_name": "Metal-rich Dwarf",
+      "stellar_params": {
+        "Teff": 5500,
+        "logg": 4.3,
+        "m_H": 0.5
+      },
+      "component_results": {},
+      "overall_precision": 0.0,
+      "runtime": 1.1920928955078125e-06,
+      "status": "ERROR",
+      "error": "'ChemicalEquilibriumValidator' object has no attribute 'validate_chemical_equilibrium_precision'"
+    },
+    {
+      "test_name": "Wavelength Precision",
+      "stellar_params": {
+        "Teff": 5780,
+        "logg": 4.44,
+        "m_H": 0.0
+      },
+      "component_results": {
+        "wavelength_grid": {
+          "precision": 1.0,
+          "details": {
+            "grid_uniformity": 0.9999999996878114,
+            "voigt_sampling": 15.0,
+            "spacing_achieved": 1.3333333333333333
+          }
+        }
+      },
+      "overall_precision": 1.0,
+      "runtime": 0.0011272430419921875,
+      "status": "PASS"
+    }
+  ],
+  "runtime_performance": {
+    "Solar Reference": {
+      "actual": 5.0067901611328125e-06,
+      "expected": 30.0,
+      "efficiency": 5991862.857142857
+    },
+    "Hot A-type": {
+      "actual": 1.9073486328125e-06,
+      "expected": 25.0,
+      "efficiency": 13107200.0
+    },
+    "Cool K-dwarf": {
+      "actual": 9.5367431640625e-07,
+      "expected": 35.0,
+      "efficiency": 36700160.0
+    },
+    "Metal-poor Giant": {
+      "actual": 1.1920928955078125e-06,
+      "expected": 40.0,
+      "efficiency": 33554432.0
+    },
+    "Metal-rich Dwarf": {
+      "actual": 1.1920928955078125e-06,
+      "expected": 35.0,
+      "efficiency": 29360128.0
+    },
+    "Wavelength Precision": {
+      "actual": 0.0011272430419921875,
+      "expected": 5.0,
+      "efficiency": 4435.600676818951
+    }
+  },
+  "timestamp": "20250807_135448",
+  "precision_target": 0.001
+}

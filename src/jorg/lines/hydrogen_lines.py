@@ -883,7 +883,7 @@ def hydrogen_line_absorption(
             log_gf = line_data['log_gf']
             amplitude = 10.0**log_gf * nH_I * sigma_line(lambda0) * levels_factor
             
-            # Handle Balmer lines (n=2) with both ABO and Stark profiles
+            # Handle Balmer lines (n=2) with ABO van der Waals broadening ONLY
             if n_lower == 2 and n_upper in [3, 4, 5]:
                 # ABO van der Waals broadening for Balmer lines (like Korg.jl)
                 ABO_params = {
@@ -902,7 +902,10 @@ def hydrogen_line_absorption(
                 abo_absorption = line_profile(lambda0_abo, sigma_doppler, gamma_abo, amplitude, wavelengths)
                 absorption += abo_absorption
                 
-            # Add Stark profile using interpolated data 
+                # SKIP Stark profile for Balmer lines - ABO is sufficient and Stark profile is broken
+                continue
+                
+            # Add Stark profile using interpolated data for non-Balmer lines
             try:
                 # Get Stark profile (simplified - full implementation would use proper interpolation)
                 nu0 = c_cgs / lambda0

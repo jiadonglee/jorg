@@ -1,5 +1,5 @@
 # Korg.jl synthesize() Result - Atmospheric Structure
-# Generated: 2025-07-31T22:04:11.295
+# Generated: 2025-08-06T22:15:22.413
 # Parameters: Teff=5780 K, logg=4.44, [M/H]=0.0
 #
 # Layer  ElectronDensity(cm⁻³)

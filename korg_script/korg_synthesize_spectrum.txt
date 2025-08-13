@@ -1,7 +1,7 @@
 # Korg.jl synthesize() Result - Spectrum Data
-# Generated: 2025-07-31T22:04:10.757
+# Generated: 2025-08-06T22:15:21.936
 # Parameters: Teff=5780 K, logg=4.44, [M/H]=0.0, vmic=1.0 km/s
-# Synthesis time: 17.18 seconds
+# Synthesis time: 16.67 seconds
 # Linelist: 41821 lines
 #
 # Wavelength(Å)    Flux              Continuum         NormalizedFlux

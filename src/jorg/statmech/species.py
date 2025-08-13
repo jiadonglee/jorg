@@ -25,7 +25,7 @@ ATOMIC_SYMBOLS = [
 ]
 
 MAX_ATOMIC_NUMBER = len(ATOMIC_SYMBOLS)  # 92
-MAX_ATOMS_PER_MOLECULE = 6
+MAX_ATOMS_PER_MOLECULE = 10  # Increased to handle C2H6 and other polyatomics
 
 # Create atomic number lookup
 ATOMIC_NUMBERS = {symbol: i + 1 for i, symbol in enumerate(ATOMIC_SYMBOLS)}

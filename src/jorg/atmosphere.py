@@ -356,16 +356,47 @@ def interpolate_marcs_from_abundances(Teff: float,
     # Extract metallicity parameters from A_X (simplified implementation)
     # Full implementation would need proper abundance analysis
     
+    # Import solar abundances for reference
+    from .lines.atomic_data import get_solar_abundance
+    
     # Calculate [M/H] from iron abundance if available
     if 26 in A_X:  # Iron
-        solar_Fe = 7.50  # Grevesse 2007
+        solar_Fe = get_solar_abundance(26)  # Use consistent solar abundance
         m_H = A_X[26] - solar_Fe
     else:
         m_H = 0.0
     
-    # Simplified alpha and carbon calculation
-    alpha_m = 0.0
-    C_m = 0.0
+    # CRITICAL FIX: Calculate alpha enhancement from alpha elements
+    # Alpha elements: Mg (12), Si (14), Ca (20), Ti (22)
+    alpha_elements = [12, 14, 20, 22]
+    alpha_abundances = []
+    
+    for Z in alpha_elements:
+        if Z in A_X:
+            solar_Z = get_solar_abundance(Z)
+            # Calculate [X/Fe] = [X/H] - [Fe/H] = (A_X - solar_X) - m_H
+            X_Fe = (A_X[Z] - solar_Z) - m_H
+            alpha_abundances.append(X_Fe)
+    
+    # Average alpha enhancement [α/Fe]
+    if alpha_abundances:
+        alpha_m = np.mean(alpha_abundances)
+    else:
+        # Default alpha enhancement for metal-poor stars
+        # Typical trend: [α/Fe] ≈ 0.4 for [Fe/H] < -1.0
+        if m_H < -1.0:
+            alpha_m = 0.4
+        else:
+            alpha_m = 0.0
+    
+    # CRITICAL FIX: Calculate carbon abundance explicitly
+    if 6 in A_X:  # Carbon
+        solar_C = get_solar_abundance(6)
+        # [C/Fe] = [C/H] - [Fe/H]
+        C_m = (A_X[6] - solar_C) - m_H
+    else:
+        # Default carbon abundance relative to iron
+        C_m = 0.0
     
     return interpolate_marcs(Teff, logg, m_H, alpha_m, C_m, **kwargs)
 

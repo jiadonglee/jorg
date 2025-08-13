@@ -37,8 +37,11 @@ ROMAN_NUMERALS = {
 MOLECULE_CODES = {
     'H2': 100001,    # Hydrogen molecule
     'OH': 108001,    # Hydroxyl
+    'HO': 108001,    # Hydroxyl (alternate notation)
     'CH': 106001,    # Carbon hydride
+    'HC': 106001,    # Carbon hydride (alternate notation)
     'NH': 107001,    # Nitrogen hydride
+    'HN': 107001,    # Nitrogen hydride (alternate notation)
     'CN': 106007,    # Cyanogen
     'CO': 106008,    # Carbon monoxide
     'SiO': 114008,   # Silicon monoxide
@@ -131,12 +134,37 @@ def parse_species(species_str: Union[str, float, int]) -> int:
     
     species_str = str(species_str).strip()
     
-    # Try molecular species first
+    # Try molecular species first (exact match)
     if species_str in MOLECULE_CODES:
         return MOLECULE_CODES[species_str]
     
+    # Try VALD format first: "Element N" where N is ionization level
+    # This is the most common format in VALD files
+    match = re.match(r'^([A-Z][a-z]?)\s+(\d+)$', species_str)
+    if match:
+        element_symbol = match.group(1)
+        vald_ion_number = int(match.group(2))
+        
+        # Check if it's a single element
+        if element_symbol in ELEMENT_NAMES:
+            element_id = ELEMENT_NAMES[element_symbol]
+            # VALD convention: 1=neutral, 2=singly ionized, 3=doubly ionized
+            ion_state = vald_ion_number - 1  # Convert to 0-based
+            return element_id * 100 + ion_state
+    
+    # Try molecular species in VALD format: "Molecule N" 
+    match = re.match(r'^([A-Z][a-z]*[A-Z0-9]*[a-z0-9]*)\s+(\d+)$', species_str)
+    if match:
+        formula_part = match.group(1)
+        ion_number = int(match.group(2))
+        
+        # Check if it's a predefined molecule
+        if formula_part in MOLECULE_CODES:
+            # For molecules, return the molecular code regardless of ion_number
+            return MOLECULE_CODES[formula_part]
+    
     # Try element + Roman numeral format (e.g., "Fe I", "Ca II")
-    match = re.match(r'([A-Z][a-z]?)\s+([IVX]+)', species_str)
+    match = re.match(r'^([A-Z][a-z]?)\s+([IVX]+)$', species_str)
     if match:
         element_symbol = match.group(1)
         roman_numeral = match.group(2)
@@ -144,17 +172,6 @@ def parse_species(species_str: Union[str, float, int]) -> int:
         if element_symbol in ELEMENT_NAMES and roman_numeral in ROMAN_NUMERALS:
             element_id = ELEMENT_NAMES[element_symbol]
             ion_state = ROMAN_NUMERALS[roman_numeral]
-            return element_id * 100 + ion_state
-    
-    # Try element + numeric ionization format (e.g., "Na 1", "Ca 2") 
-    match = re.match(r'([A-Z][a-z]?)\s+(\d+)', species_str)
-    if match:
-        element_symbol = match.group(1)
-        ion_number = int(match.group(2))
-        
-        if element_symbol in ELEMENT_NAMES:
-            element_id = ELEMENT_NAMES[element_symbol]
-            ion_state = ion_number - 1  # Convert to 0-based (neutral = 0)
             return element_id * 100 + ion_state
     
     # Try element.ionization format (e.g., "26.00", "26.01")

@@ -21,9 +21,9 @@ def he_minus_ff_absorption(
     """
     Calculate He^- free-free absorption coefficient
     
-    This is a simplified implementation that approximates the
-    Helium negative ion free-free absorption. The contribution
-    is typically small compared to hydrogen sources.
+    This is an exact implementation using John (1994) tabulated values,
+    directly ported from Korg.jl. The contribution is typically small 
+    compared to hydrogen sources but uses proper physics.
     
     Parameters
     ----------
@@ -41,8 +41,8 @@ def he_minus_ff_absorption(
     jnp.ndarray
         He^- free-free absorption coefficient in cm^-1
     """
-    # Simplified implementation - He^- ff is generally much smaller than H^- ff
-    # This would need detailed calculations or fits to be more accurate
+    # Exact implementation using John (1994) tabulated values
+    # Matches Korg.jl's implementation exactly (absorption_He.jl:52-63)
     
     # Ground state He I density (degeneracy = 1, Boltzmann factor = 1)
     n_he_i_ground = 1.0 * n_he_i_div_u

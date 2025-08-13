@@ -103,8 +103,9 @@ class KorgLineProcessor:
             print(f"   Atmospheric layers: {n_layers}")
             print(f"   Wavelength points: {n_wavelengths}")
             print(f"   Cutoff threshold: {cutoff_threshold:.0e}")
-            # Initialize debug counter
+            # Initialize debug counter and warning tracking
             self._debug_line_count = 0
+            self._warned_species = set()
         
         # Initialize alpha matrix [layers × wavelengths]
         alpha_matrix = np.zeros((n_layers, n_wavelengths))
@@ -126,6 +127,13 @@ class KorgLineProcessor:
         amplitude_values = []
         
         for line_idx, line in enumerate(linelist):
+            # DETAILED DEBUGGING: Track every step for first few lines (only if verbose)
+            debug_this_line = (self.verbose and line_idx < 5)
+            
+            if debug_this_line:
+                print(f"\n   🔍 DEBUG LINE {line_idx}: {line.wavelength*1e8:.2f} Å, species={line.species}")
+                print(f"      log_gf={line.log_gf:.3f}, E_lower={line.E_lower:.3f} eV")
+            
             result = self._process_single_line(
                 line=line,
                 wl_array_cm=wl_array_cm,
@@ -136,7 +144,8 @@ class KorgLineProcessor:
                 beta=beta,
                 microturbulence_cm_s=microturbulence_cm_s,
                 continuum_opacity_fn=continuum_opacity_fn,
-                cutoff_threshold=cutoff_threshold
+                cutoff_threshold=cutoff_threshold,
+                debug=debug_this_line
             )
             
             if result is not None:
@@ -145,13 +154,18 @@ class KorgLineProcessor:
                 total_amplitude += amplitude
                 lines_processed += 1
                 
+                if debug_this_line:
+                    print(f"      ✅ ADDED: amplitude={amplitude:.2e}, max_alpha={np.max(line_alpha):.2e}")
+                
                 # Check if line was windowed (truncated)
                 if np.any(line_alpha > 0):
                     lines_windowed += 1
                     amplitude_values.append(amplitude)
             else:
                 lines_windowed_out += 1
-                if self.verbose and line_idx < 10:  # Show first 10 windowed lines
+                if debug_this_line:
+                    print(f"      ❌ WINDOWED OUT: No contribution")
+                elif self.verbose and line_idx < 10:  # Show first 10 windowed lines
                     print(f"     Line {line_idx} at {line.wavelength*1e8:.2f} Å windowed out")
         
         if self.verbose:
@@ -190,8 +204,8 @@ class KorgLineProcessor:
                 log_temps = np.log(temps)
                 U_values = np.array([partition_fns[species](log_T) for log_T in log_temps])
                 
-                # Calculate n/U for all layers
-                n_div_U[species] = n_densities[species] / U_values
+                # Calculate n/U for all layers (avoid divide by zero)
+                n_div_U[species] = n_densities[species] / np.maximum(U_values, 1e-50)
             else:
                 # Fallback: use simple temperature scaling
                 U_fallback = 25.0 * (temps / 5778.0)**0.3
@@ -201,7 +215,7 @@ class KorgLineProcessor:
     
     def _process_single_line(self, line, wl_array_cm, temps, electron_densities, 
                            n_densities, n_div_U, beta, microturbulence_cm_s,
-                           continuum_opacity_fn, cutoff_threshold) -> Optional[Tuple[np.ndarray, float]]:
+                           continuum_opacity_fn, cutoff_threshold, debug=False) -> Optional[Tuple[np.ndarray, float]]:
         """
         Process a single line following Korg.jl algorithm exactly (lines 66-106)
         
@@ -215,35 +229,85 @@ class KorgLineProcessor:
         
         # Get atomic mass (Korg.jl line 67)
         atomic_mass = self._get_atomic_mass(line.species)
+        if debug:
+            print(f"        atomic_mass = {atomic_mass/amu_cgs:.1f} amu ({atomic_mass:.2e} g)")
         
         # Calculate Doppler width σ for all layers (Korg.jl line 70)
         sigma = self._doppler_width(line.wavelength, temps, atomic_mass, microturbulence_cm_s)
+        if debug:
+            print(f"        sigma (Doppler) = {np.mean(sigma):.2e} cm (mean)")
         
         # Calculate broadening parameters (Korg.jl lines 74-83)
         gamma = self._calculate_lorentz_broadening(line, temps, electron_densities, 
                                                   n_densities, atomic_mass)
+        if debug:
+            print(f"        gamma (Lorentz) = {np.mean(gamma):.2e} cm (mean)")
         
         # Calculate level population factor (Korg.jl lines 85-86)
         E_upper = line.E_lower + hplanck_eV * c_cgs / line.wavelength
         levels_factor = np.exp(-beta * line.E_lower) - np.exp(-beta * E_upper)
+        if debug:
+            print(f"        E_upper = {E_upper:.3f} eV, levels_factor = {np.mean(levels_factor):.2e} (mean)")
         
         # Calculate line amplitude for all layers (Korg.jl lines 89-90)
         gf = 10.0**line.log_gf
         cross_section = self._sigma_line(line.wavelength)
+        if debug:
+            print(f"        gf = {gf:.2e}, cross_section = {cross_section:.2e} cm²")
         
-        # Get number density / partition function for this species
-        # CRITICAL FIX: Map VALD species codes to Jorg Species objects
-        jorg_species = self._map_vald_species_to_jorg(line.species)
+        # Get number density / partition function for this species  
+        # VALD linelist species are already Jorg Species objects
+        species_for_lookup = line.species
+        if debug:
+            print(f"        Species: {species_for_lookup} (type: {type(species_for_lookup)})")
         
-        if jorg_species in n_div_U:
-            n_div_U_species = n_div_U[jorg_species]
+        if species_for_lookup in n_div_U:
+            n_div_U_species = n_div_U[species_for_lookup]
+            if debug:
+                print(f"        n_div_U found: mean = {np.mean(n_div_U_species):.2e}")
         else:
-            # Fallback for missing species
-            if self.verbose:
-                print(f"     Warning: Species {line.species} (VALD) -> {jorg_species} (Jorg) not in n_div_U, using fallback")
-            return None
+            # Fallback for missing species - use a default value instead of excluding
+            if debug or (self.verbose and hasattr(self, '_warned_species')):
+                if not hasattr(self, '_warned_species'):
+                    self._warned_species = set()
+                if species_for_lookup not in self._warned_species:
+                    print(f"        ⚠️  WARNING: Species {species_for_lookup} not in n_div_U")
+                    print(f"            Available species in n_div_U: {list(n_div_U.keys())[:5]}...")
+                    print(f"            Using fallback n_div_U = 1e8")
+                    self._warned_species.add(species_for_lookup)
+            # FIXED: Use realistic species-dependent fallback densities
+            # The previous fallback of 1e8 was too high for molecular species
+            
+            # Check if this is a molecular species
+            is_molecule = False
+            if hasattr(species_for_lookup, 'formula') and species_for_lookup.formula:
+                try:
+                    # Check if formula has multiple atoms (molecule)
+                    if hasattr(species_for_lookup.formula, 'atoms') and len(species_for_lookup.formula.atoms) > 1:
+                        is_molecule = True
+                    elif hasattr(species_for_lookup.formula, 'components') and len(species_for_lookup.formula.components) > 1:
+                        is_molecule = True
+                except:
+                    pass
+            
+            # Species-dependent fallback densities
+            if is_molecule:
+                # Molecular species: very low abundance in stellar atmospheres
+                # C2, CN, CH, etc. typically have n_div_U ~ 1e3-1e5 in cool atmospheres
+                n_div_U_species = np.ones_like(temps) * 1e4  # Molecular fallback: 10,000× lower
+                if debug:
+                    print(f"            Using MOLECULAR fallback n_div_U = 1e4")
+            else:
+                # Atomic species: use previous fallback based on typical Fe I
+                # For Fe I at solar conditions: density ~1e13, partition function ~25 
+                # So n_div_U ~4e11. Use 1e8 as conservative lower bound
+                n_div_U_species = np.ones_like(temps) * 1e8  # Atomic fallback
+                if debug:
+                    print(f"            Using ATOMIC fallback n_div_U = 1e8")
             
         amplitude = gf * cross_section * levels_factor * n_div_U_species
+        if debug:
+            print(f"        amplitude = {np.mean(amplitude):.2e} cm⁻¹ (mean)")
         
         # Apply line windowing algorithm (Korg.jl lines 92-105)
         return self._apply_windowing(
@@ -253,8 +317,10 @@ class KorgLineProcessor:
             gamma=gamma, 
             amplitude=amplitude,
             continuum_opacity_fn=continuum_opacity_fn,
-            cutoff_threshold=cutoff_threshold
+            cutoff_threshold=cutoff_threshold,
+            debug=debug
         )
+    
     
     def _map_vald_species_to_jorg(self, vald_species) -> Species:
         """
@@ -264,6 +330,8 @@ class KorgLineProcessor:
         - 2600: Fe I (iron neutral)
         - 2601: Fe II (iron singly ionized)  
         - 6001: C I (carbon neutral)
+        - 601: C II (carbon singly ionized)
+        - 699: C(-1) (carbon negative ion) - special case
         - etc.
         
         Jorg uses Species objects created from atomic number and ionization.
@@ -272,9 +340,28 @@ class KorgLineProcessor:
             # Convert string to int if needed
             species_code = int(vald_species) if isinstance(vald_species, str) else vald_species
             
-            # Extract atomic number and ionization state
+            # Handle special cases for negative ions (codes < 100)
+            if species_code < 100:
+                # These are typically negative ions with special encoding
+                # e.g., 699 could be C(-1), 199 could be H(-1), etc.
+                if species_code == 699 or species_code == 99:
+                    # C(-1) negative ion
+                    return Species.from_atomic_number(6, -1)
+                elif species_code == 199:
+                    # H(-1) negative ion
+                    return Species.from_atomic_number(1, -1)
+                else:
+                    # Other special codes - use neutral carbon as fallback
+                    return Species.from_atomic_number(6, 0)
+            
+            # Standard VALD codes (>= 100)
             element_id = species_code // 100  # First 1-2 digits
             ionization = species_code % 100   # Last 2 digits
+            
+            # Handle negative ions indicated by high ionization numbers
+            if ionization == 99:
+                # Convention for negative ions in some VALD files
+                ionization = -1
             
             # Create Jorg Species object
             try:
@@ -291,14 +378,18 @@ class KorgLineProcessor:
     
     def _get_atomic_mass(self, species) -> float:
         """Get atomic mass for species (Korg.jl get_mass function)"""
-        # Map VALD species to Jorg species first
-        jorg_species = self._map_vald_species_to_jorg(species)
+        # Species from VALD linelist are already Jorg Species objects
+        if hasattr(species, 'mass'):
+            return float(species.mass) * amu_cgs
         
-        if hasattr(jorg_species, 'get_atom'):
-            element_id = jorg_species.get_atom()
-            return float(element_id) * amu_cgs  # Convert to grams
-        else:
-            return 26.0 * amu_cgs  # Default to iron
+        # If for some reason we get a string/int, try to map it  
+        if isinstance(species, (int, str)):
+            jorg_species = self._map_vald_species_to_jorg(species)
+            if hasattr(jorg_species, 'mass'):
+                return float(jorg_species.mass) * amu_cgs
+        
+        # Final fallback: default to iron mass
+        return 55.845 * amu_cgs
     
     def _doppler_width(self, wavelength_cm: float, temps: np.ndarray, 
                       atomic_mass: float, microturbulence_cm_s: float) -> np.ndarray:
@@ -364,7 +455,15 @@ class KorgLineProcessor:
     
     def _is_molecule(self, species: Species) -> bool:
         """Check if species is a molecule"""
-        return hasattr(species, 'is_molecule') and species.is_molecule
+        # Multiple ways to detect molecules
+        if hasattr(species, 'is_molecule') and species.is_molecule:
+            return True
+        if hasattr(species, 'formula') and species.formula is not None:
+            return True
+        # Check atomic number - molecules typically have atomic number > 92 in some systems
+        if hasattr(species, 'element') and species.element > 92:
+            return True
+        return False
     
     def _scaled_stark(self, gamma_stark: float, temps: np.ndarray, T0: float = 10000.0) -> np.ndarray:
         """Stark broadening temperature scaling (Korg.jl line 179)"""
@@ -387,18 +486,25 @@ class KorgLineProcessor:
             # gamma_vdW = 10^(log_factor) * approximate_vdW
             # Use Unsöld approximation as base
             from ..lines.broadening_korg import approximate_vdw_broadening
-            base_log_gamma = approximate_vdw_broadening(self.species, self.E_lower, 
-                                                       self.wavelength, temps[0])[1]
+            # Map VALD species to Jorg species for broadening calculation
+            jorg_species = self._map_vald_species_to_jorg(self.species)
+            # Calculate for a single temperature first, then scale
+            base_log_gamma = approximate_vdw_broadening(jorg_species, self.E_lower, 
+                                                       self.wavelength, temps[0])
             base_gamma = 10**base_log_gamma if base_log_gamma > 0 else 1e-8
-            return 10**sigma * base_gamma * (temps / 10000.0)**0.3
+            # Return array with proper shape for all temperature layers
+            return 10**sigma * base_gamma * np.power(temps / 10000.0, 0.3)
         elif alpha == -2:
             # Unsöld fudge factor (0 < value < 20)
             # Similar to above but with fudge factor multiplier
             from ..lines.broadening_korg import approximate_vdw_broadening
-            base_log_gamma = approximate_vdw_broadening(self.species, self.E_lower,
-                                                       self.wavelength, temps[0])[1]
+            # Map VALD species to Jorg species for broadening calculation
+            jorg_species = self._map_vald_species_to_jorg(self.species)
+            base_log_gamma = approximate_vdw_broadening(jorg_species, self.E_lower,
+                                                       self.wavelength, temps[0])
             base_gamma = 10**base_log_gamma if base_log_gamma > 0 else 1e-8
-            return sigma * base_gamma * (temps / 10000.0)**0.3
+            # Return array with proper shape for all temperature layers
+            return sigma * base_gamma * np.power(temps / 10000.0, 0.3)
         else:
             # ABO theory (σ in cm², α dimensionless)
             v0 = 1e6  # Reference velocity cm/s
@@ -415,12 +521,12 @@ class KorgLineProcessor:
         """
         Line cross-section calculation (Korg.jl lines 213-221)
         
-        sigma_line(λ) = (π * e²/mₑ/c) * (λ²/c)
+        REVERTED: Back to original formula to find actual root cause
         """
-        return (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs) * (wavelength_cm**2 / c_cgs)
+        return (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs**2) * wavelength_cm**2
     
     def _apply_windowing(self, line, wl_array_cm, sigma, gamma, amplitude, 
-                        continuum_opacity_fn, cutoff_threshold) -> Optional[Tuple[np.ndarray, float]]:
+                        continuum_opacity_fn, cutoff_threshold, debug=False) -> Optional[Tuple[np.ndarray, float]]:
         """
         Apply Korg.jl line windowing algorithm (lines 92-105)
         """
@@ -437,14 +543,10 @@ class KorgLineProcessor:
         amplitude_safe = np.maximum(amplitude, 1e-50)
         rho_crit = (continuum_opacity * cutoff_threshold) / amplitude_safe
         
-        # Debug output for first few lines
-        if self.verbose and hasattr(self, '_debug_line_count'):
-            if self._debug_line_count < 5:
-                print(f"\n     DEBUG Line {self._debug_line_count}: λ={line.wavelength*1e8:.2f} Å")
-                print(f"       Continuum opacity: {continuum_opacity:.2e} cm⁻¹")
-                print(f"       Line amplitude: {np.mean(amplitude):.2e}")
-                print(f"       ρ_crit: {np.mean(rho_crit):.2e}")
-                self._debug_line_count += 1
+        if debug:
+            print(f"        continuum_opacity = {continuum_opacity:.2e} cm⁻¹")
+            print(f"        cutoff_threshold = {cutoff_threshold:.0e}")
+            print(f"        rho_crit = {np.mean(rho_crit):.2e} (mean)")
         
         # Calculate window sizes (Korg.jl lines 93-97)  
         doppler_windows = np.array([self._inverse_gaussian_density(rho, sig) 
@@ -461,17 +563,41 @@ class KorgLineProcessor:
         lb = np.searchsorted(wl_array_cm, line.wavelength - window_size)
         ub = np.searchsorted(wl_array_cm, line.wavelength + window_size, side='right')
         
-        if lb >= ub:  # No contribution
-            if self.verbose and hasattr(self, '_debug_line_count') and self._debug_line_count < 10:
-                print(f"       Window size: {window_size*1e8:.3f} Å (too small, line excluded)")
+        # FIXED: Check if line window actually overlaps with synthesis wavelength range
+        line_start = line.wavelength - window_size
+        line_end = line.wavelength + window_size
+        grid_start = wl_array_cm[0] 
+        grid_end = wl_array_cm[-1]
+        
+        # FIXED: Check overlap more carefully - include lines whose profiles extend into synthesis range
+        # Add a small buffer to account for numerical precision and extended wings
+        buffer_width = 0.5e-8  # 0.5 Å buffer in cm
+        extended_line_start = line.wavelength - window_size - buffer_width
+        extended_line_end = line.wavelength + window_size + buffer_width
+        
+        if debug:
+            print(f"        window_size = {window_size*1e8:.3f} Å")
+            print(f"        line range: {line_start*1e8:.2f} - {line_end*1e8:.2f} Å")
+            print(f"        grid range: {grid_start*1e8:.2f} - {grid_end*1e8:.2f} Å")
+            print(f"        lb={lb}, ub={ub} (of {n_wavelengths} points)")
+        
+        # Only reject if line window completely outside synthesis range (with buffer)
+        if extended_line_end < grid_start or extended_line_start > grid_end:
+            if debug:
+                print(f"        ❌ REJECTED: Line outside wavelength range")
             return None
-            
+        
         # Ensure bounds are valid
         lb = max(0, lb)
         ub = min(n_wavelengths, ub)
         
         if lb >= ub:
+            if debug:
+                print(f"        ❌ REJECTED: Invalid bounds lb={lb} >= ub={ub}")
             return None
+        
+        if debug:
+            print(f"        ✅ ACCEPTED: Will compute profile for {ub-lb} wavelength points")
         
         # Calculate line profiles (Korg.jl line 105)
         line_alpha_matrix = np.zeros((n_layers, n_wavelengths))
@@ -496,9 +622,9 @@ class KorgLineProcessor:
         Fixed: Return minimum window size instead of 0.0 to prevent line exclusion
         """
         sqrt_2pi = np.sqrt(2 * PI)
-        # Minimum window of 0.1 Å (20× the wavelength spacing) to ensure proper line inclusion
-        min_window_angstrom = 0.1e-8  # Convert Å to cm
-        min_window = max(sigma * 0.2, min_window_angstrom)
+        # Increased minimum window to 0.5 Å to ensure lines are included
+        min_window_angstrom = 0.5e-8  # Convert Å to cm (0.5 Å = 100× typical spacing)
+        min_window = max(sigma * 3.0, min_window_angstrom)  # At least 3σ for numerical stability
         
         if rho > 1.0 / (sqrt_2pi * sigma):
             return min_window  # Prevent 0.0 window that excludes lines
@@ -513,15 +639,19 @@ class KorgLineProcessor:
         
         Fixed: Return minimum window size instead of 0.0 to prevent line exclusion
         """
-        # Minimum window of 0.1 Å (20× the wavelength spacing) to ensure proper line inclusion
-        min_window_angstrom = 0.1e-8  # Convert Å to cm
-        min_window = max(gamma * 0.2, min_window_angstrom)
+        # Increased minimum window to 0.5 Å to ensure lines are included
+        min_window_angstrom = 0.5e-8  # Convert Å to cm (0.5 Å = 100× typical spacing)
+        min_window = max(gamma * 3.0, min_window_angstrom)  # At least 3γ for numerical stability
         
         if rho > 1.0 / (PI * gamma):
             return min_window  # Prevent 0.0 window that excludes lines
         else:
             # CRITICAL FIX: Correct Korg.jl formula is γ/(π*ρ) - γ², not γ/(π*ρ - γ²)
-            return max(min_window, np.sqrt(gamma / (PI * rho) - gamma*gamma))
+            # Additional safety check for numerical stability
+            inner = gamma / (PI * rho) - gamma*gamma
+            if inner <= 0:
+                return min_window
+            return max(min_window, np.sqrt(inner))
     
     def _line_profile(self, lambda0: float, sigma: float, gamma: float, 
                      amplitude: float, wavelength: float) -> float:

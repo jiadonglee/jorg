@@ -1,5 +1,5 @@
 # Korg.jl synthesize() Result - Radiative Transfer Data
-# Generated: 2025-07-31T22:04:12.287
+# Generated: 2025-08-06T22:15:23.368
 # Intensity array shape: (1, 20001)
 #
 # μ grid (values and weights):

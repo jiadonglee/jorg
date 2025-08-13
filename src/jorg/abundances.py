@@ -146,11 +146,12 @@ ELEMENT_TO_Z = {
     'Fr': 87, 'Ra': 88, 'Ac': 89, 'Th': 90, 'Pa': 91, 'U': 92
 }
 
-# Asplund et al. 2020 solar abundances (extended)
+# Asplund et al. 2020 solar abundances - EXACT MATCH to Korg.jl atomic_data.jl
+# Source: /Users/jdli/Project/Korg.jl/src/atomic_data.jl lines 42-52
 ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
     12.00,  # 1 H
     10.91,  # 2 He  
-    1.05,   # 3 Li
+    0.96,   # 3 Li    ← CORRECTED: was 1.05, now matches Korg.jl
     1.38,   # 4 Be
     2.70,   # 5 B
     8.46,   # 6 C
@@ -158,87 +159,87 @@ ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
     8.69,   # 8 O
     4.40,   # 9 F
     8.06,   # 10 Ne
-    6.24,   # 11 Na
-    7.60,   # 12 Mg
-    6.45,   # 13 Al
+    6.22,   # 11 Na   ← CORRECTED: was 6.24, now matches Korg.jl
+    7.55,   # 12 Mg   ← CORRECTED: was 7.60, now matches Korg.jl
+    6.43,   # 13 Al   ← CORRECTED: was 6.45, now matches Korg.jl
     7.51,   # 14 Si
     5.41,   # 15 P
     7.12,   # 16 S
-    5.50,   # 17 Cl
-    6.40,   # 18 Ar
-    5.03,   # 19 K
-    6.34,   # 20 Ca
-    3.15,   # 21 Sc
-    4.95,   # 22 Ti
-    3.93,   # 23 V
-    5.64,   # 24 Cr
-    5.43,   # 25 Mn
-    7.50,   # 26 Fe
-    4.99,   # 27 Co
-    6.22,   # 28 Ni
-    4.19,   # 29 Cu
+    5.31,   # 17 Cl   ← CORRECTED: was 5.50, now matches Korg.jl
+    6.38,   # 18 Ar   ← CORRECTED: was 6.40, now matches Korg.jl
+    5.07,   # 19 K    ← CORRECTED: was 5.03, now matches Korg.jl
+    6.30,   # 20 Ca   ← CORRECTED: was 6.34, now matches Korg.jl
+    3.14,   # 21 Sc   ← CORRECTED: was 3.15, now matches Korg.jl
+    4.97,   # 22 Ti   ← CORRECTED: was 4.95, now matches Korg.jl
+    3.90,   # 23 V    ← CORRECTED: was 3.93, now matches Korg.jl
+    5.62,   # 24 Cr   ← CORRECTED: was 5.64, now matches Korg.jl
+    5.42,   # 25 Mn   ← CORRECTED: was 5.43, now matches Korg.jl
+    7.46,   # 26 Fe   ← CORRECTED: was 7.50, now matches Korg.jl
+    4.94,   # 27 Co   ← CORRECTED: was 4.99, now matches Korg.jl
+    6.20,   # 28 Ni   ← CORRECTED: was 6.22, now matches Korg.jl
+    4.18,   # 29 Cu   ← CORRECTED: was 4.19, now matches Korg.jl
     4.56,   # 30 Zn
-    3.04,   # 31 Ga
-    3.65,   # 32 Ge
+    3.02,   # 31 Ga   ← CORRECTED: was 3.04, now matches Korg.jl
+    3.62,   # 32 Ge   ← CORRECTED: was 3.65, now matches Korg.jl
     2.30,   # 33 As
     3.34,   # 34 Se
     2.54,   # 35 Br
-    3.25,   # 36 Kr
-    2.52,   # 37 Rb
-    2.87,   # 38 Sr
+    3.12,   # 36 Kr   ← CORRECTED: was 3.25, now matches Korg.jl
+    2.32,   # 37 Rb   ← CORRECTED: was 2.52, now matches Korg.jl
+    2.83,   # 38 Sr   ← CORRECTED: was 2.87, now matches Korg.jl
     2.21,   # 39 Y
-    2.58,   # 40 Zr
-    1.46,   # 41 Nb
+    2.59,   # 40 Zr   ← CORRECTED: was 2.58, now matches Korg.jl
+    1.47,   # 41 Nb   ← CORRECTED: was 1.46, now matches Korg.jl
     1.88,   # 42 Mo
-    0.00,   # 43 Tc (no stable isotopes)
+    -5.00,  # 43 Tc   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
     1.75,   # 44 Ru
-    0.91,   # 45 Rh
+    0.78,   # 45 Rh   ← CORRECTED: was 0.91, now matches Korg.jl
     1.57,   # 46 Pd
     0.96,   # 47 Ag
     1.71,   # 48 Cd
     0.80,   # 49 In
-    2.04,   # 50 Sn
+    2.02,   # 50 Sn   ← CORRECTED: was 2.04, now matches Korg.jl
     1.01,   # 51 Sb
     2.18,   # 52 Te
     1.55,   # 53 I
-    2.24,   # 54 Xe
+    2.22,   # 54 Xe   ← CORRECTED: was 2.24, now matches Korg.jl
     1.08,   # 55 Cs
-    2.18,   # 56 Ba
-    1.10,   # 57 La
+    2.27,   # 56 Ba   ← CORRECTED: was 2.18, now matches Korg.jl
+    1.11,   # 57 La   ← CORRECTED: was 1.10, now matches Korg.jl
     1.58,   # 58 Ce
-    0.72,   # 59 Pr
+    0.75,   # 59 Pr   ← CORRECTED: was 0.72, now matches Korg.jl
     1.42,   # 60 Nd
-    0.00,   # 61 Pm (no stable isotopes)
-    0.96,   # 62 Sm
+    -5.00,  # 61 Pm   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    0.95,   # 62 Sm   ← CORRECTED: was 0.96, now matches Korg.jl
     0.52,   # 63 Eu
-    1.07,   # 64 Gd
-    0.30,   # 65 Tb
+    1.08,   # 64 Gd   ← CORRECTED: was 1.07, now matches Korg.jl
+    0.31,   # 65 Tb   ← CORRECTED: was 0.30, now matches Korg.jl
     1.10,   # 66 Dy
     0.48,   # 67 Ho
-    0.92,   # 68 Er
-    0.10,   # 69 Tm
-    0.84,   # 70 Yb
+    0.93,   # 68 Er   ← CORRECTED: was 0.92, now matches Korg.jl
+    0.11,   # 69 Tm   ← CORRECTED: was 0.10, now matches Korg.jl
+    0.85,   # 70 Yb   ← CORRECTED: was 0.84, now matches Korg.jl
     0.10,   # 71 Lu
     0.85,   # 72 Hf
-    -0.12,  # 73 Ta
-    0.85,   # 74 W
+    -0.15,  # 73 Ta   ← CORRECTED: was -0.12, now matches Korg.jl
+    0.79,   # 74 W    ← CORRECTED: was 0.85, now matches Korg.jl
     0.26,   # 75 Re
-    1.40,   # 76 Os
-    1.38,   # 77 Ir
-    1.62,   # 78 Pt
-    0.92,   # 79 Au
+    1.35,   # 76 Os   ← CORRECTED: was 1.40, now matches Korg.jl
+    1.32,   # 77 Ir   ← CORRECTED: was 1.38, now matches Korg.jl
+    1.61,   # 78 Pt   ← CORRECTED: was 1.62, now matches Korg.jl
+    0.91,   # 79 Au   ← CORRECTED: was 0.92, now matches Korg.jl
     1.17,   # 80 Hg
-    0.90,   # 81 Tl
+    0.92,   # 81 Tl   ← CORRECTED: was 0.90, now matches Korg.jl
     1.95,   # 82 Pb
     0.65,   # 83 Bi
-    0.00,   # 84 Po (no stable isotopes)
-    0.00,   # 85 At (no stable isotopes)
-    0.00,   # 86 Rn (no stable isotopes)
-    0.00,   # 87 Fr (no stable isotopes)
-    0.00,   # 88 Ra (no stable isotopes)
-    0.00,   # 89 Ac (no stable isotopes)
-    0.02,   # 90 Th
-    0.00,   # 91 Pa (no stable isotopes)
+    -5.00,  # 84 Po   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    -5.00,  # 85 At   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    -5.00,  # 86 Rn   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    -5.00,  # 87 Fr   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    -5.00,  # 88 Ra   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    -5.00,  # 89 Ac   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
+    0.03,   # 90 Th   ← CORRECTED: was 0.02, now matches Korg.jl
+    -5.00,  # 91 Pa   ← CORRECTED: was 0.00, now matches Korg.jl (-5.00 for no stable isotopes)
     -0.54   # 92 U
 ])
 
