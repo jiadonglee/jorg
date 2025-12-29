@@ -35,25 +35,34 @@ from .fast_kernels import (
 # Optimized molecular equilibrium with JIT and vectorization
 from .molecular import (
     create_optimized_molecular_equilibrium,
-    create_default_log_equilibrium_constants_optimized as create_default_log_equilibrium_constants,
     get_log_nK_optimized as get_log_nK,
     OptimizedMolecularEquilibrium,
     molecular_equilibrium_batch,
     benchmark_molecular_performance
 )
 
+# Korg-compatible molecular constants and partition functions
+from .korg_equilibrium_constants import (
+    create_default_partition_functions_korg as create_default_partition_functions,
+    create_default_log_equilibrium_constants_korg as create_default_log_equilibrium_constants
+)
+
 # Saha equation and ionization (exact Korg.jl implementation)
-from .saha_equation import (
+from .saha_equation_fast import (
     saha_ion_weights_fast as saha_ion_weights,
     translational_U_fast as translational_U,
-    create_default_ionization_energies,
     KORG_KBOLTZ_EV,
     KORG_ELECTRON_MASS_CGS
 )
 
-# Partition functions
-from .partition_functions import (
-    create_default_partition_functions_fast as create_default_partition_functions,
+# Proper ionization energies (Barklem & Collet 2016)
+from .proper_ionization_energies import (
+    create_proper_ionization_energy_dict as create_default_ionization_energies,
+    get_proper_ionization_energies
+)
+
+# Partition functions (atomic approximations still available)
+from .partition_functions_fast import (
     hydrogen_partition_function_fast as hydrogen_partition_function,
     simple_atom_partition_function_fast as simple_partition_function,
     simple_atom_partition_function_fast as atomic_partition_function,
@@ -77,8 +86,13 @@ from .working_optimizations import (
     benchmark_working_optimizations
 )
 
-# Set the optimized version as the default chemical_equilibrium API
-chemical_equilibrium = chemical_equilibrium_working_optimized
+# Korg-compatible full solver (SciPy-based); fallback to optimized if unavailable
+try:
+    from .korg_chemical_equilibrium import chemical_equilibrium as chemical_equilibrium_korg
+except Exception:
+    chemical_equilibrium_korg = None
+
+chemical_equilibrium = chemical_equilibrium_korg or chemical_equilibrium_working_optimized
 
 __all__ = [
     # Core functions

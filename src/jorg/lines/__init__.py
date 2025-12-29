@@ -11,7 +11,6 @@ Key Features:
 - Complete pressure ionization physics
 """
 
-from .core import line_absorption, LineData, create_line_data
 from .profiles import (
     line_profile,
     voigt_hjerting,
@@ -111,9 +110,8 @@ except ImportError:
     _hydrogen_available = False
 
 __all__ = [
-    # Core line absorption
-    "line_absorption",
-    "LineData", 
+    # Line data helpers
+    "LineData",
     "create_line_data",
     
     # Line profiles and physics

@@ -30,7 +30,9 @@ from functools import partial
 from .mclaughlin_hminus import mclaughlin_hminus_bf_absorption
 from .metals_bf import metal_bf_absorption
 from .nahar_h_i_bf import nahar_h_i_bf_absorption_single_level
-from .hydrogen import h_minus_ff_absorption
+from .hydrogen import h_minus_ff_absorption, h2_plus_bf_ff_absorption
+from .helium import he_minus_ff_absorption
+from .positive_ion_ff import positive_ion_ff_absorption
 from .scattering import thomson_scattering, rayleigh_scattering
 
 # Physical constants (exactly matching Korg.jl)
@@ -165,7 +167,7 @@ def total_continuum_absorption_exact_physics_only(
         If exact physics components fail (no fallbacks provided)
     """
     from ..statmech.species import Species
-    from ..statmech.partition_functions import create_default_partition_functions
+    from ..statmech import create_default_partition_functions
     
     if verbose:
         print(f"EXACT PHYSICS CONTINUUM: T={temperature:.1f}K, n_e={electron_density:.2e}")
@@ -189,6 +191,8 @@ def total_continuum_absorption_exact_physics_only(
     U_H_I = partition_funcs[h_i_species](jnp.log(temperature))
     inv_u_h = 1.0 / U_H_I
     n_h_i_div_u = n_h_i / U_H_I
+    U_He_I = partition_funcs[he_i_species](jnp.log(temperature))
+    n_he_i_div_u = n_he_i / U_He_I
     
     if verbose:
         print(f"Species densities: H I={n_h_i:.2e}, H II={n_h_ii:.2e}, He I={n_he_i:.2e}")
@@ -208,9 +212,10 @@ def total_continuum_absorption_exact_physics_only(
         include_stimulated_emission=True
     )
     alpha_total += alpha_h_minus_bf
-    
+
     if verbose:
-        print(f"   Peak: {jnp.max(alpha_h_minus_bf):.3e} cm⁻¹")
+        print(f"   H⁻ bf Peak: {jnp.max(alpha_h_minus_bf):.3e} cm⁻¹")
+        print(f"   H⁻ bf Mean: {jnp.mean(alpha_h_minus_bf):.3e} cm⁻¹")
     
     # 2. Bell & Berrington 1987 H⁻ free-free (EXACT)
     if verbose:
@@ -223,13 +228,59 @@ def total_continuum_absorption_exact_physics_only(
         electron_density=electron_density
     )
     alpha_total += alpha_h_minus_ff
-    
+
     if verbose:
-        print(f"   Peak: {jnp.max(alpha_h_minus_ff):.3e} cm⁻¹")
+        print(f"   H⁻ ff Peak: {jnp.max(alpha_h_minus_ff):.3e} cm⁻¹")
+        print(f"   H⁻ ff Mean: {jnp.mean(alpha_h_minus_ff):.3e} cm⁻¹")
     
-    # 3. TOPBase/NORAD metal bound-free (EXACT)
+    # 3. Stancil 1994 H2+ bound-free and free-free (EXACT)
     if verbose:
-        print("3. Adding TOPBase/NORAD metal bound-free...")
+        print("3. Adding Stancil 1994 H2+ bf+ff...")
+
+    alpha_h2plus = h2_plus_bf_ff_absorption(
+        frequencies=frequencies,
+        temperature=temperature,
+        n_h_i=n_h_i,
+        n_h_ii=n_h_ii
+    )
+    alpha_total += alpha_h2plus
+
+    if verbose:
+        print(f"   H2+ Peak: {jnp.max(alpha_h2plus):.3e} cm⁻¹")
+
+    # 4. He- free-free (EXACT)
+    if verbose:
+        print("4. Adding He- free-free...")
+
+    alpha_he_minus_ff = jnp.asarray(he_minus_ff_absorption(
+        frequencies=frequencies,
+        temperature=temperature,
+        n_he_i_div_u=n_he_i_div_u,
+        electron_density=electron_density
+    ))
+    alpha_total += alpha_he_minus_ff
+
+    if verbose:
+        print(f"   He- ff Peak: {jnp.max(alpha_he_minus_ff):.3e} cm⁻¹")
+
+    # 5. Positive ion free-free (EXACT)
+    if verbose:
+        print("5. Adding positive ion free-free...")
+
+    alpha_pos_ion_ff = jnp.asarray(positive_ion_ff_absorption(
+        frequencies=frequencies,
+        temperature=temperature,
+        number_densities=number_densities,
+        electron_density=electron_density
+    ))
+    alpha_total += alpha_pos_ion_ff
+
+    if verbose:
+        print(f"   Positive ion ff Peak: {jnp.max(alpha_pos_ion_ff):.3e} cm⁻¹")
+
+    # 6. TOPBase/NORAD metal bound-free (EXACT)
+    if verbose:
+        print("6. Adding TOPBase/NORAD metal bound-free...")
     
     alpha_metal_bf = metal_bf_absorption(
         frequencies=frequencies,
@@ -238,14 +289,15 @@ def total_continuum_absorption_exact_physics_only(
         species_list=None  # Use all available species
     )
     alpha_total += alpha_metal_bf
-    
+
     if verbose:
-        print(f"   Peak: {jnp.max(alpha_metal_bf):.3e} cm⁻¹")
+        print(f"   Metal bf Peak: {jnp.max(alpha_metal_bf):.3e} cm⁻¹")
+        print(f"   Metal bf Mean: {jnp.mean(alpha_metal_bf):.3e} cm⁻¹")
     
-    # 4. Nahar 2021 H I bound-free (EXACT)
+    # 7. Nahar 2021 H I bound-free (EXACT)
     if include_nahar_h_i:
         if verbose:
-            print(f"4. Adding Nahar 2021 H I bound-free (n=1-{n_levels_max})...")
+            print(f"7. Adding Nahar 2021 H I bound-free (n=1-{n_levels_max})...")
         
         alpha_h_i_bf_total = jnp.zeros_like(frequencies, dtype=jnp.float64)
         
@@ -268,13 +320,14 @@ def total_continuum_absorption_exact_physics_only(
                 print(f"     n={n_level}: {jnp.max(alpha_h_i_n):.3e} cm⁻¹")
         
         alpha_total += alpha_h_i_bf_total
-        
+
         if verbose:
-            print(f"   Total H I bf: {jnp.max(alpha_h_i_bf_total):.3e} cm⁻¹")
+            print(f"   H I bf Total Peak: {jnp.max(alpha_h_i_bf_total):.3e} cm⁻¹")
+            print(f"   H I bf Total Mean: {jnp.mean(alpha_h_i_bf_total):.3e} cm⁻¹")
     
-    # 5. He I bound-free (EXACT)
+    # 8. He I bound-free (EXACT)
     if verbose:
-        print("5. Adding exact He I bound-free...")
+        print("8. Adding exact He I bound-free...")
     
     alpha_he_i_bf = jax.vmap(
         partial(he_i_bf_exact, temperature=temperature, n_he_i=n_he_i)
@@ -284,21 +337,9 @@ def total_continuum_absorption_exact_physics_only(
     if verbose:
         print(f"   Peak: {jnp.max(alpha_he_i_bf):.3e} cm⁻¹")
     
-    # 6. H II free-free (EXACT)
+    # 9. Thomson scattering (EXACT)
     if verbose:
-        print("6. Adding exact H II free-free...")
-    
-    alpha_h_ii_ff = jax.vmap(
-        partial(h_ii_ff_exact, temperature=temperature, n_h_ii=n_h_ii, n_e=electron_density)
-    )(frequencies)
-    alpha_total += alpha_h_ii_ff
-    
-    if verbose:
-        print(f"   Peak: {jnp.max(alpha_h_ii_ff):.3e} cm⁻¹")
-    
-    # 7. Thomson scattering (EXACT)
-    if verbose:
-        print("7. Adding exact Thomson scattering...")
+        print("9. Adding exact Thomson scattering...")
     
     alpha_thomson = thomson_scattering(electron_density)
     alpha_total += alpha_thomson
@@ -306,17 +347,23 @@ def total_continuum_absorption_exact_physics_only(
     if verbose:
         print(f"   Constant: {alpha_thomson:.3e} cm⁻¹")
     
-    # 8. Rayleigh scattering (EXACT)
+    # 10. Rayleigh scattering (EXACT)
     if verbose:
-        print("8. Adding exact Rayleigh scattering...")
+        print("10. Adding exact Rayleigh scattering...")
     
     alpha_rayleigh = rayleigh_scattering(frequencies, n_h_i, n_he_i, 0.0)  # No H2 for now
     alpha_total += alpha_rayleigh
     
     if verbose:
-        print(f"   Peak: {jnp.max(alpha_rayleigh):.3e} cm⁻¹")
-        print(f"TOTAL PEAK: {jnp.max(alpha_total):.3e} cm⁻¹")
-    
+        print(f"   Rayleigh Peak: {jnp.max(alpha_rayleigh):.3e} cm⁻¹")
+        print(f"")
+        print(f"=" * 60)
+        print(f"CONTINUUM OPACITY SUMMARY:")
+        print(f"  Total Peak: {jnp.max(alpha_total):.3e} cm⁻¹")
+        print(f"  Total Mean: {jnp.mean(alpha_total):.3e} cm⁻¹")
+        print(f"  Total Min:  {jnp.min(alpha_total):.3e} cm⁻¹")
+        print(f"=" * 60)
+
     return alpha_total
 
 

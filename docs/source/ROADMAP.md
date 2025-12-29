@@ -4,6 +4,8 @@
 
 **Jorg** is the JAX-based translation of Korg.jl, designed to provide identical scientific accuracy while achieving 10-50x performance improvements through GPU acceleration and automatic differentiation. This roadmap defines the complete API structure and implementation plan based on comprehensive analysis of Korg.jl's architecture.
 
+NOTE: Legacy `line_absorption` helpers referenced in this roadmap have been superseded by KorgLineProcessor (`jorg/opacity/korg_line_processor.py`).
+
 ## Current Implementation Status
 
 ### ✅ Completed Components
@@ -630,7 +632,7 @@ def uncertainty_propagation(
 
 4. **Weeks 7-8**: Line absorption physics
    - Voigt profiles and broadening mechanisms
-   - `line_absorption()` function with proper windowing
+   - KorgLineProcessor windowing integration
    - Hydrogen line special treatment
 
 ### Phase 2: Integration (Weeks 9-14)

@@ -20,8 +20,6 @@ Outside the regime in which Peach 1970 provides data, the interpolators return 0
 the hydrogenic approximation.
 """
 
-import jax.numpy as jnp
-from jax import jit
 from scipy.interpolate import RegularGridInterpolator
 import numpy as np
 from typing import Dict, Optional
@@ -60,12 +58,20 @@ class Peach1970Interpolator:
         Returns:
             Departure coefficient (unitless)
         """
-        # Ensure inputs are within reasonable bounds
-        T = jnp.clip(T, self.T_vals.min(), self.T_vals.max())
-        sigma = jnp.clip(sigma, self.sigma_vals.min(), self.sigma_vals.max())
-        
-        # Use scipy interpolator (will be converted to JAX-compatible form)
-        return self.interpolator(jnp.array([T, sigma]))[0]
+        T_arr = np.asarray(T, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
+
+        T_arr, sigma_arr = np.broadcast_arrays(T_arr, sigma_arr)
+        T_arr = np.clip(T_arr, self.T_vals.min(), self.T_vals.max())
+        sigma_arr = np.clip(sigma_arr, self.sigma_vals.min(), self.sigma_vals.max())
+
+        points = np.column_stack([T_arr.ravel(), sigma_arr.ravel()])
+        values = self.interpolator(points)
+        values = values.reshape(T_arr.shape)
+
+        if values.size == 1:
+            return float(values.ravel()[0])
+        return values
 
 
 def _create_he_ii_interpolator() -> Peach1970Interpolator:

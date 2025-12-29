@@ -11,9 +11,9 @@ PRODUCTION STATUS (December 2024):
 - Ready for production stellar synthesis
 """
 
-from .core import total_continuum_absorption
 from .exact_physics_continuum import (
     total_continuum_absorption_exact_physics_only,
+    total_continuum_absorption_exact_physics_only as total_continuum_absorption,  # Alias for backward compatibility
     validate_korg_compatibility
 )
 from .hydrogen import (
@@ -25,6 +25,7 @@ from .hydrogen import (
 from .helium import he_minus_ff_absorption
 from .scattering import thomson_scattering, rayleigh_scattering
 from .metals_bf import metal_bf_absorption
+from .positive_ion_ff import positive_ion_ff_absorption
 from .utils import frequency_to_wavelength, wavelength_to_frequency
 from .h_i_bf_api import H_I_bf, H_I_bf_fast, H_I_bf_stellar
 
@@ -38,6 +39,7 @@ __all__ = [
     "h2_plus_bf_ff_absorption",
     "he_minus_ff_absorption",
     "metal_bf_absorption",
+    "positive_ion_ff_absorption",
     "thomson_scattering",
     "rayleigh_scattering",
     "frequency_to_wavelength",

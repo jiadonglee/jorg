@@ -441,16 +441,29 @@ def compute_F_flux_only_expint(tau: np.ndarray, source: np.ndarray) -> float:
     - Sum contributions from all layers
     """
     flux = 0.0
-    
+
     for i in range(len(tau) - 1):
+        # Check for zero or negative tau difference (numerical stability fix)
+        tau_diff = tau[i+1] - tau[i]
+        if abs(tau_diff) < 1e-15:  # Effectively zero
+            # Skip layer pairs with identical tau (optically thin limit)
+            # This can happen in continuum-only synthesis with uniform opacity
+            # Use source function directly for zero tau difference
+            # flux contribution is zero in this case anyway
+            continue
+        elif tau_diff < 0:
+            # Sanity check - tau should be monotonically increasing
+            # This should not happen, but handle gracefully
+            continue
+
         # Linear interpolation parameters (Korg.jl lines 382-383)
-        m = (source[i+1] - source[i]) / (tau[i+1] - tau[i])
+        m = (source[i+1] - source[i]) / tau_diff
         b = source[i] - m * tau[i]
-        
+
         # Exact integration (Korg.jl lines 384-385)
-        flux += (expint_transfer_integral_core(tau[i+1], m, b) - 
+        flux += (expint_transfer_integral_core(tau[i+1], m, b) -
                 expint_transfer_integral_core(tau[i], m, b))
-    
+
     return flux
 
 

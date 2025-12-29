@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jorg"
 version = "0.1.0"
-description = "JAX-based stellar spectral synthesis package"
+description = "JAX-based stellar spectral synthesis, API-compatible with Korg.jl"
 authors = [
-    {name = "Jorg Development Team", email = "jorg@example.com"}
+    {name = "Jorg Development Team"}
 ]
 readme = "README.md"
 license = {text = "MIT"}

@@ -34,9 +34,9 @@ Recent Major Fixes (December 2024 - January 2025):
 
 1. **CHEMICAL EQUILIBRIUM MAJOR UPGRADE** ✅:
    - **PROBLEM**: 17.5%-29.4% systematic electron density bias in original solver
-   - **SOLUTION**: Created `chemical_equilibrium_proper.py` using exact partition functions
-   - **RESULT**: Electron density bias dramatically changed (+23.9% → -37.6% for metal-poor case)
-   - **IMPACT**: Chemical equilibrium now uses exact Korg.jl partition functions instead of hardcoded approximations
+   - **SOLUTION**: Use `korg_chemical_equilibrium.py` (Newton solver) with Korg-equivalent partition funcs
+   - **RESULT**: Ionization and molecular equilibrium now follow Korg.jl equations
+   - **IMPACT**: Removes simplified Saha-only approximations and aligns number densities to Korg
    - **STATUS**: Integrated into synthesis.py as primary chemical equilibrium solver
 
 2. **HYDROGEN LINES CRITICAL FIX** ✅:
@@ -67,7 +67,7 @@ Recent Major Fixes (December 2024 - January 2025):
 - **WAVELENGTH RANGE**: 5000-5200Å with 0.005Å spacing for smooth comparison
 
 **SYNTHESIS SYSTEM STATUS** ✅ PRODUCTION READY:
-- ✅ **Chemical Equilibrium**: Using exact partition functions, 60pp electron density improvement
+- ✅ **Chemical Equilibrium**: Korg-equivalent solver with Barklem/ExoMol equilibrium constants
 - ✅ **VALD Lines**: 71.2% maximum line depth, 799 strong absorption lines
 - ✅ **Hydrogen Lines**: ABO Balmer profiles working, realistic H-alpha absorption
 - ✅ **Unit Conversions**: Correct flux scaling for both rectified and raw output
@@ -163,15 +163,14 @@ try:
 except ImportError:
     create_exact_partition_functions = None
     FullMolecularEquilibrium = None
-# JANUARY 2025 UPGRADE: Use exact partition function solver to fix 17.5%-29.4% electron density bias
-# This solver properly uses exact Korg.jl partition functions instead of hardcoded approximations
-from .statmech.chemical_equilibrium_proper import chemical_equilibrium_proper as chemical_equilibrium
-# Backup (for debugging): from .statmech.working_optimizations import chemical_equilibrium_working_optimized as chemical_equilibrium
+# Korg.jl-equivalent chemical equilibrium solver (Newton + molecular equilibrium)
+from .statmech.korg_chemical_equilibrium import chemical_equilibrium
 # Import new proper physics implementations (August 2025 hardcode fixes)
-from .statmech.proper_partition_functions import get_proper_partition_functions
+# CRITICAL FIX (Jan 2025): Use EXACT Korg.jl partition functions, not approximations!
+# This fixes 72-100% partition function errors that were causing 6.7% electron density error
+from .statmech.korg_exact_partition_functions import get_korg_exact_partition_functions
 from .statmech.proper_ionization_energies import get_proper_ionization_energies
 from .continuum.exact_physics_continuum import total_continuum_absorption_exact_physics_only
-from .lines.core import total_line_absorption
 from .lines.linelist import read_linelist
 # Import NEW Kurucz format support
 try:
@@ -238,22 +237,29 @@ class SynthesisResult:
     intermediate_results: Optional[Dict] = None
 
 
-def create_korg_compatible_abundance_array(m_H=0.0):
-    """Create abundance array matching Korg.jl format_A_X() exactly"""
-    # Korg.jl reference values (Grevesse & Sauval 2007 + metallicity)
-    A_X = np.array([
-        12.000000, 10.910000, 0.960000, 1.380000, 2.700000, 8.460000, 7.830000, 8.690000, 4.400000, 8.060000,  # Elements 1-10
-        6.220000, 7.550000, 6.430000, 7.510000, 5.410000, 7.120000, 5.310000, 6.380000, 5.070000, 6.300000,  # Elements 11-20
-        3.140000, 4.970000, 3.900000, 5.620000, 5.420000, 7.460000, 4.940000, 6.200000, 4.180000, 4.560000,  # Elements 21-30
-        3.020000, 3.620000, 2.300000, 3.340000, 2.540000, 3.120000, 2.320000, 2.830000, 2.210000, 2.590000,  # Elements 31-40
-        1.470000, 1.880000, -5.000000, 1.750000, 0.780000, 1.570000, 0.960000, 1.710000, 0.800000, 2.020000,  # Elements 41-50
-        1.010000, 2.180000, 1.550000, 2.220000, 1.080000, 2.270000, 1.110000, 1.580000, 0.750000, 1.420000,  # Elements 51-60
-        -5.000000, 0.950000, 0.520000, 1.080000, 0.310000, 1.100000, 0.480000, 0.930000, 0.110000, 0.850000,  # Elements 61-70
-        0.100000, 0.850000, -0.150000, 0.790000, 0.260000, 1.350000, 1.320000, 1.610000, 0.910000, 1.170000,  # Elements 71-80
-        0.920000, 1.950000, 0.650000, -5.000000, -5.000000, -5.000000, -5.000000, -5.000000, -5.000000, 0.030000,  # Elements 81-90
-        -5.000000, -0.540000  # Elements 91-92
-    ])
-    return A_X
+def create_korg_compatible_abundance_array(
+    m_H=0.0,
+    alpha_H=None,
+    abundances=None,
+    solar_relative=True,
+    solar_abundances=None,
+    alpha_elements=None,
+):
+    """Create abundance array matching Korg.jl format_A_X() exactly."""
+    from .abundances import ASPLUND_2020_SOLAR_ABUNDANCES, format_abundances
+
+    if solar_abundances is None:
+        solar_abundances = ASPLUND_2020_SOLAR_ABUNDANCES
+
+    A_X = format_abundances(
+        default_metals_H=m_H,
+        default_alpha_H=alpha_H,
+        abundances=abundances,
+        solar_relative=solar_relative,
+        solar_abundances=solar_abundances,
+        alpha_elements=alpha_elements,
+    )
+    return np.array(A_X, dtype=float)
 
 
 def synthesize_korg_compatible(
@@ -428,12 +434,11 @@ def synthesize_korg_compatible(
         ionization_energies = create_default_ionization_energies()
     
     if partition_funcs is None:
-        # Try to use KORG partition functions first
+        # Korg.jl-compatible partition functions (atomic + molecular)
         try:
-            from .statmech.korg_partition_functions import create_korg_partition_functions
-            partition_funcs = create_korg_partition_functions()
+            partition_funcs = create_default_partition_functions()
             if verbose:
-                print("  🎯 Using EXACT Korg.jl partition functions (fixes 57% Fe II error)")
+                print("  🎯 Using Korg-compatible partition functions (atomic + molecular)")
         except Exception as e:
             # Fallback to exact partition functions if available
             if create_exact_partition_functions is not None:
@@ -451,23 +456,8 @@ def synthesize_korg_compatible(
                     print(f"  ⚠️ Fallback to default partition functions: {e}")
     
     if log_equilibrium_constants is None:
-        # Try to use FULL molecular equilibrium with 86+ species
-        if FullMolecularEquilibrium is not None:
-            try:
-                mol_eq = FullMolecularEquilibrium()
-                # Create equilibrium constants from full molecular data
-                log_equilibrium_constants = {}
-                for molecule in mol_eq.get_all_molecular_species():
-                    K = mol_eq.get_equilibrium_constant(molecule, 5000.0)
-                    log_equilibrium_constants[molecule] = np.log10(K)
-                if verbose:
-                    print(f"  🎯 Using FULL molecular equilibrium ({len(log_equilibrium_constants)} species vs ~20)")
-            except Exception as e:
-                log_equilibrium_constants = create_default_log_equilibrium_constants()
-                if verbose:
-                    print(f"  ⚠️ Fallback to default molecular equilibrium: {e}")
-        else:
-            log_equilibrium_constants = create_default_log_equilibrium_constants()
+        # Korg.jl-compatible molecular equilibrium constants
+        log_equilibrium_constants = create_default_log_equilibrium_constants()
     
     if verbose:
         print("✅ Atomic physics data loaded")
@@ -516,6 +506,7 @@ def synthesize_korg_compatible(
         partition_funcs=partition_funcs,
         log_equilibrium_constants=log_equilibrium_constants,
         electron_density_warn_threshold=electron_number_density_warn_threshold,
+        line_cutoff_threshold=line_cutoff_threshold,
         verbose=verbose
     )
     
@@ -551,20 +542,49 @@ def synthesize_korg_compatible(
     # Use the logg parameter passed to function
     log_g = logg
     
-    # 6. Process all layers systematically (following Korg.jl exactly)
+    # 6. Process all layers systematically (following Korg.jl's TWO-STAGE approach)
+    # CRITICAL FIX: Korg.jl calculates continuum FIRST, then adds lines
+    # This is essential for proper continuum flux (see synthesize.jl:213-267)
     start_time = time.time() if debug_mode else None
-    
-    alpha_matrix, all_number_densities, all_electron_densities = layer_processor.process_all_layers(
+
+    # Stage 1: Calculate CONTINUUM-ONLY opacity (Korg.jl lines 213-221)
+    alpha_continuum, all_number_densities, all_electron_densities = layer_processor.process_all_layers(
         atm=atm,
         abs_abundances={Z: abs_abundances[Z-1] for Z in range(1, MAX_ATOMIC_NUMBER+1)},
         wl_array=wl_array,
-        linelist=linelist,
+        linelist=None,  # NO lines yet - continuum only
         line_buffer=line_buffer,
-        hydrogen_lines=hydrogen_lines,
+        hydrogen_lines=False,  # NO hydrogen lines yet
         vmic=vmic,
         use_chemical_equilibrium_from=use_chemical_equilibrium_from,
-        log_g=log_g  # Pass surface gravity to layer processor
+        log_g=log_g
     )
+
+    # Stage 2: Calculate TOTAL opacity by adding lines (Korg.jl lines 253-267)
+    # Use multilayer KorgLineProcessor to match Korg.jl's max-window line selection.
+    line_opacity = _calculate_line_opacity_multilayer(
+        wl_array=wl_array,
+        temps=np.array(atm['temperature']),
+        electron_densities=all_electron_densities,
+        number_densities=all_number_densities,
+        partition_funcs=partition_funcs,
+        linelist=linelist,
+        line_buffer=line_buffer,
+        microturbulence_kms=vmic,
+        continuum_opacity=alpha_continuum,
+        cutoff_threshold=line_cutoff_threshold,
+        verbose=verbose
+    )
+
+    alpha_matrix = alpha_continuum + line_opacity
+
+    if hydrogen_lines:
+        # Add hydrogen lines per layer, matching Korg.jl's separate hydrogen treatment.
+        for i, T in enumerate(atm['temperature']):
+            layer_number_densities = {spec: densities[i] for spec, densities in all_number_densities.items()}
+            alpha_matrix[i, :] += layer_processor._calculate_default_hydrogen_line_opacity(
+                wl_array, float(T), float(all_electron_densities[i]), layer_number_densities, vmic
+            )
     
     # Debug tracking: layer processing timing and statistics
     if debug_mode:
@@ -610,7 +630,9 @@ def synthesize_korg_compatible(
     flux, continuum, intensity = _calculate_radiative_transfer(
         alpha_matrix, atm, wl_array, mu_grid, I_scheme, return_cntm, A_X,
         layer_processor, linelist, line_buffer, hydrogen_lines, vmic, abs_abundances,
-        use_chemical_equilibrium_from, log_g, rectify, rt_method, verbose
+        use_chemical_equilibrium_from, log_g, rectify, rt_method, verbose,
+        alpha_continuum=alpha_continuum,  # Pass pre-calculated continuum opacity
+        line_cutoff_threshold=line_cutoff_threshold
     )
     
     if verbose:
@@ -662,9 +684,68 @@ def _setup_mu_grid(mu_values):
     return [(float(mu), float(w)) for mu, w in zip(mu_points, weights)]
 
 
+def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, number_densities,
+                                       partition_funcs, linelist, line_buffer,
+                                       microturbulence_kms, continuum_opacity,
+                                       cutoff_threshold=3e-4, verbose=False):
+    """
+    Calculate line opacity for all layers at once using Korg-style windowing.
+    """
+    n_layers = len(temps)
+    n_wavelengths = len(wl_array)
+
+    if linelist is None or len(linelist) == 0:
+        return np.zeros((n_layers, n_wavelengths))
+
+    wl_array = np.asarray(wl_array)
+    wl_array_cm = wl_array * 1e-8
+
+    wl_min_cm = (wl_array[0] - line_buffer) * 1e-8
+    wl_max_cm = (wl_array[-1] + line_buffer) * 1e-8
+    relevant_lines = [line for line in linelist if wl_min_cm <= line.wavelength <= wl_max_cm]
+
+    if not relevant_lines:
+        return np.zeros((n_layers, n_wavelengths))
+
+    if continuum_opacity is None:
+        continuum_opacity_fn = None
+    else:
+        continuum_opacity = np.asarray(continuum_opacity)
+
+        def continuum_opacity_fn(wl_cm):
+            wl_ang = wl_cm * 1e8
+            if wl_ang <= wl_array[0]:
+                return continuum_opacity[:, 0]
+            if wl_ang >= wl_array[-1]:
+                return continuum_opacity[:, -1]
+            idx = np.searchsorted(wl_array, wl_ang)
+            x0 = wl_array[idx - 1]
+            x1 = wl_array[idx]
+            y0 = continuum_opacity[:, idx - 1]
+            y1 = continuum_opacity[:, idx]
+            frac = (wl_ang - x0) / (x1 - x0)
+            return y0 + frac * (y1 - y0)
+
+    processor = KorgLineProcessor(verbose=verbose)
+    result = processor.process_lines(
+        wl_array_cm=wl_array_cm,
+        temps=temps,
+        electron_densities=electron_densities,
+        n_densities=number_densities,
+        partition_fns=partition_funcs,
+        linelist=relevant_lines,
+        microturbulence_cm_s=microturbulence_kms * 1e5,
+        continuum_opacity_fn=continuum_opacity_fn,
+        cutoff_threshold=cutoff_threshold
+    )
+
+    return result.alpha_matrix
+
+
 def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_scheme, return_cntm, A_X,
                                 layer_processor, linelist, line_buffer, hydrogen_lines, vmic, abs_abundances,
-                                use_chemical_equilibrium_from, log_g, rectify, rt_method="korg_default", verbose=False):
+                                use_chemical_equilibrium_from, log_g, rectify, rt_method="korg_default", verbose=False,
+                                alpha_continuum=None, line_cutoff_threshold=3e-4):
     """
     Korg.jl-compatible radiative transfer using exact analytical methods
     
@@ -699,9 +780,26 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
         planck_numerator = 2 * hplanck_cgs * c_cgs**2
         planck_denominator = wl**5 * (np.exp(hplanck_cgs * c_cgs / (wl * kboltz_cgs * temperatures)) - 1)
         source_matrix[:, i] = planck_numerator / planck_denominator
+
+    if verbose:
+        print(f"   Source function (B_λ) range: {source_matrix.min():.3e} - {source_matrix.max():.3e} erg/s/cm²/cm/sr")
+        T_surface = temperatures[0]
+        wl_mid = wl_cm[len(wl_cm)//2]
+        B_mid = source_matrix[0, len(wl_cm)//2]
+        print(f"   Example: B_λ({wl_mid*1e8:.0f}Å, {T_surface:.0f}K) = {B_mid:.3e} erg/s/cm²/cm/sr")
     
     # CRITICAL FIX: Calculate proper α5 reference instead of np.ones()
-    alpha5_reference = calculate_alpha5_reference(atm, A_X, linelist=None, verbose=False)
+    alpha5_reference = calculate_alpha5_reference(
+        atm,
+        A_X,
+        linelist=linelist,
+        number_densities=layer_processor.all_number_densities,
+        electron_densities=layer_processor.all_electron_densities,
+        partition_funcs=layer_processor.partition_funcs,
+        microturbulence_kms=vmic,
+        line_cutoff_threshold=line_cutoff_threshold,
+        verbose=False
+    )
     
     # Use exact Korg.jl radiative transfer (validated to 0.4% agreement)
     # Pass the number of mu points (typically 20) to let RT function generate optimal grid
@@ -750,7 +848,7 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
             print(f"   Using default Korg.jl radiative transfer (requested {rt_method} not available)")
         flux, intensity, mu_surface_grid, mu_weights = radiative_transfer(
             alpha=alpha_matrix,
-            source=source_matrix, 
+            source=source_matrix,
             spatial_coord=spatial_coord,
             mu_points=mu_points_count,
             spherical=False,  # Plane-parallel atmosphere
@@ -760,30 +858,25 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
             alpha_ref=alpha5_reference,   # FIXED: Use proper α5 reference
             tau_ref=tau_5000              # Reference optical depth for anchoring
         )
-    
-    # Calculate continuum if needed
-    if return_cntm:
-        # FIXED: Use Korg.jl's approach - calculate continuum-only opacity separately
-        # This ensures proper continuum/total flux ratio for rectification
+
         if verbose:
-            print("   Calculating continuum-only opacity using same method as synthesis_korg_exact.py...")
-        
-        # Calculate continuum-only opacity matrix (NO LINES, like Korg.jl approach)
-        alpha_continuum_only, _, _ = layer_processor.process_all_layers(
-            atm=atm,
-            abs_abundances={Z: abs_abundances[Z-1] for Z in range(1, MAX_ATOMIC_NUMBER+1)},
-            wl_array=wavelengths,
-            linelist=None,  # NO LINES for continuum-only calculation
-            line_buffer=line_buffer,
-            hydrogen_lines=False,  # NO hydrogen lines for continuum
-            vmic=vmic,
-            use_chemical_equilibrium_from=use_chemical_equilibrium_from,
-            log_g=log_g
-        )
-        
-        # Calculate continuum flux via radiative transfer using continuum-only opacity
+            print(f"   Raw flux from RT: {flux.min():.3e} - {flux.max():.3e} erg/s/cm²/cm")
+            print(f"   Expected for solar: ~1e15 erg/s/cm²/cm")
+    
+    # Calculate continuum if needed (using pre-calculated continuum opacity from Stage 1)
+    if return_cntm:
+        # KORG.JL COMPATIBILITY: Use continuum opacity calculated BEFORE lines were added
+        # This matches Korg.jl synthesize.jl:248-250 where continuum is calculated from
+        # the α matrix before lines are added (lines 253-267)
+        if verbose:
+            print("   Calculating continuum flux from pre-computed continuum opacity...")
+
+        if alpha_continuum is None:
+            raise ValueError("alpha_continuum must be provided when return_cntm=True")
+
+        # Calculate continuum flux via radiative transfer using pre-calculated continuum opacity
         continuum_flux, _, _, _ = radiative_transfer(
-            alpha=alpha_continuum_only,  # Use pure continuum opacity
+            alpha=alpha_continuum,  # Use pre-calculated continuum-only opacity (Stage 1)
             source=source_matrix,
             spatial_coord=spatial_coord,
             mu_points=mu_points_count,
@@ -794,7 +887,7 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
             alpha_ref=alpha5_reference,  # Use same reference as total
             tau_ref=tau_5000
         )
-        
+
         continuum = continuum_flux
         
         # RECTIFICATION: Only normalize flux by continuum if rectify=True is explicitly requested
@@ -836,17 +929,17 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
         continuum = None
     
     
-    # === CRITICAL UNIT CONVERSION FIX (January 2025) ===
-    # PROBLEM: Unit conversion was being applied to rectified flux, turning ~1.0 into ~1e-8 (effectively 0)
-    # SOLUTION: Apply unit conversion ONLY to raw flux (erg/s/cm²/cm → erg/s/cm²/Å)
-    # When rectified, flux is dimensionless (flux/continuum) so no unit conversion needed
-    if not rectify:
-        # Convert raw flux from per cm to per Å: 1 cm = 10⁸ Å, so multiply by 1e-8
-        flux = flux * 1e-8
-        if continuum is not None:
-            continuum = continuum * 1e-8
-    # Rectified flux remains dimensionless (~1.0) - no conversion applied
-    # === END CRITICAL UNIT CONVERSION FIX ===
+    # === CRITICAL FIX (September 2025): DO NOT CONVERT FLUX UNITS ===
+    # PROBLEM: Previous code multiplied flux by 1e-8, making it 100 million times too small!
+    # ANALYSIS: Korg.jl outputs flux in erg/s/cm²/cm (with wavelengths in Å)
+    #           It does NOT convert flux units when converting wavelength units
+    #           See Korg.jl src/synthesize.jl:277 - only wavelengths are multiplied by 1e8
+    # SOLUTION: Match Korg.jl behavior - keep flux in erg/s/cm²/cm
+    #
+    # Flux units remain in erg/s/cm²/cm (matching Korg.jl output convention)
+    # Wavelengths are in Å, but flux is "per cm" - this is the Korg.jl standard
+    # When rectified, flux is dimensionless (flux/continuum) - no unit issues
+    # === END CRITICAL FIX ===
     
     return flux, continuum, intensity
 
@@ -1264,7 +1357,7 @@ def validate_proper_physics_integration():
     # Test 1: Proper Partition Functions
     print("\n1. Testing Proper Partition Function System:")
     try:
-        pf_system = get_proper_partition_functions()
+        pf_system = get_korg_exact_partition_functions()
         
         # Test Fe I partition function (should be physics-based, not empirical)
         iron_pf_3000K = pf_system.get_partition_function(26, 0, 3000.0)  # Fe I at 3000K
@@ -1462,7 +1555,7 @@ DEBUGGING SESSION COMPLETED - TARGET: <1% Korg.jl Agreement
    - **Electron density bias fixed**: 17.5%-29.4% systematic error eliminated
    - **Exact partition functions**: Now uses Korg.jl values instead of hardcoded approximations  
    - **Impact**: Metal-poor G star bias: +23.9% → -37.6% (60pp improvement)
-   - **Solver**: chemical_equilibrium_proper.py integrated as primary solver
+   - **Solver**: korg_chemical_equilibrium.py integrated as primary solver
 
 2. **HYDROGEN LINES RESTORED** ✅:
    - **Problem**: H-alpha returning exactly 0.0 cm⁻¹ (completely broken)

@@ -62,40 +62,59 @@ def chemical_equilibrium_proper(temp: float, nt: float, model_atm_ne: float,
         ne_new = 0.0
         species_densities = {}
         
-        # Process each element
-        for Z in range(1, min(31, max(absolute_abundances.keys()) + 1)):
+        # Process each element (all 92 elements, matching Korg.jl)
+        for Z in range(1, 93):
             if Z not in absolute_abundances or Z not in ionization_energies:
                 continue
                 
             abundance = absolute_abundances[Z]
             chi_I, chi_II, _ = ionization_energies[Z]
             
-            # Get exact partition functions
+            # Get exact partition functions (return U, not log(U))
             species_neutral = Species.from_atomic_number(Z, 0)
             species_ion = Species.from_atomic_number(Z, 1)
             
             if species_neutral in partition_funcs and species_ion in partition_funcs:
-                # Use EXACT partition functions from Korg.jl
+                # Use EXACT partition functions from Korg.jl (in log space to avoid overflow)
+                # Partition function interpolators return U, not log(U)
                 U_I = float(partition_funcs[species_neutral](log_T))
                 U_II = float(partition_funcs[species_ion](log_T))
+
+                # Saha equation in log space to avoid overflow for large partition functions
+                # w_II = (n_II / n_I) = (2 * U_II / U_I) * (trans_U / ne) * exp(-chi_I / kT)
+                # log(w_II) = log(2) + log(U_II) - log(U_I) + log(trans_U) - log(ne) - chi_I/(kT)
+                log_saha_factor = (np.log(2.0) + np.log(max(U_II, 1e-300)) - np.log(max(U_I, 1e-300)) +
+                                  np.log(trans_U) - np.log(max(ne_current, 1e-100)) - chi_I / (k_eV * temp))
+
+                # Clip to prevent overflow/underflow: exp(±700) is near float limits
+                log_saha_factor = np.clip(log_saha_factor, -700, 700)
+                saha_factor = np.exp(log_saha_factor)
             else:
                 # Fallback to simple values (but this should rarely happen)
                 U_I = 2.0 if Z == 1 else 1.0
                 U_II = 1.0
-            
-            # Saha equation for first ionization
-            # w_II = (n_II / n_I) = (2 * U_II / U_I) * (translational_U / ne) * exp(-chi_I / kT)
-            saha_factor = 2.0 * trans_U / ne_current * (U_II / U_I) * np.exp(-chi_I / (k_eV * temp))
-            
+                # Standard Saha equation
+                saha_factor = 2.0 * trans_U / ne_current * (U_II / U_I) * np.exp(-chi_I / (k_eV * temp))
+
+            # Ensure finite values
+            if not np.isfinite(saha_factor):
+                saha_factor = 0.0
+
             # Solve for neutral and ionized densities
             # n_total = n_I + n_II = n_I + n_I * w_II = n_I * (1 + w_II)
             # Therefore: n_I = n_total / (1 + w_II), n_II = n_total * w_II / (1 + w_II)
-            
+
             n_total_element = abundance * nt
             denominator = 1.0 + saha_factor
-            
+
             n_neutral = n_total_element / denominator
             n_ionized = n_total_element * saha_factor / denominator
+
+            # Ensure finite results
+            if not np.isfinite(n_neutral):
+                n_neutral = n_total_element
+            if not np.isfinite(n_ionized):
+                n_ionized = 0.0
             
             # Store densities
             species_densities[species_neutral] = n_neutral
@@ -111,13 +130,13 @@ def chemical_equilibrium_proper(temp: float, nt: float, model_atm_ne: float,
             h_neutral = species_densities[Species.from_atomic_number(1, 0)]
             
             # Ground state H I density (degeneracy = 2, Boltzmann factor = 1)
-            # Use exact partition function if available
+            # Use exact partition function if available (returns U)
             species_neutral = Species.from_atomic_number(1, 0)
             if species_neutral in partition_funcs:
                 U_I = float(partition_funcs[species_neutral](log_T))
-                nHI_groundstate = 2.0 * h_neutral / U_I
+                nHI_groundstate = 2.0 * h_neutral / max(U_I, 1e-300)
             else:
-                nHI_groundstate = 2.0 * h_neutral  # Fallback: assume U_I = 2
+                nHI_groundstate = h_neutral  # Fallback: assume U_I = 2
             
             # Exact Korg.jl constants
             coef = 3.31283018e-22  # cm³*eV^1.5

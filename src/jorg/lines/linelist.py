@@ -429,7 +429,6 @@ def parse_vald_line(line_text: str,
                 
                 # Convert from log₁₀ to linear scale (as Korg.jl does with tentotheOrMissing)
                 # Korg.jl: tentotheOrMissing(x) = x == 0 ? missing : 10^x
-                # CRITICAL FIX: VALD gives gamma_rad in Hz, but Jorg needs s⁻¹
                 if gamma_rad_log == 0:
                     gamma_rad = 0.0  # Will use default approximation
                 else:
@@ -438,8 +437,7 @@ def parse_vald_line(line_text: str,
                     # Cap at reasonable physical value (10^20 Hz is already enormous)
                     if gamma_rad_log > 20:
                         gamma_rad_log = 20.0
-                    gamma_rad_hz = 10.0**gamma_rad_log  # VALD format: log₁₀(gamma) in Hz
-                    gamma_rad = gamma_rad_hz * 2.0 * 3.141592653589793  # Convert Hz to s⁻¹ with 2π factor
+                    gamma_rad = 10.0**gamma_rad_log  # VALD format: log₁₀(gamma) in s⁻¹
                     
                 if gamma_stark_log == 0:
                     gamma_stark = 0.0  # Will use default approximation
@@ -460,10 +458,9 @@ def parse_vald_line(line_text: str,
                     vdw_param1 = 0.0
                     vdw_param2 = 0.0
                 elif vdw_raw < 0:
-                    # Negative: log10 of enhancement factor (most common in VALD)
-                    # Store as-is, will be handled in broadening calculation
-                    vdw_param1 = vdw_raw
-                    vdw_param2 = -1.0  # Marker for log enhancement factor
+                    # Negative: log10(γ_vdW) evaluated at 10,000 K (Korg.jl behavior)
+                    vdw_param1 = 10.0**vdw_raw
+                    vdw_param2 = -1.0  # Marker for gamma_vdW at 10k
                 elif 0 < vdw_raw < 20:
                     # Between 0 and 20: Unsöld approximation fudge factor
                     vdw_param1 = vdw_raw
@@ -490,6 +487,7 @@ def parse_vald_line(line_text: str,
             gamma_stark = approximate_stark_gamma(species_id)
         if vdw_param1 == 0.0:
             vdw_param1 = approximate_vdw_gamma(species_id)
+            vdw_param2 = -1.0
         
         # Convert species integer to proper Species object
         species_obj = species_from_integer(species_id)
@@ -947,34 +945,10 @@ def parse_alpha_5000_linelist(filename: Union[str, Path], wavelength_unit: str =
     
     lines = []
     
-    def parse_korg_species_to_vald_code(species_str):
-        """Parse Korg.jl species string like 'Fe I' into VALD integer code."""
-        parts = species_str.strip().split()
-        
-        if len(parts) == 2:
-            element_symbol = parts[0]
-            ionization_roman = parts[1]
-            
-            # Convert roman numeral to ionization level (1-indexed for VALD)
-            roman_to_ionization = {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5}
-            ionization_level = roman_to_ionization.get(ionization_roman, 1)
-            
-            # Convert element symbol to atomic number
-            element_symbols = {
-                'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8,
-                'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15,
-                'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22,
-                'V': 23, 'Cr': 24, 'Mn': 25, 'Fe': 26, 'Co': 27, 'Ni': 28, 'Cu': 29,
-                'Zn': 30, 'Nd': 60
-            }
-            
-            atomic_number = element_symbols.get(element_symbol, 1)
-            
-            # VALD species code: atomic_number * 100 + ionization_level
-            return atomic_number * 100 + ionization_level
-        else:
-            # Handle molecular species like 'HMg' - default to H I
-            return 101  # H I in VALD format
+    def parse_korg_species(species_str):
+        """Parse Korg.jl species string like 'Fe I' or 'OZr' into Species."""
+        from ..statmech.species import Species as ChemSpecies
+        return ChemSpecies.from_string(species_str)
 
     def parse_vdw_parameter(vdw_str):
         """Parse vdW parameter string from Korg.jl format."""
@@ -1009,7 +983,7 @@ def parse_alpha_5000_linelist(filename: Union[str, Path], wavelength_unit: str =
                 
                 # Parse other parameters
                 log_gf = float(row['log_gf'])
-                species_code = parse_korg_species_to_vald_code(row['species'])
+                species_obj = parse_korg_species(row['species'])
                 E_lower = float(row['E_lower'])  # eV
                 
                 # Parse broadening parameters
@@ -1022,10 +996,6 @@ def parse_alpha_5000_linelist(filename: Union[str, Path], wavelength_unit: str =
                     vdw_param1, vdw_param2 = vdw_param
                 else:
                     vdw_param1, vdw_param2 = float(vdw_param), -1.0
-                
-                # Create LineData object using VALD-compatible format
-                # Convert species integer to proper Species object
-                species_obj = species_from_integer(species_code)
                 
                 line = create_line_data(
                     wavelength=wl_angstrom,  # Keep in Å 

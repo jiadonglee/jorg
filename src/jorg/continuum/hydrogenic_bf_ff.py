@@ -10,6 +10,7 @@ from jax import jit
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 from typing import Tuple, Optional
+from pathlib import Path
 import os
 
 # Physical constants (CGS units)
@@ -32,12 +33,23 @@ class VanHoofGauntFactors:
             data_file: Path to van Hoof data file (optional)
         """
         if data_file is None:
+            data_file = self._default_data_file()
+
+        if data_file is not None and os.path.exists(data_file):
+            self._load_data(data_file)
+        else:
             # Use synthetic data if file not available
             self._create_synthetic_data()
-        else:
-            self._load_data(data_file)
-        
+
         self._create_interpolator()
+
+    def _default_data_file(self) -> Optional[str]:
+        """Locate the vanHoof2014-nr-gauntff.dat file in the repo."""
+        repo_root = Path(__file__).resolve().parents[4]
+        candidate = repo_root / "data" / "vanHoof2014-nr-gauntff.dat"
+        if candidate.exists():
+            return str(candidate)
+        return None
     
     def _create_synthetic_data(self):
         """Create synthetic Gaunt factor data for demonstration."""
@@ -96,15 +108,49 @@ class VanHoofGauntFactors:
         gaunt_factors = np.clip(gaunt_factors, 0.1, 10.0)
         
         return gaunt_factors
-    
+
+    def _read_next_data_line(self, file_obj) -> Optional[str]:
+        """Read the next non-comment line from the data file."""
+        for line in file_obj:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            return stripped
+        return None
+
     def _load_data(self, data_file: str):
-        """Load van Hoof data from file (if available)."""
-        if not os.path.exists(data_file):
-            raise FileNotFoundError(f"Van Hoof data file not found: {data_file}")
-        
-        # Implementation would parse the van Hoof data format
-        # For now, fall back to synthetic data
-        self._create_synthetic_data()
+        """Load van Hoof data from file."""
+        with open(data_file, "r") as handle:
+            magic_line = self._read_next_data_line(handle)
+            if magic_line is None:
+                raise ValueError("van Hoof gaunt factor file is empty")
+            magic_number = int(magic_line.split()[0])
+            if magic_number != 20140210:
+                raise ValueError(f"Unexpected van Hoof magic number: {magic_number}")
+
+            counts_line = self._read_next_data_line(handle)
+            if counts_line is None:
+                raise ValueError("Missing van Hoof grid dimensions")
+            num_gamma2, num_u = (int(val) for val in counts_line.split()[:2])
+
+            log10_gamma2_start = float(self._read_next_data_line(handle).split()[0])
+            log10_u_start = float(self._read_next_data_line(handle).split()[0])
+            step_size = float(self._read_next_data_line(handle).split()[0])
+
+            self.log10_γ2 = log10_gamma2_start + step_size * np.arange(num_gamma2)
+            self.log10_u = log10_u_start + step_size * np.arange(num_u)
+
+            table = np.empty((num_u, num_gamma2), dtype=float)
+            for row_idx in range(num_u):
+                row_vals = []
+                while len(row_vals) < num_gamma2:
+                    line = self._read_next_data_line(handle)
+                    if line is None:
+                        raise ValueError("Unexpected EOF while reading gaunt factors")
+                    row_vals.extend(float(val) for val in line.split())
+                table[row_idx, :] = row_vals[:num_gamma2]
+
+            self.gaunt_table = table
     
     def _create_interpolator(self):
         """Create 2D interpolator for Gaunt factors."""
@@ -123,16 +169,30 @@ class VanHoofGauntFactors:
         # Find bounds for interpolation
         γ2_bounds = [calc_log10_γ2(Z, T) for Z in Z_extrema for T in T_extrema]
         u_bounds = [calc_log10_u(λ, T) for λ in λ_extrema for T in T_extrema]
-        
-        self.γ2_min, self.γ2_max = min(γ2_bounds), max(γ2_bounds)
-        self.u_min, self.u_max = min(u_bounds), max(u_bounds)
-        
+
+        def _find_bound_inds(values: np.ndarray, min_val: float, max_val: float) -> Tuple[int, int]:
+            lb = int(np.searchsorted(values, min_val, side="right") - 1)
+            ub = int(np.searchsorted(values, max_val, side="left"))
+            if lb < 0 or ub >= len(values):
+                raise ValueError("Gaunt factor bounds outside table coverage")
+            return lb, ub
+
+        gamma2_lb, gamma2_ub = _find_bound_inds(self.log10_γ2, min(γ2_bounds), max(γ2_bounds))
+        u_lb, u_ub = _find_bound_inds(self.log10_u, min(u_bounds), max(u_bounds))
+
+        self.log10_γ2 = self.log10_γ2[gamma2_lb:gamma2_ub + 1]
+        self.log10_u = self.log10_u[u_lb:u_ub + 1]
+        self.gaunt_table = self.gaunt_table[u_lb:u_ub + 1, gamma2_lb:gamma2_ub + 1]
+
+        self.γ2_min, self.γ2_max = self.log10_γ2[0], self.log10_γ2[-1]
+        self.u_min, self.u_max = self.log10_u[0], self.log10_u[-1]
+
         # Create interpolator
         self.interpolator = RegularGridInterpolator(
             (self.log10_u, self.log10_γ2),
             self.gaunt_table,
             bounds_error=False,
-            fill_value=1.0,  # Default Gaunt factor
+            fill_value=None,
             method='linear'
         )
         
@@ -151,12 +211,20 @@ class VanHoofGauntFactors:
         Returns:
             Free-free Gaunt factor
         """
-        # Clamp to valid bounds
-        log_u = jnp.clip(log_u, self.u_min, self.u_max)
-        log_γ2 = jnp.clip(log_γ2, self.γ2_min, self.γ2_max)
-        
-        # Use scipy interpolator (will be converted to JAX-compatible)
-        return self.interpolator(jnp.array([log_u, log_γ2]))[0]
+        log_u_arr = np.asarray(log_u, dtype=float)
+        log_γ2_arr = np.asarray(log_γ2, dtype=float)
+
+        log_u_arr = np.clip(log_u_arr, self.u_min, self.u_max)
+        log_γ2_arr = np.clip(log_γ2_arr, self.γ2_min, self.γ2_max)
+
+        log_u_arr, log_γ2_arr = np.broadcast_arrays(log_u_arr, log_γ2_arr)
+        points = np.column_stack([log_u_arr.ravel(), log_γ2_arr.ravel()])
+        values = self.interpolator(points)
+        values = values.reshape(log_u_arr.shape)
+
+        if values.size == 1:
+            return float(values.ravel()[0])
+        return values
     
     def hydrogenic_ff_absorption(self, frequency: float, temperature: float, 
                                Z: int, ni: float, ne: float) -> float:
@@ -182,24 +250,21 @@ class VanHoofGauntFactors:
         """
         inv_T = 1.0 / temperature
         Z2 = Z * Z
-        
-        # Calculate dimensionless parameters
-        hν_div_kT = (HPLANCK_EV / KBOLTZ_EV) * frequency * inv_T
-        log_u = jnp.log10(hν_div_kT)
-        log_γ2 = jnp.log10((RYDBERG_EV / KBOLTZ_EV) * Z2 * inv_T)
-        
-        # Get Gaunt factor
+
+        freq_arr = np.asarray(frequency, dtype=float)
+        hν_div_kT = (HPLANCK_EV / KBOLTZ_EV) * freq_arr * inv_T
+        log_u = np.log10(hν_div_kT)
+        log_γ2 = np.log10((RYDBERG_EV / KBOLTZ_EV) * Z2 * inv_T)
+
         gaunt_ff = self.gaunt_ff_vanHoof(log_u, log_γ2)
-        
-        # Calculate absorption coefficient
-        # From equation 5.18b of Rybicki & Lightman (2004)
-        # α = coef * Z² * ne * ni * (1 - exp(-hν/kT)) * g_ff / (sqrt(T) * ν³)
-        F_ν = 3.6919e8 * gaunt_ff * Z2 * jnp.sqrt(inv_T) / (frequency * frequency * frequency)
-        
-        # Include stimulated emission correction
-        stimulated_emission_factor = 1.0 - jnp.exp(-hν_div_kT)
-        
-        return ni * ne * F_ν * stimulated_emission_factor
+
+        F_ν = 3.6919e8 * gaunt_ff * Z2 * np.sqrt(inv_T) / (freq_arr * freq_arr * freq_arr)
+        stimulated_emission_factor = 1.0 - np.exp(-hν_div_kT)
+        alpha = ni * ne * F_ν * stimulated_emission_factor
+
+        if np.isscalar(frequency):
+            return float(alpha)
+        return alpha
 
 
 # Global instance
