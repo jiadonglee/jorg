@@ -2,8 +2,6 @@
 Helium continuum absorption implementations in JAX
 """
 
-import jax
-import jax.numpy as jnp
 from scipy.interpolate import RectBivariateSpline
 import numpy as np
 
@@ -11,13 +9,12 @@ from ..constants import kboltz_cgs, c_cgs
 from .utils import stimulated_emission_factor
 
 
-@jax.jit
 def he_minus_ff_absorption(
-    frequencies: jnp.ndarray,
+    frequencies: np.ndarray,
     temperature: float,
     n_he_i_div_u: float,
     electron_density: float
-) -> jnp.ndarray:
+) -> np.ndarray:
     """
     Calculate He^- free-free absorption coefficient
     
@@ -54,13 +51,17 @@ def he_minus_ff_absorption(
     # Direct port from Korg.jl/src/ContinuumAbsorption/absorption_He.jl:52-63
     
     # Convert frequency to wavelength in Angstroms
-    wavelength_A = c_cgs * 1e8 / frequency  # Å
+    wavelength_A = c_cgs * 1e8 / frequencies  # Å
     theta = 5040.0 / temperature  # Korg.jl parameter
     
     # Use John (1994) tabulated values as implemented in Korg.jl
     # This is the proper physics-based calculation
-    K_he_proper = _helium_free_free_john1994(wavelength_A, theta)
-    
+    K_he_proper = np.array([
+        _helium_free_free_john1994(float(wl), theta) for wl in np.atleast_1d(wavelength_A)
+    ])
+
+    if np.isscalar(wavelength_A):
+        return float(K_he_proper[0] * n_he_i_ground * P_e)
     return K_he_proper * n_he_i_ground * P_e
 
 

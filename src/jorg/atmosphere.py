@@ -353,51 +353,41 @@ def interpolate_marcs_from_abundances(Teff: float,
     Returns:
         ModelAtmosphere object
     """
-    # Extract metallicity parameters from A_X (simplified implementation)
-    # Full implementation would need proper abundance analysis
-    
-    # Import solar abundances for reference
-    from .lines.atomic_data import get_solar_abundance
-    
-    # Calculate [M/H] from iron abundance if available
-    if 26 in A_X:  # Iron
-        solar_Fe = get_solar_abundance(26)  # Use consistent solar abundance
-        m_H = A_X[26] - solar_Fe
+    # Follow Korg.jl interpolate_marcs(A_X) logic exactly.
+    from .abundances import DEFAULT_ALPHA_ELEMENTS, GREVESSE_2007_SOLAR_ABUNDANCES
+
+    solar_abundances = np.array(GREVESSE_2007_SOLAR_ABUNDANCES, dtype=float)
+
+    if isinstance(A_X, dict):
+        A_vec = np.array(solar_abundances, dtype=float)
+        for Z, value in A_X.items():
+            if 1 <= Z <= 92:
+                A_vec[Z - 1] = float(value)
     else:
-        m_H = 0.0
-    
-    # CRITICAL FIX: Calculate alpha enhancement from alpha elements
-    # Alpha elements: Mg (12), Si (14), Ca (20), Ti (22)
-    alpha_elements = [12, 14, 20, 22]
-    alpha_abundances = []
-    
-    for Z in alpha_elements:
-        if Z in A_X:
-            solar_Z = get_solar_abundance(Z)
-            # Calculate [X/Fe] = [X/H] - [Fe/H] = (A_X - solar_X) - m_H
-            X_Fe = (A_X[Z] - solar_Z) - m_H
-            alpha_abundances.append(X_Fe)
-    
-    # Average alpha enhancement [α/Fe]
-    if alpha_abundances:
-        alpha_m = np.mean(alpha_abundances)
-    else:
-        # Default alpha enhancement for metal-poor stars
-        # Typical trend: [α/Fe] ≈ 0.4 for [Fe/H] < -1.0
-        if m_H < -1.0:
-            alpha_m = 0.4
-        else:
-            alpha_m = 0.0
-    
-    # CRITICAL FIX: Calculate carbon abundance explicitly
-    if 6 in A_X:  # Carbon
-        solar_C = get_solar_abundance(6)
-        # [C/Fe] = [C/H] - [Fe/H]
-        C_m = (A_X[6] - solar_C) - m_H
-    else:
-        # Default carbon abundance relative to iron
+        A_vec = np.array(A_X, dtype=float)
+        if A_vec.shape[0] < 92:
+            raise ValueError("A_X must have at least 92 elements.")
+        A_vec = A_vec[:92]
+
+    def _get_multi_X_H(A_values, Zs, solar_values):
+        A_mX = np.log10(np.sum(10 ** A_values[np.array(Zs) - 1]))
+        A_mX_solar = np.log10(np.sum(10 ** solar_values[np.array(Zs) - 1]))
+        return A_mX - A_mX_solar
+
+    alpha_elements = list(DEFAULT_ALPHA_ELEMENTS)
+    metals = [Z for Z in range(3, 93) if Z not in ([6] + alpha_elements)]
+
+    m_H = _get_multi_X_H(A_vec, metals, solar_abundances)
+    alpha_H = _get_multi_X_H(A_vec, alpha_elements, solar_abundances)
+    C_H = A_vec[5] - solar_abundances[5]
+
+    alpha_m = alpha_H - m_H
+    C_m = C_H - m_H
+
+    if m_H < -2.5:
+        alpha_m = 0.4
         C_m = 0.0
-    
+
     return interpolate_marcs(Teff, logg, m_H, alpha_m, C_m, **kwargs)
 
 

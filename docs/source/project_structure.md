@@ -28,11 +28,9 @@ Jorg/
 │   │
 │   ├── 📁 lines/                         # Line absorption calculations
 │   │   ├── 📄 __init__.py                # Module exports
-│   │   ├── 📄 core.py                    # Main line_absorption() functions
 │   │   ├── 📄 hydrogen_lines.py          # 🌟 Sophisticated hydrogen line treatment
 │   │   ├── 📄 hydrogen_lines_simple.py   # Simplified hydrogen lines (Balmer focus)
 │   │   ├── 📄 linelist.py                # Linelist reading and parsing
-│   │   ├── 📄 opacity.py                 # Line opacity calculations
 │   │   ├── 📄 profiles.py                # Voigt, Gaussian, Lorentzian profiles
 │   │   ├── 📄 broadening.py              # Doppler, van der Waals, Stark broadening
 │   │   ├── 📄 species.py                 # Species identification and handling
@@ -150,7 +148,7 @@ Following Python best practices with the `src/` layout:
     ↓ calls
 🌡️ continuum/core.py ← continuum/hydrogen.py, helium.py, scattering.py
     ↓ combines with
-📊 lines/core.py ← lines/linelist.py, opacity.py, profiles.py
+📊 opacity/korg_line_processor.py ← lines/linelist.py, statmech/partition functions
     ↓ uses
 🔧 utils/math.py, wavelength_utils.py
     ↓ references
@@ -164,7 +162,8 @@ from jorg import synth, synthesize
 
 # Module-level imports
 from jorg.continuum import total_continuum_absorption
-from jorg.lines import total_line_absorption, LineList
+from jorg.lines import LineList
+from jorg.opacity.korg_line_processor import KorgLineProcessor
 
 # Utility imports
 from jorg.utils import air_to_vacuum, voigt_hjerting

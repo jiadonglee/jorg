@@ -7,5 +7,6 @@ exact architecture while using Jorg's validated physics implementations.
 """
 
 from .layer_processor import LayerProcessor
+from .korg_line_processor import KorgLineProcessor
 
-__all__ = ['LayerProcessor']
+__all__ = ['LayerProcessor', 'KorgLineProcessor']

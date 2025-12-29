@@ -1,16 +1,16 @@
 """
 Jorg: JAX-based stellar spectral synthesis package
-A high-performance implementation of Korg.jl using JAX
 
-Key Features:
-- 93.5% opacity agreement with Korg.jl (post H⁻ and H I bound-free fixes)
+A high-performance implementation of Korg.jl using JAX.
+
+Features:
+- 90-96.5% agreement with Korg.jl across stellar parameter space
 - Full Korg.jl API compatibility with synth() and synthesize()
 - Production-ready spectral synthesis for stellar surveys
-- JAX-optimized for GPU acceleration and automatic differentiation
-- Advanced chemical equilibrium with 0.2% accuracy
+- JAX-optimised for GPU acceleration and automatic differentiation
 """
 
-__version__ = "1.0.0"  # Production release - Korg.jl compatibility achieved
+__version__ = "0.1.0"
 __author__ = "Jorg Development Team"
 
 # Import main synthesis functions

@@ -637,27 +637,23 @@ def h2_plus_bf_ff_absorption(
     # Convert frequencies to wavelengths in Angstroms
     wavelengths = c_cgs * 1e8 / frequencies
     
-    # Get equilibrium constant and calculate H₂⁺ density
+    # Equilibrium constant K = n(H I) * n(H II) / n(H2+)
     K_h2plus = get_h2plus_equilibrium_constant(temperature)
-    
-    # Calculate H₂⁺ density using equilibrium constant
-    # H + H⁺ ⇌ H₂⁺ + e⁻
-    # K = [H₂⁺][e⁻] / ([H][H⁺])
-    # Assuming quasi-neutrality and typical stellar conditions
-    n_h2plus = K_h2plus * n_h_i * n_h_ii / (n_h_i + n_h_ii)  # Simple approximation
-    
+
     # Get cross-sections from Stancil 1994 data
     # Use regular loop instead of vmap to avoid JAX tracer issues
-    total_cross_sections = []
+    bf_cross_sections = []
+    ff_cross_sections = []
     for wl in wavelengths:
-        bf_cross = get_h2plus_bf_cross_section(float(wl), temperature)
-        ff_cross = get_h2plus_ff_cross_section(float(wl), temperature)
-        total_cross_sections.append(bf_cross + ff_cross)
-    
-    total_cross_sections = jnp.array(total_cross_sections)
-    
-    # Calculate absorption coefficient
-    alpha = n_h2plus * total_cross_sections
+        bf_cross_sections.append(get_h2plus_bf_cross_section(float(wl), temperature))
+        ff_cross_sections.append(get_h2plus_ff_cross_section(float(wl), temperature))
+
+    bf_cross_sections = jnp.array(bf_cross_sections)
+    ff_cross_sections = jnp.array(ff_cross_sections)
+
+    # Calculate absorption coefficient following Korg.jl:
+    # (σbf / K + σff) * n(H I) * n(H II)
+    alpha = (bf_cross_sections / K_h2plus + ff_cross_sections) * n_h_i * n_h_ii
     
     # Include stimulated emission if requested
     if include_stimulated_emission:

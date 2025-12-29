@@ -6,10 +6,12 @@
 
 Following the same strategy as `jorg.continuum`, we have successfully implemented the complete line absorption module for stellar spectral synthesis. The implementation achieves excellent accuracy compared to the reference Korg.jl implementation.
 
+NOTE: The legacy `line_absorption` pipeline documented below has been removed. Line opacity is now handled exclusively by KorgLineProcessor (`jorg/opacity/korg_line_processor.py`). The remaining content is historical.
+
 ### Key Components Implemented
 
 #### 1. **Core Functions**
-- `line_absorption()` - Main function matching `total_continuum_absorption` pattern
+- KorgLineProcessor - Korg.jl line_absorption algorithm (current path)
 - `line_profile()` - Exact translation of Korg.jl Voigt profile calculation
 - `voigt_hjerting()` - Complete Hunger 1965 approximation with all regimes
 
@@ -43,33 +45,7 @@ Comprehensive testing against Korg.jl reference data shows exceptional accuracy:
 
 ### API Usage
 
-```python
-from jorg.lines import line_absorption
-from jorg.lines.main import LineData, create_line_data
-
-# Create line data
-line = create_line_data(
-    wavelength_cm=5889.95e-8,  # Na D2 line
-    log_gf=0.108,
-    E_lower_eV=0.0,
-    species_id=11,  # Na I
-    gamma_rad=6.14e7,
-    gamma_stark=2.8e-5,
-    vdw_param1=1.4e-7,
-    vdw_param2=0.3
-)
-
-# Calculate line absorption
-alpha_lines = line_absorption(
-    wavelengths=wavelengths,        # JAX array of wavelengths in cm
-    linelist=[line],               # List of LineData structures  
-    temperature=5778.0,            # Temperature in K
-    electron_density=1e15,         # Electron density in cm^-3
-    number_densities={11: 1e10},   # Species densities in cm^-3
-    partition_functions={11: pf},  # Partition functions
-    microturbulent_velocity=1e5    # Microturbulence in cm/s
-)
-```
+Line opacity is computed through `synth`/`synthesize` via KorgLineProcessor.
 
 ### Performance Features
 

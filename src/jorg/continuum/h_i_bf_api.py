@@ -195,7 +195,7 @@ def H_I_bf_stellar(
     """
     if inv_u_h is None:
         # Calculate H I partition function automatically
-        from ..statmech.partition_functions import create_default_partition_functions
+        from ..statmech import create_default_partition_functions
         from ..statmech.species import Species
         
         h_i_species = Species.from_atomic_number(1, 0)

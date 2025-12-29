@@ -243,6 +243,21 @@ ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
     -0.54   # 92 U
 ])
 
+# Grevesse et al. 2007 solar abundances - matches Korg.jl grevesse_2007_solar_abundances
+# Source: /Users/jdli/Project/Korg.jl/src/atomic_data.jl lines 55-66
+GREVESSE_2007_SOLAR_ABUNDANCES = jnp.array([
+    12.00, 10.93, 1.05, 1.38, 2.70, 8.39, 7.78, 8.66, 4.56, 7.84,
+    6.17, 7.53, 6.37, 7.51, 5.36, 7.14, 5.50, 6.18, 5.08, 6.31,
+    3.17, 4.90, 4.00, 5.64, 5.39, 7.45, 4.92, 6.23, 4.21, 4.60,
+    2.88, 3.58, 2.29, 3.33, 2.56, 3.25, 2.60, 2.92, 2.21, 2.58,
+    1.42, 1.92, -5.00, 1.84, 1.12, 1.66, 0.94, 1.77, 1.60, 2.00,
+    1.00, 2.19, 1.51, 2.24, 1.07, 2.17, 1.13, 1.70, 0.58, 1.45,
+    -5.00, 1.00, 0.52, 1.11, 0.28, 1.14, 0.51, 0.93, 0.00, 1.08,
+    0.06, 0.88, -0.17, 1.11, 0.23, 1.25, 1.38, 1.64, 1.01, 1.13,
+    0.90, 2.00, 0.65, -5.00, -5.00, -5.00, -5.00, -5.00, -5.00, 0.06,
+    -5.00, -0.52
+])
+
 
 def format_abundances(default_metals_H=0.0, default_alpha_H=None, abundances=None,
                      solar_relative=True, solar_abundances=None, 

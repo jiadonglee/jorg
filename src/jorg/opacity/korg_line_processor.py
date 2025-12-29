@@ -253,7 +253,10 @@ class KorgLineProcessor:
         gf = 10.0**line.log_gf
         cross_section = self._sigma_line(line.wavelength)
         if debug:
-            print(f"        gf = {gf:.2e}, cross_section = {cross_section:.2e} cm²")
+            print(f"        log_gf = {line.log_gf:.3f}")
+            print(f"        gf = 10^{line.log_gf:.3f} = {gf:.3e}")
+            print(f"        cross_section (σ_line) = {cross_section:.3e} cm²")
+            print(f"        wavelength = {line.wavelength*1e8:.2f} Å = {line.wavelength:.3e} cm")
         
         # Get number density / partition function for this species  
         # VALD linelist species are already Jorg Species objects
@@ -266,44 +269,19 @@ class KorgLineProcessor:
             if debug:
                 print(f"        n_div_U found: mean = {np.mean(n_div_U_species):.2e}")
         else:
-            # Fallback for missing species - use a default value instead of excluding
+            # CRITICAL FIX: Skip lines for species not in chemical equilibrium
+            # Using fallback values causes HUGE windows for rare earth elements
+            # because tiny n_div_U → tiny amplitude → tiny rho_crit → huge window
             if debug or (self.verbose and hasattr(self, '_warned_species')):
                 if not hasattr(self, '_warned_species'):
                     self._warned_species = set()
                 if species_for_lookup not in self._warned_species:
-                    print(f"        ⚠️  WARNING: Species {species_for_lookup} not in n_div_U")
-                    print(f"            Available species in n_div_U: {list(n_div_U.keys())[:5]}...")
-                    print(f"            Using fallback n_div_U = 1e8")
+                    if debug:
+                        print(f"        ⚠️  WARNING: Species {species_for_lookup} not in n_div_U")
+                        print(f"            SKIPPING this line (not in chemical equilibrium)")
                     self._warned_species.add(species_for_lookup)
-            # FIXED: Use realistic species-dependent fallback densities
-            # The previous fallback of 1e8 was too high for molecular species
-            
-            # Check if this is a molecular species
-            is_molecule = False
-            if hasattr(species_for_lookup, 'formula') and species_for_lookup.formula:
-                try:
-                    # Check if formula has multiple atoms (molecule)
-                    if hasattr(species_for_lookup.formula, 'atoms') and len(species_for_lookup.formula.atoms) > 1:
-                        is_molecule = True
-                    elif hasattr(species_for_lookup.formula, 'components') and len(species_for_lookup.formula.components) > 1:
-                        is_molecule = True
-                except:
-                    pass
-            
-            # Species-dependent fallback densities
-            if is_molecule:
-                # Molecular species: very low abundance in stellar atmospheres
-                # C2, CN, CH, etc. typically have n_div_U ~ 1e3-1e5 in cool atmospheres
-                n_div_U_species = np.ones_like(temps) * 1e4  # Molecular fallback: 10,000× lower
-                if debug:
-                    print(f"            Using MOLECULAR fallback n_div_U = 1e4")
-            else:
-                # Atomic species: use previous fallback based on typical Fe I
-                # For Fe I at solar conditions: density ~1e13, partition function ~25 
-                # So n_div_U ~4e11. Use 1e8 as conservative lower bound
-                n_div_U_species = np.ones_like(temps) * 1e8  # Atomic fallback
-                if debug:
-                    print(f"            Using ATOMIC fallback n_div_U = 1e8")
+            # Return None to skip this line
+            return None
             
         amplitude = gf * cross_section * levels_factor * n_div_U_species
         if debug:
@@ -455,11 +433,11 @@ class KorgLineProcessor:
     
     def _is_molecule(self, species: Species) -> bool:
         """Check if species is a molecule"""
-        # Multiple ways to detect molecules
-        if hasattr(species, 'is_molecule') and species.is_molecule:
-            return True
-        if hasattr(species, 'formula') and species.formula is not None:
-            return True
+        # Prefer explicit molecule flags when available
+        if hasattr(species, 'is_molecule'):
+            return bool(species.is_molecule)
+        if hasattr(species, 'formula') and hasattr(species.formula, 'is_molecule'):
+            return bool(species.formula.is_molecule)
         # Check atomic number - molecules typically have atomic number > 92 in some systems
         if hasattr(species, 'element') and species.element > 92:
             return True
@@ -482,27 +460,16 @@ class KorgLineProcessor:
         sigma, alpha = vdW_param
         
         if alpha == -1:
-            # log10 enhancement factor (most common VALD format)
-            # gamma_vdW = 10^(log_factor) * approximate_vdW
-            # Use Unsöld approximation as base
-            from ..lines.broadening_korg import approximate_vdw_broadening
-            # Map VALD species to Jorg species for broadening calculation
-            jorg_species = self._map_vald_species_to_jorg(self.species)
-            # Calculate for a single temperature first, then scale
-            base_log_gamma = approximate_vdw_broadening(jorg_species, self.E_lower, 
-                                                       self.wavelength, temps[0])
-            base_gamma = 10**base_log_gamma if base_log_gamma > 0 else 1e-8
-            # Return array with proper shape for all temperature layers
-            return 10**sigma * base_gamma * np.power(temps / 10000.0, 0.3)
+            # gamma_vdW evaluated at 10,000 K (Korg.jl: scaled_vdW with vdW[2] == -1)
+            return sigma * np.power(temps / 10000.0, 0.3)
         elif alpha == -2:
             # Unsöld fudge factor (0 < value < 20)
             # Similar to above but with fudge factor multiplier
             from ..lines.broadening_korg import approximate_vdw_broadening
             # Map VALD species to Jorg species for broadening calculation
             jorg_species = self._map_vald_species_to_jorg(self.species)
-            base_log_gamma = approximate_vdw_broadening(jorg_species, self.E_lower,
-                                                       self.wavelength, temps[0])
-            base_gamma = 10**base_log_gamma if base_log_gamma > 0 else 1e-8
+            base_gamma = approximate_vdw_broadening(jorg_species, self.E_lower,
+                                                    self.wavelength, temps[0])
             # Return array with proper shape for all temperature layers
             return sigma * base_gamma * np.power(temps / 10000.0, 0.3)
         else:
@@ -562,39 +529,22 @@ class KorgLineProcessor:
         # Find wavelength bounds (Korg.jl lines 98-103)
         lb = np.searchsorted(wl_array_cm, line.wavelength - window_size)
         ub = np.searchsorted(wl_array_cm, line.wavelength + window_size, side='right')
-        
-        # FIXED: Check if line window actually overlaps with synthesis wavelength range
-        line_start = line.wavelength - window_size
-        line_end = line.wavelength + window_size
-        grid_start = wl_array_cm[0] 
-        grid_end = wl_array_cm[-1]
-        
-        # FIXED: Check overlap more carefully - include lines whose profiles extend into synthesis range
-        # Add a small buffer to account for numerical precision and extended wings
-        buffer_width = 0.5e-8  # 0.5 Å buffer in cm
-        extended_line_start = line.wavelength - window_size - buffer_width
-        extended_line_end = line.wavelength + window_size + buffer_width
-        
+
         if debug:
             print(f"        window_size = {window_size*1e8:.3f} Å")
-            print(f"        line range: {line_start*1e8:.2f} - {line_end*1e8:.2f} Å")
-            print(f"        grid range: {grid_start*1e8:.2f} - {grid_end*1e8:.2f} Å")
+            print(f"        line range: {(line.wavelength - window_size)*1e8:.2f} - {(line.wavelength + window_size)*1e8:.2f} Å")
+            print(f"        grid range: {wl_array_cm[0]*1e8:.2f} - {wl_array_cm[-1]*1e8:.2f} Å")
             print(f"        lb={lb}, ub={ub} (of {n_wavelengths} points)")
-        
-        # Only reject if line window completely outside synthesis range (with buffer)
-        if extended_line_end < grid_start or extended_line_start > grid_end:
-            if debug:
-                print(f"        ❌ REJECTED: Line outside wavelength range")
-            return None
-        
-        # Ensure bounds are valid
-        lb = max(0, lb)
-        ub = min(n_wavelengths, ub)
-        
+
+        # EXACT Korg.jl behavior (line 101-103): if lb > ub, skip the line
         if lb >= ub:
             if debug:
                 print(f"        ❌ REJECTED: Invalid bounds lb={lb} >= ub={ub}")
             return None
+
+        # Ensure bounds are within array limits
+        lb = max(0, lb)
+        ub = min(n_wavelengths, ub)
         
         if debug:
             print(f"        ✅ ACCEPTED: Will compute profile for {ub-lb} wavelength points")
@@ -616,42 +566,30 @@ class KorgLineProcessor:
     def _inverse_gaussian_density(self, rho: float, sigma: float) -> float:
         """
         Inverse Gaussian density function (Korg.jl lines 124-129)
-        
+
         Returns x such that ρ = exp(-0.5 x²/σ²) / √(2π)
-        
-        Fixed: Return minimum window size instead of 0.0 to prevent line exclusion
+
+        CRITICAL: Must return 0.0 for weak lines to match Korg.jl exactly
         """
         sqrt_2pi = np.sqrt(2 * PI)
-        # Increased minimum window to 0.5 Å to ensure lines are included
-        min_window_angstrom = 0.5e-8  # Convert Å to cm (0.5 Å = 100× typical spacing)
-        min_window = max(sigma * 3.0, min_window_angstrom)  # At least 3σ for numerical stability
-        
+
         if rho > 1.0 / (sqrt_2pi * sigma):
-            return min_window  # Prevent 0.0 window that excludes lines
+            return 0.0  # EXACT Korg.jl behavior: exclude weak lines
         else:
-            return max(min_window, sigma * np.sqrt(-2 * np.log(sqrt_2pi * sigma * rho)))
+            return sigma * np.sqrt(-2 * np.log(sqrt_2pi * sigma * rho))
     
     def _inverse_lorentz_density(self, rho: float, gamma: float) -> float:
         """
         Inverse Lorentz density function (Korg.jl lines 140-145)
-        
+
         Returns x such that ρ = 1 / (π γ (1 + x²/γ²))
-        
-        Fixed: Return minimum window size instead of 0.0 to prevent line exclusion
+
+        CRITICAL: Must return 0.0 for weak lines to match Korg.jl exactly
         """
-        # Increased minimum window to 0.5 Å to ensure lines are included
-        min_window_angstrom = 0.5e-8  # Convert Å to cm (0.5 Å = 100× typical spacing)
-        min_window = max(gamma * 3.0, min_window_angstrom)  # At least 3γ for numerical stability
-        
         if rho > 1.0 / (PI * gamma):
-            return min_window  # Prevent 0.0 window that excludes lines
+            return 0.0  # EXACT Korg.jl behavior: exclude weak lines
         else:
-            # CRITICAL FIX: Correct Korg.jl formula is γ/(π*ρ) - γ², not γ/(π*ρ - γ²)
-            # Additional safety check for numerical stability
-            inner = gamma / (PI * rho) - gamma*gamma
-            if inner <= 0:
-                return min_window
-            return max(min_window, np.sqrt(inner))
+            return np.sqrt(gamma / (PI * rho) - gamma * gamma)
     
     def _line_profile(self, lambda0: float, sigma: float, gamma: float, 
                      amplitude: float, wavelength: float) -> float:
