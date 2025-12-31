@@ -14,7 +14,9 @@ REFERENCE: /Users/jdli/Project/Korg.jl/src/line_absorption.jl
 """
 
 import numpy as np
+import jax
 import jax.numpy as jnp
+from jax.scipy.special import gamma as jax_gamma
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 
@@ -34,6 +36,80 @@ class KorgLineResult:
     lines_processed: int
     lines_windowed: int
     total_amplitude: float
+
+
+@jax.jit
+def _harris_series_vectorized_jax(v: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Vectorized Harris series coefficients for JAX."""
+    v2 = v * v
+    H0 = jnp.exp(-v2)
+
+    H1_case1 = -1.12470432 + (-0.15516677 + (3.288675912 + (-2.34357915 + 0.42139162 * v) * v) * v) * v
+    H1_case2 = -4.48480194 + (9.39456063 + (-6.61487486 + (1.98919585 - 0.22041650 * v) * v) * v) * v
+    H1_case3 = ((0.554153432 +
+                (0.278711796 + (-0.1883256872 + (0.042991293 - 0.003278278 * v) * v) * v) * v) /
+                (v2 - 1.5))
+
+    H1 = jnp.where(v < 1.3, H1_case1, jnp.where(v < 2.4, H1_case2, H1_case3))
+    H2 = (1.0 - 2.0 * v2) * H0
+
+    return H0, H1, H2
+
+
+@jax.jit
+def _voigt_hjerting_vectorized_jax(alpha: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+    """Vectorized Hjerting function with Korg.jl regime selection (JAX)."""
+    v2 = v * v
+    sqrt_pi = jnp.sqrt(PI)
+
+    alpha_safe = jnp.maximum(alpha, 1e-30)
+    v2_safe = jnp.maximum(v2, 1e-30)
+
+    mask1 = (alpha <= 0.2) & (v >= 5.0)
+    mask2 = (alpha <= 0.2) & (v < 5.0)
+    mask3 = (alpha > 0.2) & (alpha <= 1.4) & ((alpha + v) < 3.2)
+    mask4 = ~(mask1 | mask2 | mask3)
+
+    invv2 = 1.0 / v2_safe
+    result = jnp.zeros_like(v)
+
+    result = jnp.where(
+        mask1,
+        (alpha / sqrt_pi * invv2) * (1.0 + 1.5 * invv2 + 3.75 * invv2 * invv2),
+        result
+    )
+
+    H0, H1, H2 = _harris_series_vectorized_jax(v)
+    result = jnp.where(
+        mask2,
+        H0 + (H1 + H2 * alpha) * alpha,
+        result
+    )
+
+    M0 = H0
+    M1 = H1 + 2.0 / sqrt_pi * M0
+    M2 = H2 - M0 + 2.0 / sqrt_pi * M1
+    M3 = (2.0 / (3.0 * sqrt_pi)) * (1.0 - H2) - (2.0 / 3.0) * v2 * M1 + (2.0 / sqrt_pi) * M2
+    M4 = (2.0 / 3.0) * v2 * v2 * M0 - (2.0 / (3.0 * sqrt_pi)) * M1 + (2.0 / sqrt_pi) * M3
+    psi = 0.979895023 + (-0.962846325 + (0.532770573 - 0.122727278 * alpha) * alpha) * alpha
+    result = jnp.where(
+        mask3,
+        psi * (M0 + (M1 + (M2 + (M3 + M4 * alpha) * alpha) * alpha) * alpha),
+        result
+    )
+
+    r2 = v2_safe / (alpha_safe * alpha_safe)
+    alpha_invu = 1.0 / (jnp.sqrt(2.0) * ((r2 + 1.0) * alpha_safe))
+    alpha2_invu2 = alpha_invu * alpha_invu
+    result = jnp.where(
+        mask4,
+        jnp.sqrt(2.0 / PI) * alpha_invu * (
+            1.0 + (3.0 * r2 - 1.0 + ((r2 - 2.0) * 15.0 * r2 + 2.0) * alpha2_invu2) * alpha2_invu2
+        ),
+        result
+    )
+
+    return result
 
 
 class KorgLineProcessor:
@@ -56,7 +132,10 @@ class KorgLineProcessor:
                      linelist: List[Any],
                      microturbulence_cm_s: float,
                      continuum_opacity_fn: Optional[Any] = None,
-                     cutoff_threshold: float = 3e-4) -> KorgLineResult:
+                     continuum_opacity: Optional[np.ndarray] = None,
+                     cutoff_threshold: float = 3e-4,
+                     use_jax: bool = True,
+                     batch_size: int = 256) -> KorgLineResult:
         """
         Process all lines using exact Korg.jl algorithm
         
@@ -78,8 +157,14 @@ class KorgLineProcessor:
             Microturbulent velocity in cm/s (NOT km/s!)
         continuum_opacity_fn : callable, optional
             Function returning continuum opacity at wavelength
+        continuum_opacity : array_like, optional
+            Continuum opacity matrix [layers × wavelengths] for JAX windowing
         cutoff_threshold : float
             Line windowing threshold (default: 3e-4)
+        use_jax : bool
+            Use JAX-compiled line processing (recommended for speed)
+        batch_size : int
+            Number of lines to process per JAX batch
             
         Returns
         -------
@@ -107,14 +192,29 @@ class KorgLineProcessor:
             self._debug_line_count = 0
             self._warned_species = set()
         
-        # Initialize alpha matrix [layers × wavelengths]
-        alpha_matrix = np.zeros((n_layers, n_wavelengths))
-        
         # Calculate β = 1/(k*T) for all layers (Korg.jl line 36)
         beta = 1.0 / (kboltz_eV * temps)
         
         # Precompute n_div_U for all species (Korg.jl lines 38-41)
         n_div_U = self._compute_n_div_U(n_densities, partition_fns, temps)
+
+        if use_jax:
+            return self._process_lines_jax(
+                wl_array_cm=wl_array_cm,
+                temps=temps,
+                electron_densities=electron_densities,
+                n_densities=n_densities,
+                n_div_U=n_div_U,
+                linelist=linelist,
+                microturbulence_cm_s=microturbulence_cm_s,
+                continuum_opacity_fn=continuum_opacity_fn,
+                continuum_opacity=continuum_opacity,
+                cutoff_threshold=cutoff_threshold,
+                batch_size=batch_size
+            )
+
+        # Initialize alpha matrix [layers × wavelengths]
+        alpha_matrix = np.zeros((n_layers, n_wavelengths))
         
         # Process each line (Korg.jl lines 66-106)
         lines_processed = 0
@@ -149,16 +249,18 @@ class KorgLineProcessor:
             )
             
             if result is not None:
-                line_alpha, amplitude = result
-                alpha_matrix += line_alpha
+                lb, ub, line_alpha_window, amplitude = result
+                if lb < ub:
+                    alpha_matrix[:, lb:ub] += line_alpha_window
                 total_amplitude += amplitude
                 lines_processed += 1
                 
                 if debug_this_line:
-                    print(f"      ✅ ADDED: amplitude={amplitude:.2e}, max_alpha={np.max(line_alpha):.2e}")
+                    max_alpha = np.max(line_alpha_window) if line_alpha_window.size else 0.0
+                    print(f"      ✅ ADDED: amplitude={amplitude:.2e}, max_alpha={max_alpha:.2e}")
                 
                 # Check if line was windowed (truncated)
-                if np.any(line_alpha > 0):
+                if line_alpha_window.size and np.any(line_alpha_window > 0):
                     lines_windowed += 1
                     amplitude_values.append(amplitude)
             else:
@@ -212,10 +314,475 @@ class KorgLineProcessor:
                 n_div_U[species] = n_densities[species] / U_fallback
                 
         return n_div_U
+
+    def _resolve_continuum_opacity(self, wl_array_cm: np.ndarray,
+                                  continuum_opacity: Optional[np.ndarray],
+                                  continuum_opacity_fn: Optional[Any],
+                                  n_layers: int) -> Optional[np.ndarray]:
+        """
+        Resolve continuum opacity into a [layers × wavelengths] matrix.
+        """
+        if continuum_opacity is not None:
+            cont = np.asarray(continuum_opacity)
+            if cont.ndim == 1:
+                cont = cont[None, :]
+            return cont
+
+        if continuum_opacity_fn is None:
+            return None
+
+        samples = []
+        for wl_cm in wl_array_cm:
+            value = np.asarray(continuum_opacity_fn(wl_cm))
+            if value.ndim == 0:
+                value = np.full(n_layers, float(value))
+            samples.append(value)
+
+        return np.stack(samples, axis=1)
+
+    def _pack_linelist_arrays(self, linelist: List[Any], species_index: Dict[Species, int],
+                             temp_ref: float) -> Optional[Dict[str, np.ndarray]]:
+        """
+        Pack linelist objects into dense numpy arrays for JAX processing.
+        """
+        from ..lines.broadening_korg import approximate_vdw_broadening
+
+        wavelengths = []
+        log_gf = []
+        E_lower = []
+        gamma_rad = []
+        gamma_stark = []
+        vdw_sigma = []
+        vdw_alpha = []
+        vdw_base_gamma = []
+        species_idx = []
+        atomic_mass = []
+        is_molecule = []
+
+        warned = set()
+
+        for line in linelist:
+            species = line.species
+            idx = species_index.get(species)
+            if idx is None:
+                if self.verbose and species not in warned:
+                    print(f"       ⚠️  Skipping line species not in n_div_U: {species}")
+                    warned.add(species)
+                continue
+
+            wl_val = float(line.wavelength)
+            log_gf_val = float(line.log_gf)
+            E_lower_val = float(line.E_lower)
+
+            if not np.isfinite(wl_val) or wl_val <= 0.0:
+                if self.verbose:
+                    print("       ⚠️  Skipping line with invalid wavelength")
+                continue
+            if not np.isfinite(log_gf_val) or not np.isfinite(E_lower_val):
+                if self.verbose:
+                    print("       ⚠️  Skipping line with invalid log_gf/E_lower")
+                continue
+
+            gamma_rad_val = float(getattr(line, 'gamma_rad', 6.16e7))
+            if not np.isfinite(gamma_rad_val) or gamma_rad_val < 0:
+                gamma_rad_val = 6.16e7
+
+            gamma_stark_val = float(getattr(line, 'gamma_stark', 0.0))
+            if not np.isfinite(gamma_stark_val) or gamma_stark_val < 0:
+                gamma_stark_val = 0.0
+
+            if hasattr(line, 'vdW'):
+                vdW_param = line.vdW
+            elif hasattr(line, 'vdw_param1') and hasattr(line, 'vdw_param2'):
+                vdW_param = (line.vdw_param1, line.vdw_param2)
+            else:
+                vdW_param = (0.0, -1)
+
+            sigma, alpha = vdW_param
+            sigma = float(sigma)
+            alpha = float(alpha)
+            if not np.isfinite(sigma):
+                sigma = 0.0
+            if not np.isfinite(alpha):
+                alpha = -1.0
+            if sigma < 0.0:
+                sigma = 0.0
+
+            if alpha == -2:
+                base_gamma = approximate_vdw_broadening(
+                    self._map_vald_species_to_jorg(species),
+                    E_lower_val,
+                    wl_val,
+                    float(temp_ref)
+                )
+            else:
+                base_gamma = 1.0
+
+            wavelengths.append(wl_val)
+            log_gf.append(log_gf_val)
+            E_lower.append(E_lower_val)
+            gamma_rad.append(gamma_rad_val)
+            gamma_stark.append(gamma_stark_val)
+            vdw_sigma.append(sigma)
+            vdw_alpha.append(alpha)
+            vdw_base_gamma.append(float(base_gamma))
+            species_idx.append(int(idx))
+            atomic_mass.append(float(self._get_atomic_mass(species)))
+            is_molecule.append(bool(self._is_molecule(species)))
+
+        if not wavelengths:
+            return None
+
+        return {
+            "wavelength": np.asarray(wavelengths, dtype=np.float64),
+            "log_gf": np.asarray(log_gf, dtype=np.float64),
+            "E_lower": np.asarray(E_lower, dtype=np.float64),
+            "gamma_rad": np.asarray(gamma_rad, dtype=np.float64),
+            "gamma_stark": np.asarray(gamma_stark, dtype=np.float64),
+            "vdw_sigma": np.asarray(vdw_sigma, dtype=np.float64),
+            "vdw_alpha": np.asarray(vdw_alpha, dtype=np.float64),
+            "vdw_base_gamma": np.asarray(vdw_base_gamma, dtype=np.float64),
+            "species_idx": np.asarray(species_idx, dtype=np.int32),
+            "atomic_mass": np.asarray(atomic_mass, dtype=np.float64),
+            "is_molecule": np.asarray(is_molecule, dtype=bool)
+        }
+
+    def _compute_line_windows_numpy(self, wl_array_cm: np.ndarray, temps: np.ndarray,
+                                   electron_densities: np.ndarray, n_div_U_array: np.ndarray,
+                                   line_arrays: Dict[str, np.ndarray], microturbulence_cm_s: float,
+                                   continuum_opacity: Optional[np.ndarray], cutoff_threshold: float,
+                                   n_h_neutral: np.ndarray, float_dtype: type) -> Tuple[np.ndarray, np.ndarray, int, int, float]:
+        """
+        Compute line windows with vectorized numpy (no Python loops).
+        """
+        from scipy.special import gamma as scipy_gamma
+
+        n_layers = temps.shape[0]
+        n_wavelengths = wl_array_cm.shape[0]
+
+        line_wl = line_arrays["wavelength"].astype(float_dtype)
+        log_gf = line_arrays["log_gf"].astype(float_dtype)
+        E_lower = line_arrays["E_lower"].astype(float_dtype)
+        gamma_rad = line_arrays["gamma_rad"].astype(float_dtype)
+        gamma_stark = line_arrays["gamma_stark"].astype(float_dtype)
+        vdw_sigma = line_arrays["vdw_sigma"].astype(float_dtype)
+        vdw_alpha = line_arrays["vdw_alpha"].astype(float_dtype)
+        vdw_base_gamma = line_arrays["vdw_base_gamma"].astype(float_dtype)
+        species_idx = line_arrays["species_idx"]
+        atomic_mass = line_arrays["atomic_mass"].astype(float_dtype)
+        is_molecule = line_arrays["is_molecule"]
+
+        temps = temps.astype(float_dtype)
+        electron_densities = electron_densities.astype(float_dtype)
+        n_h_neutral = n_h_neutral.astype(float_dtype)
+        n_div_U_array = n_div_U_array.astype(float_dtype)
+
+        beta = 1.0 / (kboltz_eV * temps)
+        inv_mu_const = 1.0 / (1.008 * amu_cgs)
+
+        sigma = line_wl[:, None] * np.sqrt(
+            kboltz_cgs * temps[None, :] / atomic_mass[:, None] + (microturbulence_cm_s**2) / 2.0
+        ) / c_cgs
+
+        Gamma = gamma_rad[:, None] + temps[None, :] * 0.0
+
+        is_atom = (~is_molecule).astype(float_dtype)
+        stark = gamma_stark[:, None] * (temps[None, :] / 10000.0)**(1.0 / 6.0)
+        Gamma = Gamma + (electron_densities[None, :] * stark) * is_atom[:, None]
+
+        temp_vdw = (temps[None, :] / 10000.0)**0.3
+        vdw_simple = vdw_sigma[:, None] * temp_vdw
+        vdw_unsold = vdw_sigma[:, None] * vdw_base_gamma[:, None] * temp_vdw
+
+        inv_mu = inv_mu_const + 1.0 / atomic_mass
+        vbar = np.sqrt(8 * kboltz_cgs * temps[None, :] / PI * inv_mu[:, None])
+        gamma_factor = scipy_gamma((4.0 - vdw_alpha) / 2.0)
+        v0 = 1e6
+        vdw_abo = 2.0 * (4.0 / PI)**(vdw_alpha[:, None] / 2.0) * gamma_factor[:, None] * v0 * vdw_sigma[:, None] * (vbar / v0)**(1.0 - vdw_alpha[:, None])
+
+        vdw_gamma = np.where(
+            (vdw_alpha == -1)[:, None],
+            vdw_simple,
+            np.where((vdw_alpha == -2)[:, None], vdw_unsold, vdw_abo)
+        )
+        Gamma = Gamma + (n_h_neutral[None, :] * vdw_gamma) * is_atom[:, None]
+
+        gamma = Gamma * line_wl[:, None]**2 / (4.0 * PI * c_cgs)
+
+        E_upper = E_lower + hplanck_eV * c_cgs / line_wl
+        levels_factor = np.exp(-beta[None, :] * E_lower[:, None]) - np.exp(-beta[None, :] * E_upper[:, None])
+        gf = np.power(10.0, log_gf)
+        cross_section = (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs**2) * line_wl**2
+
+        n_div_U_lines = n_div_U_array[species_idx]
+        amplitude = gf[:, None] * cross_section[:, None] * levels_factor * n_div_U_lines
+        amplitude_safe = np.maximum(amplitude, 1e-50)
+
+        if continuum_opacity is None:
+            continuum_line = np.full_like(amplitude, 1e-6)
+        else:
+            continuum_opacity = np.asarray(continuum_opacity, dtype=float_dtype)
+            if continuum_opacity.ndim == 1:
+                continuum_opacity = continuum_opacity[None, :]
+            if n_wavelengths == 1:
+                continuum_line = np.tile(continuum_opacity[:, 0], (line_wl.shape[0], 1))
+            else:
+                idx = np.searchsorted(wl_array_cm, line_wl)
+                idx = np.clip(idx, 1, n_wavelengths - 1)
+                x0 = wl_array_cm[idx - 1]
+                x1 = wl_array_cm[idx]
+                dx = x1 - x0
+                frac = np.where(dx != 0.0, (line_wl - x0) / dx, 0.0)
+                cont0 = np.take(continuum_opacity, idx - 1, axis=1)
+                cont1 = np.take(continuum_opacity, idx, axis=1)
+                continuum_line = cont0 + (cont1 - cont0) * frac[None, :]
+                below = line_wl <= wl_array_cm[0]
+                above = line_wl >= wl_array_cm[-1]
+                continuum_line = np.where(below[None, :], continuum_opacity[:, 0][:, None], continuum_line)
+                continuum_line = np.where(above[None, :], continuum_opacity[:, -1][:, None], continuum_line)
+                continuum_line = continuum_line.T
+
+        rho_crit = (continuum_line * cutoff_threshold) / amplitude_safe
+
+        sigma_safe = np.maximum(sigma, 1e-30)
+        gamma_safe = np.maximum(gamma, 1e-30)
+        sqrt_2pi = np.sqrt(2.0 * PI)
+
+        threshold_g = 1.0 / (sqrt_2pi * sigma_safe)
+        safe_g = np.clip(sqrt_2pi * sigma_safe * rho_crit, 1e-300, 1.0)
+        doppler_val = sigma_safe * np.sqrt(-2.0 * np.log(safe_g))
+        doppler_windows = np.where(rho_crit <= threshold_g, doppler_val, 0.0)
+
+        threshold_l = 1.0 / (PI * gamma_safe)
+        safe_rho = np.maximum(rho_crit, 1e-300)
+        lorentz_val = np.sqrt(np.maximum(gamma_safe / (PI * safe_rho) - gamma_safe * gamma_safe, 0.0))
+        lorentz_windows = np.where(rho_crit <= threshold_l, lorentz_val, 0.0)
+
+        doppler_window = np.max(doppler_windows, axis=1)
+        lorentz_window = np.max(lorentz_windows, axis=1)
+        window_size = np.sqrt(lorentz_window**2 + doppler_window**2)
+
+        lb = np.searchsorted(wl_array_cm, line_wl - window_size)
+        ub = np.searchsorted(wl_array_cm, line_wl + window_size, side='right')
+        lb = np.maximum(lb, 0)
+        ub = np.minimum(ub, n_wavelengths)
+
+        window_len = np.maximum(ub - lb, 0)
+        max_window_pts = int(window_len.max()) if window_len.size else 0
+        lines_windowed = int(np.sum(window_len > 0))
+        total_amplitude = float(np.sum(amplitude.mean(axis=1)))
+
+        return lb.astype(np.int32), ub.astype(np.int32), max_window_pts, lines_windowed, total_amplitude
+
+    def _process_lines_jax(self, wl_array_cm: np.ndarray, temps: np.ndarray,
+                          electron_densities: np.ndarray, n_densities: Dict[Species, np.ndarray],
+                          n_div_U: Dict[Species, np.ndarray], linelist: List[Any],
+                          microturbulence_cm_s: float, continuum_opacity_fn: Optional[Any],
+                          continuum_opacity: Optional[np.ndarray], cutoff_threshold: float,
+                          batch_size: int) -> KorgLineResult:
+        """
+        JAX-compiled line processing with Korg.jl windowing and no Python loops.
+        """
+        n_layers = len(temps)
+        n_wavelengths = len(wl_array_cm)
+
+        continuum_opacity = self._resolve_continuum_opacity(
+            wl_array_cm, continuum_opacity, continuum_opacity_fn, n_layers
+        )
+
+        species_list = list(n_div_U.keys())
+        species_index = {species: idx for idx, species in enumerate(species_list)}
+        n_div_U_array = np.stack([n_div_U[species] for species in species_list], axis=0)
+
+        line_arrays = self._pack_linelist_arrays(linelist, species_index, temps[0])
+        if line_arrays is None:
+            return KorgLineResult(
+                alpha_matrix=np.zeros((n_layers, n_wavelengths)),
+                lines_processed=0,
+                lines_windowed=0,
+                total_amplitude=0.0
+            )
+
+        h_neutral = Species.from_atomic_number(1, 0)
+        n_h_neutral = n_densities.get(h_neutral, np.zeros(n_layers))
+
+        use_x64 = bool(jax.config.read("jax_enable_x64")) if hasattr(jax.config, "read") else False
+        float_dtype = np.float64 if use_x64 else np.float32
+
+        lb, ub, max_window_pts, lines_windowed, total_amplitude = self._compute_line_windows_numpy(
+            wl_array_cm=wl_array_cm,
+            temps=temps,
+            electron_densities=electron_densities,
+            n_div_U_array=n_div_U_array,
+            line_arrays=line_arrays,
+            microturbulence_cm_s=microturbulence_cm_s,
+            continuum_opacity=continuum_opacity,
+            cutoff_threshold=cutoff_threshold,
+            n_h_neutral=n_h_neutral,
+            float_dtype=float_dtype
+        )
+
+        lines_processed = line_arrays["wavelength"].shape[0]
+        if max_window_pts <= 0 or lines_processed == 0:
+            return KorgLineResult(
+                alpha_matrix=np.zeros((n_layers, n_wavelengths)),
+                lines_processed=lines_processed,
+                lines_windowed=0,
+                total_amplitude=total_amplitude
+            )
+
+        batch_size = int(max(1, batch_size))
+        max_elements = 2_000_000
+        batch_limit = max(1, int(max_elements / max(1, n_layers * max_window_pts)))
+        batch_size = min(batch_size, lines_processed, batch_limit)
+
+        pad = (-lines_processed) % batch_size
+        if pad:
+            def _pad(arr, pad_value=0):
+                return np.pad(arr, (0, pad), constant_values=pad_value)
+
+            line_arrays = {
+                "wavelength": _pad(line_arrays["wavelength"]),
+                "log_gf": _pad(line_arrays["log_gf"]),
+                "E_lower": _pad(line_arrays["E_lower"]),
+                "gamma_rad": _pad(line_arrays["gamma_rad"]),
+                "gamma_stark": _pad(line_arrays["gamma_stark"]),
+                "vdw_sigma": _pad(line_arrays["vdw_sigma"]),
+                "vdw_alpha": _pad(line_arrays["vdw_alpha"]),
+                "vdw_base_gamma": _pad(line_arrays["vdw_base_gamma"], pad_value=1.0),
+                "species_idx": _pad(line_arrays["species_idx"]),
+                "atomic_mass": _pad(line_arrays["atomic_mass"], pad_value=amu_cgs),
+                "is_molecule": _pad(line_arrays["is_molecule"], pad_value=False)
+            }
+            lb = _pad(lb)
+            ub = _pad(ub)
+
+        line_mask = np.ones(lines_processed, dtype=float_dtype)
+        if pad:
+            line_mask = np.pad(line_mask, (0, pad), constant_values=0.0)
+
+        n_lines_padded = line_arrays["wavelength"].shape[0]
+        n_batches = n_lines_padded // batch_size
+
+        wl_array_cm_j = jnp.asarray(wl_array_cm)
+        temps_j = jnp.asarray(temps)
+        electron_densities_j = jnp.asarray(electron_densities)
+        n_div_U_array_j = jnp.asarray(n_div_U_array)
+        n_h_neutral_j = jnp.asarray(n_h_neutral)
+
+        line_wl_j = jnp.asarray(line_arrays["wavelength"])
+        log_gf_j = jnp.asarray(line_arrays["log_gf"])
+        E_lower_j = jnp.asarray(line_arrays["E_lower"])
+        gamma_rad_j = jnp.asarray(line_arrays["gamma_rad"])
+        gamma_stark_j = jnp.asarray(line_arrays["gamma_stark"])
+        vdw_sigma_j = jnp.asarray(line_arrays["vdw_sigma"])
+        vdw_alpha_j = jnp.asarray(line_arrays["vdw_alpha"])
+        vdw_base_gamma_j = jnp.asarray(line_arrays["vdw_base_gamma"])
+        species_idx_j = jnp.asarray(line_arrays["species_idx"], dtype=jnp.int32)
+        atomic_mass_j = jnp.asarray(line_arrays["atomic_mass"])
+        is_molecule_j = jnp.asarray(line_arrays["is_molecule"], dtype=temps_j.dtype)
+        lb_j = jnp.asarray(lb, dtype=jnp.int32)
+        ub_j = jnp.asarray(ub, dtype=jnp.int32)
+        line_mask_j = jnp.asarray(line_mask, dtype=temps_j.dtype)
+
+        beta_j = 1.0 / (kboltz_eV * temps_j)
+        temp_stark = (temps_j / 10000.0)**(1.0 / 6.0)
+        temp_vdw = (temps_j / 10000.0)**0.3
+        temp_vbar = jnp.sqrt(8.0 * kboltz_cgs * temps_j / PI)
+        inv_mu_const = 1.0 / (1.008 * amu_cgs)
+        sigma_line_const = (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs**2)
+
+        arange_window = jnp.arange(max_window_pts, dtype=jnp.int32)
+
+        def batch_body(i, alpha_matrix):
+            start = i * batch_size
+            line_wl = jax.lax.dynamic_slice(line_wl_j, (start,), (batch_size,))
+            log_gf = jax.lax.dynamic_slice(log_gf_j, (start,), (batch_size,))
+            E_lower = jax.lax.dynamic_slice(E_lower_j, (start,), (batch_size,))
+            gamma_rad = jax.lax.dynamic_slice(gamma_rad_j, (start,), (batch_size,))
+            gamma_stark = jax.lax.dynamic_slice(gamma_stark_j, (start,), (batch_size,))
+            vdw_sigma = jax.lax.dynamic_slice(vdw_sigma_j, (start,), (batch_size,))
+            vdw_alpha = jax.lax.dynamic_slice(vdw_alpha_j, (start,), (batch_size,))
+            vdw_base_gamma = jax.lax.dynamic_slice(vdw_base_gamma_j, (start,), (batch_size,))
+            species_idx = jax.lax.dynamic_slice(species_idx_j, (start,), (batch_size,))
+            atomic_mass = jax.lax.dynamic_slice(atomic_mass_j, (start,), (batch_size,))
+            is_molecule = jax.lax.dynamic_slice(is_molecule_j, (start,), (batch_size,))
+            lb_b = jax.lax.dynamic_slice(lb_j, (start,), (batch_size,))
+            ub_b = jax.lax.dynamic_slice(ub_j, (start,), (batch_size,))
+            line_mask = jax.lax.dynamic_slice(line_mask_j, (start,), (batch_size,))
+
+            sigma = line_wl[:, None] * jnp.sqrt(
+                kboltz_cgs * temps_j[None, :] / atomic_mass[:, None] + (microturbulence_cm_s**2) / 2.0
+            ) / c_cgs
+            sigma = jnp.maximum(sigma, 1e-30)
+
+            is_atom = 1.0 - is_molecule
+            Gamma = gamma_rad[:, None] + is_atom[:, None] * (electron_densities_j[None, :] * (gamma_stark[:, None] * temp_stark[None, :]))
+
+            inv_mu = inv_mu_const + 1.0 / atomic_mass
+            vbar = temp_vbar[None, :] * jnp.sqrt(inv_mu[:, None])
+            gamma_factor = jax_gamma((4.0 - vdw_alpha) / 2.0)
+            v0 = 1e6
+            vdw_abo = 2.0 * (4.0 / PI)**(vdw_alpha[:, None] / 2.0) * gamma_factor[:, None] * v0 * vdw_sigma[:, None] * (vbar / v0)**(1.0 - vdw_alpha[:, None])
+            vdw_simple = vdw_sigma[:, None] * temp_vdw[None, :]
+            vdw_unsold = vdw_sigma[:, None] * vdw_base_gamma[:, None] * temp_vdw[None, :]
+            vdw_gamma = jnp.where(vdw_alpha[:, None] == -1.0, vdw_simple,
+                                  jnp.where(vdw_alpha[:, None] == -2.0, vdw_unsold, vdw_abo))
+            Gamma = Gamma + is_atom[:, None] * (n_h_neutral_j[None, :] * vdw_gamma)
+
+            gamma = Gamma * line_wl[:, None]**2 / (4.0 * PI * c_cgs)
+
+            E_upper = E_lower + hplanck_eV * c_cgs / line_wl
+            levels_factor = jnp.exp(-beta_j[None, :] * E_lower[:, None]) - jnp.exp(-beta_j[None, :] * E_upper[:, None])
+            gf = jnp.power(10.0, log_gf)
+            cross_section = sigma_line_const * line_wl**2
+            n_div_U_line = n_div_U_array_j[species_idx]
+            amplitude = gf[:, None] * cross_section[:, None] * levels_factor * n_div_U_line
+            amplitude = amplitude * line_mask[:, None]
+
+            inv_sigma_sqrt2 = 1.0 / (sigma * jnp.sqrt(2.0))
+            scaling = inv_sigma_sqrt2 / jnp.sqrt(PI) * amplitude
+            alpha = gamma * inv_sigma_sqrt2
+
+            window_idx = lb_b[:, None] + arange_window[None, :]
+            window_mask = window_idx < ub_b[:, None]
+            window_idx_clipped = jnp.clip(window_idx, 0, n_wavelengths - 1)
+            wl_window = jnp.take(wl_array_cm_j, window_idx_clipped)
+
+            v = jnp.abs(wl_window[:, None, :] - line_wl[:, None, None]) * inv_sigma_sqrt2[:, :, None]
+            voigt_values = _voigt_hjerting_vectorized_jax(alpha[:, :, None], v)
+            line_alpha = voigt_values * scaling[:, :, None]
+            line_alpha = jnp.nan_to_num(line_alpha, nan=0.0, posinf=0.0, neginf=0.0)
+
+            line_alpha = line_alpha * window_mask[:, None, :] * line_mask[:, None, None]
+            alpha_matrix = alpha_matrix.at[:, window_idx_clipped].add(jnp.transpose(line_alpha, (1, 0, 2)))
+
+            return alpha_matrix
+
+        def run_batches(alpha_init):
+            return jax.lax.fori_loop(0, n_batches, batch_body, alpha_init)
+
+        alpha_init = jnp.zeros((n_layers, n_wavelengths), dtype=temps_j.dtype)
+        alpha_matrix_j = jax.jit(run_batches)(alpha_init)
+
+        alpha_matrix = np.asarray(alpha_matrix_j)
+
+        if self.verbose:
+            max_opacity = np.max(alpha_matrix) if alpha_matrix.size else 0.0
+            print(f"   ✅ JAX processed: {lines_processed} lines")
+            print(f"   ✅ JAX contributing: {lines_windowed} lines")
+            print(f"   ✅ JAX max line opacity: {max_opacity:.2e} cm⁻¹")
+
+        return KorgLineResult(
+            alpha_matrix=alpha_matrix,
+            lines_processed=lines_processed,
+            lines_windowed=lines_windowed,
+            total_amplitude=total_amplitude
+        )
     
     def _process_single_line(self, line, wl_array_cm, temps, electron_densities, 
                            n_densities, n_div_U, beta, microturbulence_cm_s,
-                           continuum_opacity_fn, cutoff_threshold, debug=False) -> Optional[Tuple[np.ndarray, float]]:
+                           continuum_opacity_fn, cutoff_threshold, debug=False) -> Optional[Tuple[int, int, np.ndarray, float]]:
         """
         Process a single line following Korg.jl algorithm exactly (lines 66-106)
         
@@ -493,7 +1060,7 @@ class KorgLineProcessor:
         return (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs**2) * wavelength_cm**2
     
     def _apply_windowing(self, line, wl_array_cm, sigma, gamma, amplitude, 
-                        continuum_opacity_fn, cutoff_threshold, debug=False) -> Optional[Tuple[np.ndarray, float]]:
+                        continuum_opacity_fn, cutoff_threshold, debug=False) -> Optional[Tuple[int, int, np.ndarray, float]]:
         """
         Apply Korg.jl line windowing algorithm (lines 92-105)
         """
@@ -515,11 +1082,9 @@ class KorgLineProcessor:
             print(f"        cutoff_threshold = {cutoff_threshold:.0e}")
             print(f"        rho_crit = {np.mean(rho_crit):.2e} (mean)")
         
-        # Calculate window sizes (Korg.jl lines 93-97)  
-        doppler_windows = np.array([self._inverse_gaussian_density(rho, sig) 
-                                   for rho, sig in zip(rho_crit, sigma)])
-        lorentz_windows = np.array([self._inverse_lorentz_density(rho, gam)
-                                   for rho, gam in zip(rho_crit, gamma)])
+        # Calculate window sizes (Korg.jl lines 93-97)
+        doppler_windows = self._inverse_gaussian_density_vec(rho_crit, sigma)
+        lorentz_windows = self._inverse_lorentz_density_vec(rho_crit, gamma)
         
         # Combined window size (Korg.jl line 97)
         doppler_window = np.max(doppler_windows)
@@ -550,18 +1115,12 @@ class KorgLineProcessor:
             print(f"        ✅ ACCEPTED: Will compute profile for {ub-lb} wavelength points")
         
         # Calculate line profiles (Korg.jl line 105)
-        line_alpha_matrix = np.zeros((n_layers, n_wavelengths))
         wl_window = wl_array_cm[lb:ub]
+        line_alpha_window = self._line_profile_matrix(
+            line.wavelength, sigma, gamma, amplitude, wl_window
+        )
         
-        for layer_idx in range(n_layers):
-            for wl_idx, wl in enumerate(wl_window):
-                profile_value = self._line_profile(
-                    line.wavelength, sigma[layer_idx], gamma[layer_idx], 
-                    amplitude[layer_idx], wl
-                )
-                line_alpha_matrix[layer_idx, lb + wl_idx] = profile_value
-        
-        return line_alpha_matrix, np.mean(amplitude)
+        return lb, ub, line_alpha_window, np.mean(amplitude)
     
     def _inverse_gaussian_density(self, rho: float, sigma: float) -> float:
         """
@@ -590,6 +1149,40 @@ class KorgLineProcessor:
             return 0.0  # EXACT Korg.jl behavior: exclude weak lines
         else:
             return np.sqrt(gamma / (PI * rho) - gamma * gamma)
+
+    def _inverse_gaussian_density_vec(self, rho: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+        """
+        Vectorized inverse Gaussian density function.
+        """
+        sqrt_2pi = np.sqrt(2 * PI)
+        threshold = 1.0 / (sqrt_2pi * sigma)
+        out = np.zeros_like(rho)
+        mask = rho <= threshold
+        safe = sqrt_2pi * sigma[mask] * rho[mask]
+        out[mask] = sigma[mask] * np.sqrt(-2 * np.log(safe))
+        return out
+
+    def _inverse_lorentz_density_vec(self, rho: np.ndarray, gamma: np.ndarray) -> np.ndarray:
+        """
+        Vectorized inverse Lorentz density function.
+        """
+        threshold = 1.0 / (PI * gamma)
+        out = np.zeros_like(rho)
+        mask = rho <= threshold
+        out[mask] = np.sqrt(gamma[mask] / (PI * rho[mask]) - gamma[mask] * gamma[mask])
+        return out
+
+    def _line_profile_matrix(self, lambda0: float, sigma: np.ndarray, gamma: np.ndarray,
+                             amplitude: np.ndarray, wavelengths: np.ndarray) -> np.ndarray:
+        """
+        Vectorized Voigt line profile over all layers and wavelength points.
+        """
+        inv_sigma_sqrt2 = 1.0 / (sigma * np.sqrt(2.0))
+        scaling = inv_sigma_sqrt2 / np.sqrt(PI) * amplitude
+        alpha = gamma * inv_sigma_sqrt2
+        v = np.abs(wavelengths[None, :] - lambda0) * inv_sigma_sqrt2[:, None]
+        voigt_values = self._voigt_hjerting_vectorized(alpha[:, None], v)
+        return voigt_values * scaling[:, None]
     
     def _line_profile(self, lambda0: float, sigma: float, gamma: float, 
                      amplitude: float, wavelength: float) -> float:
@@ -606,6 +1199,71 @@ class KorgLineProcessor:
         
         voigt_value = self._voigt_hjerting(alpha, v)
         return voigt_value * scaling
+
+    def _voigt_hjerting_vectorized(self, alpha: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """
+        Vectorized Voigt-Hjerting function with Korg.jl regime selection.
+        """
+        if alpha.shape != v.shape:
+            alpha = np.broadcast_to(alpha, v.shape)
+        v2 = v * v
+        sqrt_pi = np.sqrt(PI)
+
+        result = np.zeros_like(v)
+
+        mask1 = (alpha <= 0.2) & (v >= 5.0)
+        if np.any(mask1):
+            invv2 = 1.0 / v2[mask1]
+            result[mask1] = (alpha[mask1] / sqrt_pi * invv2) * (
+                1.0 + 1.5 * invv2 + 3.75 * invv2 * invv2
+            )
+
+        mask2 = (alpha <= 0.2) & (v < 5.0)
+        mask3 = (alpha > 0.2) & (alpha <= 1.4) & ((alpha + v) < 3.2)
+        if np.any(mask2) or np.any(mask3):
+            H0, H1, H2 = self._harris_series_vectorized(v)
+            if np.any(mask2):
+                result[mask2] = H0[mask2] + (H1[mask2] + H2[mask2] * alpha[mask2]) * alpha[mask2]
+            if np.any(mask3):
+                M0 = H0
+                M1 = H1 + 2.0 / sqrt_pi * M0
+                M2 = H2 - M0 + 2.0 / sqrt_pi * M1
+                M3 = (2.0 / (3.0 * sqrt_pi)) * (1.0 - H2) - (2.0 / 3.0) * v2 * M1 + (2.0 / sqrt_pi) * M2
+                M4 = (2.0 / 3.0) * v2 * v2 * M0 - (2.0 / (3.0 * sqrt_pi)) * M1 + (2.0 / sqrt_pi) * M3
+
+                psi = 0.979895023 + (-0.962846325 + (0.532770573 - 0.122727278 * alpha) * alpha) * alpha
+                result[mask3] = psi[mask3] * (
+                    M0[mask3] + (M1[mask3] + (M2[mask3] + (M3[mask3] + M4[mask3] * alpha[mask3]) * alpha[mask3]) * alpha[mask3]) * alpha[mask3]
+                )
+
+        mask4 = ~(mask1 | mask2 | mask3)
+        if np.any(mask4):
+            r2 = v2[mask4] / (alpha[mask4] * alpha[mask4])
+            alpha_invu = 1.0 / (np.sqrt(2.0) * ((r2 + 1.0) * alpha[mask4]))
+            alpha2_invu2 = alpha_invu * alpha_invu
+            result[mask4] = (np.sqrt(2.0 / PI) * alpha_invu * (
+                1.0 + (3.0 * r2 - 1.0 + ((r2 - 2.0) * 15.0 * r2 + 2.0) * alpha2_invu2) * alpha2_invu2
+            ))
+
+        return result
+
+    def _harris_series_vectorized(self, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Vectorized Harris series coefficients.
+        """
+        v2 = v * v
+        H0 = np.exp(-v2)
+
+        H1_case1 = -1.12470432 + (-0.15516677 + (3.288675912 + (-2.34357915 + 0.42139162 * v) * v) * v) * v
+        H1_case2 = -4.48480194 + (9.39456063 + (-6.61487486 + (1.98919585 - 0.22041650 * v) * v) * v) * v
+        H1_case3 = ((0.554153432 +
+                    (0.278711796 + (-0.1883256872 + (0.042991293 - 0.003278278 * v) * v) * v) * v) /
+                    (v2 - 3.0 / 2.0))
+
+        H1 = np.where(v < 1.3, H1_case1, np.where(v < 2.4, H1_case2, H1_case3))
+        H2 = (1.0 - 2.0 * v2) * H0
+
+        return H0, H1, H2
     
     def _voigt_hjerting(self, alpha: float, v: float) -> float:
         """

@@ -147,9 +147,6 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
     else:
         wl_array_cm = np.array([ALPHA_5000_WL_CM])
 
-        def continuum_opacity_fn(_wl_cm):
-            return alpha5_continuum
-
         processor = KorgLineProcessor(verbose=verbose)
         result = processor.process_lines(
             wl_array_cm=wl_array_cm,
@@ -159,7 +156,7 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
             partition_fns=partition_funcs,
             linelist=linelist5,
             microturbulence_cm_s=microturbulence_kms * 1e5,
-            continuum_opacity_fn=continuum_opacity_fn,
+            continuum_opacity=alpha5_continuum[:, None],
             cutoff_threshold=line_cutoff_threshold
         )
         alpha5_ref = alpha5_continuum + result.alpha_matrix[:, 0]

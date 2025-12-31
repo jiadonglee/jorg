@@ -24,7 +24,27 @@ Usage:
 import jax
 import jax.numpy as jnp
 from typing import Union, Optional
-from .nahar_h_i_bf import nahar_h_i_bf_absorption_single_level
+from .nahar_h_i_bf import nahar_h_i_bf_absorption_single_level, CHI_H_EV
+from .utils import stimulated_emission_factor
+from ..constants import kboltz_eV, hplanck_eV, RydbergH_eV
+from ..statmech.hummer_mihalas import hummer_mihalas_w
+
+
+def simple_hydrogen_bf_cross_section(n_level: int, frequencies: jnp.ndarray) -> jnp.ndarray:
+    """
+    Simple high-n H I bound-free cross-section (Kurucz 1970 eq. 5.5).
+
+    Returns cross-sections in megabarns (Mb). This is used for n > n_max_MHD.
+    """
+    inv_n = 1.0 / n_level
+    inv_n2 = inv_n * inv_n
+    threshold_energy = RydbergH_eV * inv_n2
+
+    photon_energy = hplanck_eV * frequencies
+    safe_freq = jnp.maximum(frequencies, 1e-30)
+    bf_sigma_const = 2.815e29
+    sigma = bf_sigma_const * (inv_n2 * inv_n2 * inv_n) * (safe_freq ** -3.0) * 1e18
+    return jnp.where(photon_energy < threshold_energy, 0.0, sigma)
 
 
 def H_I_bf(
@@ -124,6 +144,23 @@ def H_I_bf(
         
         # Add to total
         total_alpha += alpha_n
+
+    # Add high-n tail (n > n_max_MHD) using analytic cross-sections
+    stim_emission = stimulated_emission_factor(frequencies, temperature)
+    alpha_tail = jnp.zeros_like(frequencies, dtype=jnp.float64)
+    for n_level in range(n_max_MHD + 1, 41):
+        w_lower = hummer_mihalas_w(temperature, float(n_level), n_h_i, n_he_i, electron_density,
+                                   use_hubeny_generalization=use_hubeny_generalization)
+        active = w_lower >= 1e-5
+        occupation_prob = (
+            2.0 * (n_level ** 2) * w_lower *
+            jnp.exp(-CHI_H_EV * (1.0 - 1.0 / n_level ** 2) / (kboltz_eV * temperature))
+        )
+        sigma_simple = simple_hydrogen_bf_cross_section(n_level, frequencies)
+        alpha_tail += jnp.where(active, occupation_prob * sigma_simple, 0.0)
+
+    alpha_tail *= n_h_i * inv_u_h * stim_emission * 1e-18
+    total_alpha += alpha_tail
     
     return total_alpha
 

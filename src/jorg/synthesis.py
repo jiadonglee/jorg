@@ -292,6 +292,8 @@ def synthesize_korg_compatible(
     use_chemical_equilibrium_from: Optional['SynthesisResult'] = None,
     logg: float = 4.44,
     rectify: bool = False,
+    rectify_mode: str = "continuum",
+    rectify_percentile: float = 99.5,
     verbose: bool = False,
     debug_mode: bool = False,
     export_intermediate_results: bool = False
@@ -352,6 +354,11 @@ def synthesize_korg_compatible(
         Reuse chemical equilibrium from previous calculation
     rectify : bool, default=False
         Whether to normalize flux by continuum (return rectified spectrum)
+    rectify_mode : str, default="continuum"
+        Rectification method: "continuum" for physical continuum normalization,
+        "pseudo" for percentile-based renormalization to unity.
+    rectify_percentile : float, default=99.5
+        Percentile used for pseudo-continuum renormalization when rectify_mode="pseudo".
     verbose : bool, default=False
         Print progress information
     debug_mode : bool, default=False
@@ -384,6 +391,9 @@ def synthesize_korg_compatible(
     # Initialize debug data structure
     debug_data = {} if debug_mode else None
     intermediate_results = {} if export_intermediate_results else None
+
+    if rectify_mode not in ("continuum", "pseudo"):
+        raise ValueError(f"rectify_mode must be 'continuum' or 'pseudo', got {rectify_mode!r}")
     
     if verbose:
         print("🚀 KORG-COMPATIBLE JORG SYNTHESIS")
@@ -632,7 +642,9 @@ def synthesize_korg_compatible(
         layer_processor, linelist, line_buffer, hydrogen_lines, vmic, abs_abundances,
         use_chemical_equilibrium_from, log_g, rectify, rt_method, verbose,
         alpha_continuum=alpha_continuum,  # Pass pre-calculated continuum opacity
-        line_cutoff_threshold=line_cutoff_threshold
+        line_cutoff_threshold=line_cutoff_threshold,
+        rectify_mode=rectify_mode,
+        rectify_percentile=rectify_percentile
     )
     
     if verbose:
@@ -672,6 +684,16 @@ def synthesize_korg_compatible(
 
 # Helper functions moved to LayerProcessor class for better organization
 
+def _normalize_rectified_flux(flux: np.ndarray, percentile: float = 99.5, min_scale: float = 1e-6):
+    """
+    Renormalize rectified flux to unity using a high-percentile scale.
+    """
+    pct = float(np.clip(percentile, 0.0, 100.0))
+    scale = float(np.percentile(flux, pct))
+    if not np.isfinite(scale) or scale <= min_scale:
+        return flux, 1.0
+    return flux / scale, scale
+
 
 def _setup_mu_grid(mu_values):
     """Setup μ grid for radiative transfer using exact Korg.jl method"""
@@ -707,24 +729,8 @@ def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, numb
     if not relevant_lines:
         return np.zeros((n_layers, n_wavelengths))
 
-    if continuum_opacity is None:
-        continuum_opacity_fn = None
-    else:
+    if continuum_opacity is not None:
         continuum_opacity = np.asarray(continuum_opacity)
-
-        def continuum_opacity_fn(wl_cm):
-            wl_ang = wl_cm * 1e8
-            if wl_ang <= wl_array[0]:
-                return continuum_opacity[:, 0]
-            if wl_ang >= wl_array[-1]:
-                return continuum_opacity[:, -1]
-            idx = np.searchsorted(wl_array, wl_ang)
-            x0 = wl_array[idx - 1]
-            x1 = wl_array[idx]
-            y0 = continuum_opacity[:, idx - 1]
-            y1 = continuum_opacity[:, idx]
-            frac = (wl_ang - x0) / (x1 - x0)
-            return y0 + frac * (y1 - y0)
 
     processor = KorgLineProcessor(verbose=verbose)
     result = processor.process_lines(
@@ -735,7 +741,7 @@ def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, numb
         partition_fns=partition_funcs,
         linelist=relevant_lines,
         microturbulence_cm_s=microturbulence_kms * 1e5,
-        continuum_opacity_fn=continuum_opacity_fn,
+        continuum_opacity=continuum_opacity,
         cutoff_threshold=cutoff_threshold
     )
 
@@ -745,7 +751,8 @@ def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, numb
 def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_scheme, return_cntm, A_X,
                                 layer_processor, linelist, line_buffer, hydrogen_lines, vmic, abs_abundances,
                                 use_chemical_equilibrium_from, log_g, rectify, rt_method="korg_default", verbose=False,
-                                alpha_continuum=None, line_cutoff_threshold=3e-4):
+                                alpha_continuum=None, line_cutoff_threshold=3e-4,
+                                rectify_mode="continuum", rectify_percentile=99.5):
     """
     Korg.jl-compatible radiative transfer using exact analytical methods
     
@@ -789,17 +796,25 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
         print(f"   Example: B_λ({wl_mid*1e8:.0f}Å, {T_surface:.0f}K) = {B_mid:.3e} erg/s/cm²/cm/sr")
     
     # CRITICAL FIX: Calculate proper α5 reference instead of np.ones()
-    alpha5_reference = calculate_alpha5_reference(
-        atm,
-        A_X,
-        linelist=linelist,
-        number_densities=layer_processor.all_number_densities,
-        electron_densities=layer_processor.all_electron_densities,
-        partition_funcs=layer_processor.partition_funcs,
-        microturbulence_kms=vmic,
-        line_cutoff_threshold=line_cutoff_threshold,
-        verbose=False
-    )
+    alpha5_reference = None
+    if alpha_continuum is not None:
+        wl_array = np.asarray(wavelengths)
+        idx_matches = np.where(np.isclose(wl_array, 5000.0, atol=1e-6))[0]
+        if idx_matches.size:
+            alpha5_reference = alpha_matrix[:, idx_matches[0]]
+
+    if alpha5_reference is None:
+        alpha5_reference = calculate_alpha5_reference(
+            atm,
+            A_X,
+            linelist=linelist,
+            number_densities=layer_processor.all_number_densities,
+            electron_densities=layer_processor.all_electron_densities,
+            partition_funcs=layer_processor.partition_funcs,
+            microturbulence_kms=vmic,
+            line_cutoff_threshold=line_cutoff_threshold,
+            verbose=False
+        )
     
     # Use exact Korg.jl radiative transfer (validated to 0.4% agreement)
     # Pass the number of mu points (typically 20) to let RT function generate optimal grid
@@ -922,6 +937,13 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
                     print("     ℹ️  Note: Continuum-only synthesis produces flat rectified spectra")
                     print("          This is expected behavior. Use linelist for spectral features.")
             
+            # Optional pseudo-continuum normalization for line-blanketed regions
+            if rectify_mode == "pseudo":
+                flux, scale = _normalize_rectified_flux(flux, percentile=rectify_percentile)
+                flux = np.minimum(flux, 2.0)
+                if verbose:
+                    print(f"     Pseudo-continuum scale: {scale:.6f}")
+
             # Normalize continuum to 1.0 when rectifying
             continuum = np.ones_like(continuum)
         
@@ -977,7 +999,8 @@ def synthesize(atm, linelist=None, A_X=None, wavelengths=(4000.0, 7000.0),
 
 
 def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0), 
-          linelist=None, rectify=True, R=float('inf'), vsini=0, vmic=1.0,
+          linelist=None, rectify=True, rectify_mode="continuum", rectify_percentile=99.5,
+          R=float('inf'), vsini=0, vmic=1.0,
           hydrogen_lines=True, mu_points=20, 
           rt_method="korg_default", use_cubic_interpolation=False,
           use_exact_partition_functions=True, use_full_molecular_equilibrium=True,
@@ -1013,6 +1036,10 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
     rectify : bool, optional
         If True, normalize flux by continuum (0-1 scale) - matches Korg.jl default
         If False, return in physical units (flux ~ 10¹⁵ erg/s/cm²/Å)
+    rectify_mode : str, optional
+        Rectification method: "continuum" (physical) or "pseudo" (percentile-based).
+    rectify_percentile : float, optional
+        Percentile used for pseudo-continuum renormalization.
     R : float or callable, optional
         Resolution R=λ/Δλ for automatic LSF application (default: no LSF)
         If callable, should take wavelength and return resolving power
@@ -1097,6 +1124,8 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
     # Add NEW parameters to synthesize_kwargs
     synthesize_kwargs['rt_method'] = rt_method
     synthesize_kwargs['use_cubic_interpolation'] = use_cubic_interpolation
+    synthesize_kwargs.setdefault('rectify_mode', rectify_mode)
+    synthesize_kwargs.setdefault('rectify_percentile', rectify_percentile)
     
     # Handle partition functions
     if use_exact_partition_functions and create_exact_partition_functions is not None:

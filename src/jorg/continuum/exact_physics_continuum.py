@@ -29,7 +29,7 @@ from functools import partial
 # Import all exact physics implementations
 from .mclaughlin_hminus import mclaughlin_hminus_bf_absorption
 from .metals_bf import metal_bf_absorption
-from .nahar_h_i_bf import nahar_h_i_bf_absorption_single_level
+from .h_i_bf_api import H_I_bf
 from .hydrogen import h_minus_ff_absorption, h2_plus_bf_ff_absorption
 from .helium import he_minus_ff_absorption
 from .positive_ion_ff import positive_ion_ff_absorption
@@ -118,7 +118,7 @@ def total_continuum_absorption_exact_physics_only(
     electron_density: float,
     number_densities: Dict,
     include_nahar_h_i: bool = True,
-    include_mhd: bool = True,
+    include_mhd: bool = False,
     n_levels_max: int = 6,
     verbose: bool = False
 ) -> jnp.ndarray:
@@ -150,7 +150,8 @@ def total_continuum_absorption_exact_physics_only(
     include_nahar_h_i : bool, optional
         Use exact Nahar 2021 H I cross-sections (default: True)
     include_mhd : bool, optional
-        Include MHD level dissolution effects (default: True)
+        Apply MHD to the Lyman series (n=1). MHD is always used for n>1
+        to match Korg.jl (default: False).
     n_levels_max : int, optional
         Maximum n level for H I calculations (default: 6)
     verbose : bool, optional
@@ -298,26 +299,19 @@ def total_continuum_absorption_exact_physics_only(
     if include_nahar_h_i:
         if verbose:
             print(f"7. Adding Nahar 2021 H I bound-free (n=1-{n_levels_max})...")
-        
-        alpha_h_i_bf_total = jnp.zeros_like(frequencies, dtype=jnp.float64)
-        
-        for n_level in range(1, n_levels_max + 1):
-            alpha_h_i_n = nahar_h_i_bf_absorption_single_level(
-                frequencies=frequencies,
-                temperature=temperature,
-                n_h_i=n_h_i,
-                n_he_i=n_he_i,
-                electron_density=electron_density,
-                inv_u_h=inv_u_h,
-                n_level=n_level,
-                use_hubeny_generalization=False,
-                use_mhd_for_lyman=include_mhd,
-                taper=False
-            )
-            alpha_h_i_bf_total += alpha_h_i_n
-            
-            if verbose and n_level <= 3:
-                print(f"     n={n_level}: {jnp.max(alpha_h_i_n):.3e} cm⁻¹")
+
+        alpha_h_i_bf_total = H_I_bf(
+            frequencies=frequencies,
+            temperature=temperature,
+            n_h_i=n_h_i,
+            n_he_i=n_he_i,
+            electron_density=electron_density,
+            inv_u_h=inv_u_h,
+            n_max_MHD=n_levels_max,
+            use_hubeny_generalization=False,
+            taper=False,
+            use_MHD_for_Lyman=include_mhd
+        )
         
         alpha_total += alpha_h_i_bf_total
 

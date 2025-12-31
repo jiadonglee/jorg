@@ -512,46 +512,9 @@ class LayerProcessor:
             # Create processor and run
             processor = KorgLineProcessor(verbose=self.verbose)
             
-            # Create proper wavelength-dependent continuum opacity function
-            # CRITICAL FIX: Use reference continuum opacity for line windowing
-            def continuum_opacity_at_wavelength(wl_cm):
-                """Get continuum opacity at specific wavelength for line windowing
-                
-                This follows Korg.jl's approach of using interpolated continuum opacity
-                values, but with a minimum floor to ensure proper line windowing in
-                surface layers where continuum opacity is very low.
-                """
-                if continuum_opacity is None:
-                    return 1e-6  # Default fallback
-                
-                # Convert wavelength from cm to Angstrom
-                wl_angstrom = wl_cm * 1e8
-                
-                # Find nearest wavelength index
-                idx = np.searchsorted(wl_array, wl_angstrom)
-                
-                # Get interpolated value
-                if idx == 0:
-                    opacity_value = continuum_opacity[0]
-                elif idx >= len(continuum_opacity):
-                    opacity_value = continuum_opacity[-1]
-                else:
-                    # Linear interpolation for better accuracy
-                    if idx < len(wl_array):
-                        # Interpolate between neighboring points
-                        x0, x1 = wl_array[idx-1], wl_array[idx]
-                        y0, y1 = continuum_opacity[idx-1], continuum_opacity[idx]
-                        # Linear interpolation
-                        frac = (wl_angstrom - x0) / (x1 - x0)
-                        opacity_value = y0 + frac * (y1 - y0)
-                    else:
-                        opacity_value = continuum_opacity[-1]
-                
-                # FIXED: No artificial floor - use actual continuum opacity
-                # Korg.jl handles very low continuum opacity correctly in line windowing
-                # The windowing algorithm naturally excludes weak lines when continuum is low
-                # Adding an artificial floor causes excessive line inclusion in surface layers
-                return opacity_value
+            continuum_opacity_matrix = None
+            if continuum_opacity is not None:
+                continuum_opacity_matrix = np.asarray(continuum_opacity)[None, :]
             
             result = processor.process_lines(
                 wl_array_cm=wl_array_cm,
@@ -561,7 +524,7 @@ class LayerProcessor:
                 partition_fns=self.partition_funcs,
                 linelist=relevant_lines,
                 microturbulence_cm_s=vmic * 1e5,  # Convert km/s to cm/s
-                continuum_opacity_fn=continuum_opacity_at_wavelength,
+                continuum_opacity=continuum_opacity_matrix,
                 cutoff_threshold=cutoff_threshold
             )
             

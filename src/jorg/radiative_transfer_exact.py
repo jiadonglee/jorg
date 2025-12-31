@@ -20,13 +20,31 @@ Date: December 2024
 """
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 from typing import Tuple, List, Dict, Optional, Union
-from scipy.special import roots_legendre
 import warnings
 
 
-def generate_mu_grid(n_points_or_values: Union[int, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+def _roots_legendre_jax(n: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    JAX Gauss-Legendre roots and weights via the Golub-Welsch algorithm.
+    """
+    n = int(n)
+    if n <= 0:
+        raise ValueError("n must be positive for roots_legendre")
+    if n == 1:
+        return jnp.array([0.0]), jnp.array([2.0])
+
+    i = jnp.arange(1, n, dtype=jnp.float64)
+    beta = i / jnp.sqrt(4.0 * i * i - 1.0)
+    J = jnp.diag(beta, k=-1) + jnp.diag(beta, k=1)
+    evals, evecs = jnp.linalg.eigh(J)
+    weights = 2.0 * (evecs[0, :] ** 2)
+    return evals, weights
+
+
+def generate_mu_grid(n_points_or_values: Union[int, jnp.ndarray]) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Generate μ grid for radiative transfer quadrature (EXACT Korg.jl port)
     
@@ -54,40 +72,27 @@ def generate_mu_grid(n_points_or_values: Union[int, np.ndarray]) -> Tuple[np.nda
     - Adjusts weights: w → w/2
     """
     if isinstance(n_points_or_values, int):
-        # Exact Gauss-Legendre quadrature (no approximations)
-        mu_raw, weights_raw = roots_legendre(n_points_or_values)
-        
-        # Transform from [-1,1] to [0,1] exactly as in Korg.jl line 15-16
+        mu_raw, weights_raw = _roots_legendre_jax(n_points_or_values)
         mu_grid = mu_raw / 2.0 + 0.5
         mu_weights = weights_raw / 2.0
-        
-        return mu_grid, mu_weights
-    
-    else:
-        # Handle explicit μ values (Korg.jl lines 19-30)
-        mu_grid = np.asarray(n_points_or_values)
-        
-        if len(mu_grid) == 1:
-            return mu_grid, np.array([1.0])
-        
-        # Validate sorting and bounds (exact Korg.jl validation)
-        if not np.all(np.diff(mu_grid) >= 0) or mu_grid[0] < 0 or mu_grid[-1] > 1:
-            raise ValueError("μ_grid must be sorted and bounded between 0 and 1")
-        
-        # Trapezoidal weights exactly as Korg.jl line 27-28
-        delta = np.diff(mu_grid)
-        mu_weights = 0.5 * np.concatenate([
-            [delta[0]], 
-            delta[:-1] + delta[1:], 
-            [delta[-1]]
-        ])
-        
         return mu_grid, mu_weights
 
+    mu_grid = jnp.asarray(n_points_or_values)
+    if mu_grid.size == 1:
+        return mu_grid, jnp.array([1.0])
 
-def compute_tau_anchored(alpha: np.ndarray, 
-                        integrand_factor: np.ndarray,
-                        log_tau_ref: np.ndarray) -> np.ndarray:
+    delta = jnp.diff(mu_grid)
+    mu_weights = 0.5 * jnp.concatenate([
+        jnp.array([delta[0]]),
+        delta[:-1] + delta[1:],
+        jnp.array([delta[-1]])
+    ])
+    return mu_grid, mu_weights
+
+
+def compute_tau_anchored(alpha: jnp.ndarray,
+                        integrand_factor: jnp.ndarray,
+                        log_tau_ref: jnp.ndarray) -> jnp.ndarray:
     """
     Compute optical depth using anchored integration (EXACT Korg.jl port)
     
@@ -115,23 +120,14 @@ def compute_tau_anchored(alpha: np.ndarray,
     2. Trapezoidal integration in log(τ_ref) coordinate
     3. Start from τ[0] = 0 and integrate forward
     """
-    n_layers = len(alpha)
-    tau = np.zeros(n_layers)
-    
-    # Calculate integrand buffer exactly as Korg.jl line 245-247
     integrand_buffer = alpha * integrand_factor
-    
-    # Anchored integration exactly as Korg.jl line 248-252
-    tau[0] = 0.0
-    for i in range(1, n_layers):
-        tau[i] = (tau[i-1] + 
-                 0.5 * (integrand_buffer[i] + integrand_buffer[i-1]) * 
-                 (log_tau_ref[i] - log_tau_ref[i-1]))
-    
+    delta = log_tau_ref[1:] - log_tau_ref[:-1]
+    trapezoid = 0.5 * (integrand_buffer[1:] + integrand_buffer[:-1]) * delta
+    tau = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(trapezoid)])
     return tau
 
 
-def compute_I_linear_flux_only(tau: np.ndarray, source: np.ndarray) -> float:
+def compute_I_linear_flux_only(tau: jnp.ndarray, source: jnp.ndarray) -> jnp.ndarray:
     """
     Compute surface intensity using exact linear method (EXACT Korg.jl port)
     
@@ -157,36 +153,19 @@ def compute_I_linear_flux_only(tau: np.ndarray, source: np.ndarray) -> float:
     - Analytical integration: ∫ (m*τ + b) * exp(-τ) dτ
     - Handles numerical edge cases exactly as Korg.jl
     """
-    if len(tau) == 1:
-        return 0.0
-    
-    intensity = 0.0
-    next_exp_neg_tau = np.exp(-tau[0])  # Pre-calculate first exponential
-    
-    for i in range(len(tau) - 1):
-        # Calculate delta tau
-        delta_tau = tau[i+1] - tau[i]
-        
-        # Handle numerical case exactly as Korg.jl line 316
-        # "fix the case where large τ causes numerically 0 Δτ"
-        if delta_tau == 0:
-            delta_tau = 1.0  # "if it's 0, make it 1"
-        
-        # Linear interpolation slope
-        m = (source[i+1] - source[i]) / delta_tau
-        
-        # Pre-calculated exponentials for efficiency (Korg.jl lines 319-320)
-        cur_exp_neg_tau = next_exp_neg_tau
-        next_exp_neg_tau = np.exp(-tau[i+1])
-        
-        # Exact analytical integration (Korg.jl line 321)
-        intensity += (-next_exp_neg_tau * (source[i+1] + m) + 
-                     cur_exp_neg_tau * (source[i] + m))
-    
-    return intensity
+    if tau.size == 1:
+        return jnp.array(0.0)
+
+    delta_tau = tau[1:] - tau[:-1]
+    delta_tau = jnp.where(delta_tau == 0.0, 1.0, delta_tau)
+    m = (source[1:] - source[:-1]) / delta_tau
+    cur_exp = jnp.exp(-tau[:-1])
+    next_exp = jnp.exp(-tau[1:])
+    terms = (-next_exp * (source[1:] + m) + cur_exp * (source[:-1] + m))
+    return jnp.sum(terms)
 
 
-def compute_I_linear(tau: np.ndarray, source: np.ndarray) -> np.ndarray:
+def compute_I_linear(tau: jnp.ndarray, source: jnp.ndarray) -> jnp.ndarray:
     """
     Compute intensity at all layers using exact linear method (EXACT Korg.jl port)
     
@@ -212,21 +191,23 @@ def compute_I_linear(tau: np.ndarray, source: np.ndarray) -> np.ndarray:
     - Linear source function interpolation
     - Analytical solution: I[k] = (I[k+1] - S[k] - m*(δ+1)) * exp(-δ) + m + S[k]
     """
-    n_layers = len(tau)
-    intensity = np.zeros(n_layers)
-    
+    n_layers = tau.size
     if n_layers == 1:
-        return intensity
-    
-    # Work backwards exactly as Korg.jl line 293
-    for k in range(n_layers-2, -1, -1):
-        delta = tau[k+1] - tau[k]
-        m = (source[k+1] - source[k]) / delta
-        
-        # Exact analytical solution (Korg.jl line 296)
-        intensity[k] = ((intensity[k+1] - source[k] - m * (delta + 1)) * 
-                       np.exp(-delta) + m + source[k])
-    
+        return jnp.zeros((1,))
+
+    deltas = tau[1:] - tau[:-1]
+    deltas = jnp.where(deltas == 0.0, 1.0, deltas)
+    slopes = (source[1:] - source[:-1]) / deltas
+
+    def step(intensity_next, inputs):
+        delta, m, source_k = inputs
+        intensity_k = ((intensity_next - source_k - m * (delta + 1.0)) *
+                       jnp.exp(-delta) + m + source_k)
+        return intensity_k, intensity_k
+
+    inputs = (deltas[::-1], slopes[::-1], source[:-1][::-1])
+    _, intensity_rev = jax.lax.scan(step, 0.0, inputs)
+    intensity = jnp.concatenate([intensity_rev[::-1], jnp.array([0.0])])
     return intensity
 
 
@@ -235,14 +216,14 @@ def _expint_small(x):
     """Small x expansion for E₂(x) (Korg.jl lines 432-438)"""
     euler_mascheroni = 0.57721566490153286060651209008240243104215933593992
     return (1 + 
-            ((np.log(x) + euler_mascheroni - 1) + 
+            ((jnp.log(x) + euler_mascheroni - 1) + 
              (-0.5 + (0.08333333333333333 + 
                      (-0.013888888888888888 + 0.0020833333333333333 * x) * x) * x) * x) * x)
 
 def _expint_large(x):
     """Large x expansion for E₂(x) (Korg.jl lines 440-442)"""
     invx = 1.0 / x
-    return np.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
+    return jnp.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
 
 def _expint_2(x):
     """E₂(x) around x=2 (Korg.jl lines 444-450)"""
@@ -308,7 +289,7 @@ def _expint_8(x):
                (2.2386015208338193e-6 - 5.173353514609864e-7 * x) * x) * x) * x) * x)
 
 
-def exponential_integral_2(x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+def exponential_integral_2(x: Union[float, jnp.ndarray]) -> jnp.ndarray:
     """
     Second-order exponential integral E₂(x) (EXACT Korg.jl port)
     
@@ -333,59 +314,47 @@ def exponential_integral_2(x: Union[float, np.ndarray]) -> Union[float, np.ndarr
     - 1.1 ≤ x < 9.0: piecewise polynomial approximations  
     - x ≥ 9.0: large x expansion
     """
-    if np.isscalar(x):
-        if x == 0:
-            return 1.0
-        elif x < 1.1:
-            return _expint_small(x)
-        elif x < 2.5:
-            return _expint_2(x)
-        elif x < 3.5:
-            return _expint_3(x)
-        elif x < 4.5:
-            return _expint_4(x)
-        elif x < 5.5:
-            return _expint_5(x)
-        elif x < 6.5:
-            return _expint_6(x)
-        elif x < 7.5:
-            return _expint_7(x)
-        elif x < 9.0:
-            return _expint_8(x)
-        else:
-            return _expint_large(x)
-    else:
-        # Vectorized version maintaining exact same logic
-        x = np.asarray(x)
-        result = np.zeros_like(x, dtype=float)
-        
-        # Apply same conditions as scalar version
-        mask_0 = (x == 0)
-        mask_small = (x > 0) & (x < 1.1)
-        mask_2 = (x >= 1.1) & (x < 2.5)
-        mask_3 = (x >= 2.5) & (x < 3.5)
-        mask_4 = (x >= 3.5) & (x < 4.5)
-        mask_5 = (x >= 4.5) & (x < 5.5)
-        mask_6 = (x >= 5.5) & (x < 6.5)
-        mask_7 = (x >= 6.5) & (x < 7.5)
-        mask_8 = (x >= 7.5) & (x < 9.0)
-        mask_large = (x >= 9.0)
-        
-        result[mask_0] = 1.0
-        result[mask_small] = _expint_small(x[mask_small])
-        result[mask_2] = _expint_2(x[mask_2])
-        result[mask_3] = _expint_3(x[mask_3])
-        result[mask_4] = _expint_4(x[mask_4])
-        result[mask_5] = _expint_5(x[mask_5])
-        result[mask_6] = _expint_6(x[mask_6])
-        result[mask_7] = _expint_7(x[mask_7])
-        result[mask_8] = _expint_8(x[mask_8])
-        result[mask_large] = _expint_large(x[mask_large])
-        
-        return result
+    x = jnp.asarray(x)
+    return jnp.where(
+        x == 0.0,
+        1.0,
+        jnp.where(
+            x < 1.1,
+            _expint_small(x),
+            jnp.where(
+                x < 2.5,
+                _expint_2(x),
+                jnp.where(
+                    x < 3.5,
+                    _expint_3(x),
+                    jnp.where(
+                        x < 4.5,
+                        _expint_4(x),
+                        jnp.where(
+                            x < 5.5,
+                            _expint_5(x),
+                            jnp.where(
+                                x < 6.5,
+                                _expint_6(x),
+                                jnp.where(
+                                    x < 7.5,
+                                    _expint_7(x),
+                                    jnp.where(
+                                        x < 9.0,
+                                        _expint_8(x),
+                                        _expint_large(x)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
 
 
-def expint_transfer_integral_core(tau: float, m: float, b: float) -> float:
+def expint_transfer_integral_core(tau: jnp.ndarray, m: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     """
     Exact solution to ∫ (m*τ + b) * E₂(τ) dτ (EXACT Korg.jl port)
     
@@ -411,10 +380,10 @@ def expint_transfer_integral_core(tau: float, m: float, b: float) -> float:
     (1/6) * (τ * E₂(τ) * (3b + 2mτ) - exp(-τ) * (3b + 2m(τ + 1)))
     """
     return (1.0/6.0 * (tau * exponential_integral_2(tau) * (3*b + 2*m*tau) - 
-                       np.exp(-tau) * (3*b + 2*m*(tau + 1))))
+                       jnp.exp(-tau) * (3*b + 2*m*(tau + 1.0))))
 
 
-def compute_F_flux_only_expint(tau: np.ndarray, source: np.ndarray) -> float:
+def compute_F_flux_only_expint(tau: jnp.ndarray, source: jnp.ndarray) -> jnp.ndarray:
     """
     Compute astrophysical flux using exponential integral (EXACT Korg.jl port)
     
@@ -440,31 +409,18 @@ def compute_F_flux_only_expint(tau: np.ndarray, source: np.ndarray) -> float:
     - Analytical integration using exponential integrals
     - Sum contributions from all layers
     """
-    flux = 0.0
+    tau = jnp.asarray(tau)
+    source = jnp.asarray(source)
 
-    for i in range(len(tau) - 1):
-        # Check for zero or negative tau difference (numerical stability fix)
-        tau_diff = tau[i+1] - tau[i]
-        if abs(tau_diff) < 1e-15:  # Effectively zero
-            # Skip layer pairs with identical tau (optically thin limit)
-            # This can happen in continuum-only synthesis with uniform opacity
-            # Use source function directly for zero tau difference
-            # flux contribution is zero in this case anyway
-            continue
-        elif tau_diff < 0:
-            # Sanity check - tau should be monotonically increasing
-            # This should not happen, but handle gracefully
-            continue
-
-        # Linear interpolation parameters (Korg.jl lines 382-383)
-        m = (source[i+1] - source[i]) / tau_diff
-        b = source[i] - m * tau[i]
-
-        # Exact integration (Korg.jl lines 384-385)
-        flux += (expint_transfer_integral_core(tau[i+1], m, b) -
-                expint_transfer_integral_core(tau[i], m, b))
-
-    return flux
+    tau_next = tau[1:]
+    tau_prev = tau[:-1]
+    tau_diff = tau_next - tau_prev
+    valid = tau_diff > 1e-15
+    safe_diff = jnp.where(tau_diff == 0.0, 1.0, tau_diff)
+    m = (source[1:] - source[:-1]) / safe_diff
+    b = source[:-1] - m * tau_prev
+    contrib = expint_transfer_integral_core(tau_next, m, b) - expint_transfer_integral_core(tau_prev, m, b)
+    return jnp.sum(jnp.where(valid, contrib, 0.0))
 
 
 def calculate_rays(mu_surface_grid: np.ndarray, 

@@ -25,6 +25,9 @@ import warnings
 
 from ..constants import hplanck_eV
 
+# Exact ionization energy for H I (matches Korg.jl)
+CHI_H_EV = 13.598434005136  # eV
+
 # Global variables for Nahar H I data
 _nahar_h_i_data = None
 _energy_grids = None
@@ -219,7 +222,7 @@ def nahar_h_i_bf_absorption_single_level(
     from ..constants import kboltz_eV
     
     # H I ionization energy
-    chi_h = 13.598434005136  # eV (same as Korg.jl)
+    chi_h = CHI_H_EV  # eV (same as Korg.jl)
     
     # Occupation probability with MHD
     w_lower = hummer_mihalas_w(temperature, float(n_level), n_h_i, n_he_i, 
@@ -276,8 +279,20 @@ def nahar_h_i_bf_absorption_single_level(
         # Vectorized dissolution calculation
         dissolved_fraction = jax.vmap(calc_dissolution)(frequencies)
     
-    # Get Nahar cross-sections for this level
-    cross_sections = nahar_h_i_bf_cross_section(frequencies, n_level)
+    # Get Nahar cross-sections for this level, with ν^-3 extrapolation below threshold
+    energy_grids, sigma_grids, _ = _load_nahar_h_i_data()
+    energy_grid = energy_grids[n_level]
+    sigma_grid = sigma_grids[n_level]
+    photon_energies = hplanck_eV * frequencies  # eV
+
+    # Cross-section at the unperturbed threshold (used for ν^-3 extrapolation)
+    energy_threshold = chi_h / (n_level**2)
+    sigma_break = jnp.interp(energy_threshold, energy_grid, sigma_grid)
+
+    sigma_interp = jnp.interp(photon_energies, energy_grid, sigma_grid)
+    ratio = jnp.maximum(frequencies / nu_threshold, 1e-30)
+    sigma_extrap = sigma_break * ratio ** -3.0
+    cross_sections = jnp.where(frequencies < nu_threshold, sigma_extrap, sigma_interp)
     
     # Calculate total cross-section contribution
     level_cross_section = occupation_prob * cross_sections * dissolved_fraction
