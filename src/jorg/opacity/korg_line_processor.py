@@ -19,14 +19,47 @@ import jax.numpy as jnp
 from jax.scipy.special import gamma as jax_gamma
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
+from functools import lru_cache
+import threading
 
 from ..constants import (
-    kboltz_cgs, c_cgs, hplanck_cgs, PI, 
-    electron_charge_cgs as ELECTRON_CHARGE, 
+    kboltz_cgs, c_cgs, hplanck_cgs, PI,
+    electron_charge_cgs as ELECTRON_CHARGE,
     electron_mass_cgs as ELECTRON_MASS,
     kboltz_eV, hplanck_eV, amu_cgs
 )
 from ..statmech.species import Species
+
+
+# Module-level JIT cache with thread-safe access
+_jit_cache_lock = threading.Lock()
+_jit_cache = {}
+
+
+def _get_cached_jit_function(cache_key: str, compile_fn):
+    """
+    Thread-safe cache for JIT-compiled functions.
+
+    This prevents redundant JIT compilation when the same function
+    signature is requested multiple times across different calls.
+    """
+    if cache_key in _jit_cache:
+        return _jit_cache[cache_key]
+
+    with _jit_cache_lock:
+        # Double-check in case another thread compiled while we waited
+        if cache_key in _jit_cache:
+            return _jit_cache[cache_key]
+        compiled_fn = compile_fn()
+        _jit_cache[cache_key] = compiled_fn
+        return compiled_fn
+
+
+def clear_jit_cache():
+    """Clear the JIT compilation cache. Useful for memory management."""
+    global _jit_cache
+    with _jit_cache_lock:
+        _jit_cache.clear()
 
 
 @dataclass
@@ -122,6 +155,8 @@ class KorgLineProcessor:
     
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
+        # OPTIMIZATION: Cache for layer-dependent calculations
+        self._layer_cache = {}
         
     def process_lines(self, 
                      wl_array_cm: np.ndarray,
@@ -315,6 +350,45 @@ class KorgLineProcessor:
                 
         return n_div_U
 
+    def _get_layer_data_cached(self, temps: np.ndarray, electron_densities: np.ndarray,
+                              n_h_neutral: np.ndarray) -> dict:
+        """
+        Get or compute cached layer-dependent data.
+
+        This caches calculations like beta, temp_stark, temp_vdw that are
+        computed repeatedly across different line batches.
+
+        Returns
+        -------
+        dict
+            Dictionary with cached layer data: beta, temp_stark, temp_vdw, etc.
+        """
+        # Create cache key from layer properties
+        key = (
+            tuple(temps[:5]) if len(temps) > 5 else tuple(temps),  # Sample first 5
+            tuple(electron_densities[:5]) if len(electron_densities) > 5 else tuple(electron_densities),
+            tuple(n_h_neutral[:5]) if len(n_h_neutral) > 5 else tuple(n_h_neutral),
+            len(temps)  # Include full length
+        )
+
+        if key in self._layer_cache:
+            return self._layer_cache[key]
+
+        # Compute and cache layer data
+        layer_data = {
+            'beta': 1.0 / (kboltz_eV * temps),
+            'temp_stark': (temps / 10000.0)**(1.0 / 6.0),
+            'temp_vdw': (temps / 10000.0)**0.3,
+            'temp_vbar': np.sqrt(8.0 * kboltz_cgs * temps / PI),
+        }
+
+        self._layer_cache[key] = layer_data
+        return layer_data
+
+    def clear_layer_cache(self):
+        """Clear the layer data cache. Useful for memory management."""
+        self._layer_cache.clear()
+
     def _resolve_continuum_opacity(self, wl_array_cm: np.ndarray,
                                   continuum_opacity: Optional[np.ndarray],
                                   continuum_opacity_fn: Optional[Any],
@@ -451,9 +525,82 @@ class KorgLineProcessor:
                                    electron_densities: np.ndarray, n_div_U_array: np.ndarray,
                                    line_arrays: Dict[str, np.ndarray], microturbulence_cm_s: float,
                                    continuum_opacity: Optional[np.ndarray], cutoff_threshold: float,
-                                   n_h_neutral: np.ndarray, float_dtype: type) -> Tuple[np.ndarray, np.ndarray, int, int, float]:
+                                   n_h_neutral: np.ndarray, float_dtype: type,
+                                   chunk_size: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, int, int, float]:
         """
         Compute line windows with vectorized numpy (no Python loops).
+
+        Parameters
+        ----------
+        chunk_size : int, optional
+            Process lines in chunks to reduce memory peak. If None, auto-compute
+            based on available memory and line count. Recommended: 1000-5000.
+        """
+        from scipy.special import gamma as scipy_gamma
+
+        n_layers = temps.shape[0]
+        n_wavelengths = wl_array_cm.shape[0]
+        n_lines = line_arrays["wavelength"].shape[0]
+
+        # OPTIMIZATION: Auto-determine chunk size based on memory considerations
+        # For ~19k lines × 56 layers, we want to keep peak memory under ~500MB
+        if chunk_size is None:
+            # Estimate: ~200 bytes per line-layer pair
+            max_elements = 2_000_000  # ~400MB at float64
+            chunk_size = max(500, min(5000, max_elements // (n_layers * 4)))
+
+        # If small number of lines, process all at once
+        if n_lines <= chunk_size:
+            return self._compute_line_windows_single_chunk(
+                wl_array_cm, temps, electron_densities, n_div_U_array,
+                line_arrays, microturbulence_cm_s, continuum_opacity,
+                cutoff_threshold, n_h_neutral, float_dtype
+            )
+
+        # Process in chunks to reduce memory peak
+        if self.verbose:
+            print(f"   📦 Processing {n_lines} lines in chunks of {chunk_size} (memory optimization)")
+
+        lb_list = []
+        ub_list = []
+        max_window_pts = 0
+        lines_windowed = 0
+        total_amplitude = 0.0
+
+        for start_idx in range(0, n_lines, chunk_size):
+            end_idx = min(start_idx + chunk_size, n_lines)
+
+            # Extract chunk
+            chunk_arrays = {k: v[start_idx:end_idx] for k, v in line_arrays.items()}
+
+            # Process chunk
+            lb_chunk, ub_chunk, max_pts, windowed, amplitude = self._compute_line_windows_single_chunk(
+                wl_array_cm, temps, electron_densities, n_div_U_array,
+                chunk_arrays, microturbulence_cm_s, continuum_opacity,
+                cutoff_threshold, n_h_neutral, float_dtype
+            )
+
+            lb_list.append(lb_chunk)
+            ub_list.append(ub_chunk)
+            max_window_pts = max(max_window_pts, max_pts)
+            lines_windowed += windowed
+            total_amplitude += amplitude
+
+        # Combine results
+        lb = np.concatenate(lb_list).astype(np.int32)
+        ub = np.concatenate(ub_list).astype(np.int32)
+
+        return lb, ub, max_window_pts, lines_windowed, total_amplitude
+
+    def _compute_line_windows_single_chunk(self, wl_array_cm: np.ndarray, temps: np.ndarray,
+                                          electron_densities: np.ndarray, n_div_U_array: np.ndarray,
+                                          line_arrays: Dict[str, np.ndarray], microturbulence_cm_s: float,
+                                          continuum_opacity: Optional[np.ndarray], cutoff_threshold: float,
+                                          n_h_neutral: np.ndarray, float_dtype: type) -> Tuple[np.ndarray, np.ndarray, int, int, float]:
+        """
+        Compute line windows for a single chunk of lines with vectorized numpy.
+
+        This is the original implementation that processes all lines at once.
         """
         from scipy.special import gamma as scipy_gamma
 
@@ -759,11 +906,21 @@ class KorgLineProcessor:
 
             return alpha_matrix
 
-        def run_batches(alpha_init):
-            return jax.lax.fori_loop(0, n_batches, batch_body, alpha_init)
+        # OPTIMIZED: Use cached JIT compilation instead of compiling on every call
+        # This prevents the 2-5 second compilation overhead on each invocation
+        cache_key = f"batch_processor_{n_batches}_{batch_size}_{n_layers}_{n_wavelengths}_{temps_j.dtype}"
+
+        def compile_batch_processor():
+            """Compile the batch processor with JIT for reuse."""
+            @jax.jit
+            def run_batches_compiled(alpha_init):
+                return jax.lax.fori_loop(0, n_batches, batch_body, alpha_init)
+            return run_batches_compiled
+
+        run_batches_cached = _get_cached_jit_function(cache_key, compile_batch_processor)
 
         alpha_init = jnp.zeros((n_layers, n_wavelengths), dtype=temps_j.dtype)
-        alpha_matrix_j = jax.jit(run_batches)(alpha_init)
+        alpha_matrix_j = run_batches_cached(alpha_init)
 
         alpha_matrix = np.asarray(alpha_matrix_j)
 

@@ -237,6 +237,32 @@ class SynthesisResult:
     intermediate_results: Optional[Dict] = None
 
 
+def _normalize_ce_source(use_chemical_equilibrium_from):
+    """
+    Normalize CE reuse inputs to the LayerProcessor format.
+
+    Accepts a SynthesisResult or a dict and returns a dict with:
+    - electron_densities: array of ne per layer
+    - number_densities: dict of species -> array per layer
+    """
+    if use_chemical_equilibrium_from is None:
+        return None
+    if isinstance(use_chemical_equilibrium_from, SynthesisResult):
+        return {
+            'electron_densities': np.asarray(use_chemical_equilibrium_from.electron_number_density),
+            'number_densities': use_chemical_equilibrium_from.number_densities
+        }
+    if isinstance(use_chemical_equilibrium_from, dict):
+        if 'electron_densities' in use_chemical_equilibrium_from:
+            return use_chemical_equilibrium_from
+        if 'electron_number_density' in use_chemical_equilibrium_from:
+            return {
+                'electron_densities': np.asarray(use_chemical_equilibrium_from['electron_number_density']),
+                'number_densities': use_chemical_equilibrium_from['number_densities']
+            }
+    return use_chemical_equilibrium_from
+
+
 def create_korg_compatible_abundance_array(
     m_H=0.0,
     alpha_H=None,
@@ -289,7 +315,7 @@ def synthesize_korg_compatible(
     partition_funcs: Optional[Dict] = None,
     log_equilibrium_constants: Optional[Dict] = None,
     molecular_cross_sections: List = None,
-    use_chemical_equilibrium_from: Optional['SynthesisResult'] = None,
+    use_chemical_equilibrium_from: Optional[Union['SynthesisResult', Dict]] = None,
     logg: float = 4.44,
     rectify: bool = False,
     rectify_mode: str = "continuum",
@@ -350,8 +376,8 @@ def synthesize_korg_compatible(
         Custom molecular equilibrium constants (uses Jorg defaults if None)
     molecular_cross_sections : List, default=None
         Precomputed molecular cross-sections
-    use_chemical_equilibrium_from : Optional[SynthesisResult], default=None
-        Reuse chemical equilibrium from previous calculation
+    use_chemical_equilibrium_from : Optional[SynthesisResult or dict], default=None
+        Reuse chemical equilibrium from previous calculation (per-layer, grid-independent)
     rectify : bool, default=False
         Whether to normalize flux by continuum (return rectified spectrum)
     rectify_mode : str, default="continuum"
@@ -558,6 +584,12 @@ def synthesize_korg_compatible(
     start_time = time.time() if debug_mode else None
 
     # Stage 1: Calculate CONTINUUM-ONLY opacity (Korg.jl lines 213-221)
+    ce_source = _normalize_ce_source(use_chemical_equilibrium_from)
+    if verbose and ce_source is None:
+        print("ℹ️  Chemical equilibrium is solved per layer (grid-independent); reuse it for grid sweeps.")
+    elif verbose:
+        print("✅ Reusing chemical equilibrium for this synthesis.")
+
     alpha_continuum, all_number_densities, all_electron_densities = layer_processor.process_all_layers(
         atm=atm,
         abs_abundances={Z: abs_abundances[Z-1] for Z in range(1, MAX_ATOMIC_NUMBER+1)},
@@ -566,8 +598,9 @@ def synthesize_korg_compatible(
         line_buffer=line_buffer,
         hydrogen_lines=False,  # NO hydrogen lines yet
         vmic=vmic,
-        use_chemical_equilibrium_from=use_chemical_equilibrium_from,
-        log_g=log_g
+        use_chemical_equilibrium_from=ce_source,
+        log_g=log_g,
+        cntm_step=cntm_step
     )
 
     # Stage 2: Calculate TOTAL opacity by adding lines (Korg.jl lines 253-267)
@@ -640,7 +673,7 @@ def synthesize_korg_compatible(
     flux, continuum, intensity = _calculate_radiative_transfer(
         alpha_matrix, atm, wl_array, mu_grid, I_scheme, return_cntm, A_X,
         layer_processor, linelist, line_buffer, hydrogen_lines, vmic, abs_abundances,
-        use_chemical_equilibrium_from, log_g, rectify, rt_method, verbose,
+        ce_source, log_g, rectify, rt_method, verbose,
         alpha_continuum=alpha_continuum,  # Pass pre-calculated continuum opacity
         line_cutoff_threshold=line_cutoff_threshold,
         rectify_mode=rectify_mode,

@@ -76,9 +76,10 @@ class LayerProcessor:
             'total_processing_time': 0.0
         }
     
-    def process_all_layers(self, atm, abs_abundances, wl_array, linelist, 
-                          line_buffer, hydrogen_lines, vmic, 
-                          use_chemical_equilibrium_from=None, log_g=4.44):
+    def process_all_layers(self, atm, abs_abundances, wl_array, linelist,
+                          line_buffer, hydrogen_lines, vmic,
+                          use_chemical_equilibrium_from=None, log_g=4.44,
+                          cntm_step=1.0):
         """
         Process all atmospheric layers systematically
         
@@ -101,6 +102,8 @@ class LayerProcessor:
             Include hydrogen lines
         vmic : float
             Microturbulent velocity in km/s
+        cntm_step : float, default=1.0
+            Continuum sampling step in Å (coarse grid like Korg.jl)
         use_chemical_equilibrium_from : Optional[Dict], default=None
             Reuse chemical equilibrium from previous calculation
             
@@ -134,7 +137,8 @@ class LayerProcessor:
                 # Process single layer
                 layer_opacity, layer_number_densities, layer_ne = self._process_single_layer(
                     layer_idx, atm, abs_abundances, wl_array, linelist,
-                    line_buffer, hydrogen_lines, vmic, use_chemical_equilibrium_from, log_g
+                    line_buffer, hydrogen_lines, vmic, use_chemical_equilibrium_from,
+                    log_g, cntm_step
                 )
                 
                 # Store results
@@ -164,9 +168,9 @@ class LayerProcessor:
         
         return alpha_matrix, all_number_densities, all_electron_densities
     
-    def _process_single_layer(self, layer_idx, atm, abs_abundances, wl_array, 
+    def _process_single_layer(self, layer_idx, atm, abs_abundances, wl_array,
                             linelist, line_buffer, hydrogen_lines, vmic,
-                            use_chemical_equilibrium_from, log_g):
+                            use_chemical_equilibrium_from, log_g, cntm_step):
         """
         Process a single atmospheric layer systematically
         
@@ -221,7 +225,8 @@ class LayerProcessor:
         # 3. Calculate opacity components
         layer_opacity = self._calculate_layer_opacity(
             wl_array, T, ne_solution, layer_number_densities,
-            linelist, line_buffer, hydrogen_lines, vmic, log_g
+            linelist, line_buffer, hydrogen_lines, vmic, log_g,
+            cntm_step=cntm_step
         )
         
         return layer_opacity, layer_number_densities, ne_solution
@@ -247,10 +252,11 @@ class LayerProcessor:
             # Calculate fresh chemical equilibrium with molecular equilibrium constants
             from ..statmech import create_default_log_equilibrium_constants
             log_equilibrium_constants = create_default_log_equilibrium_constants()
-            
+
+            # Use full chemical equilibrium with translational partition function (matches Korg.jl)
             ne_solution, number_densities = chemical_equilibrium(
-                temp=T, nt=nt, model_atm_ne=ne_guess, 
-                absolute_abundances=abs_abundances, 
+                temp=T, nt=nt, model_atm_ne=ne_guess,
+                absolute_abundances=abs_abundances,
                 ionization_energies=self.ionization_energies,
                 partition_funcs=self.partition_funcs,
                 log_equilibrium_constants=log_equilibrium_constants
@@ -404,7 +410,8 @@ class LayerProcessor:
         return number_densities
     
     def _calculate_layer_opacity(self, wl_array, T, ne, number_densities,
-                               linelist, line_buffer, hydrogen_lines, vmic, log_g):
+                               linelist, line_buffer, hydrogen_lines, vmic, log_g,
+                               cntm_step=1.0):
         """
         Calculate total opacity for this layer using systematic approach
         
@@ -415,7 +422,8 @@ class LayerProcessor:
         
         # 1. Continuum opacity (systematic calculation)
         continuum_opacity = self._calculate_continuum_opacity(
-            wl_array, T, ne, number_densities
+            wl_array, T, ne, number_densities,
+            cntm_step=cntm_step, line_buffer=line_buffer
         )
         
         # 2. Line opacity with Korg.jl windowing algorithm
@@ -430,18 +438,42 @@ class LayerProcessor:
         
         return total_opacity
     
-    def _calculate_continuum_opacity(self, wl_array, T, ne, number_densities):
+    def _calculate_continuum_opacity(self, wl_array, T, ne, number_densities,
+                                     cntm_step=1.0, line_buffer=0.0):
         """Calculate continuum opacity using exact physics module"""
         try:
-            # Convert wavelengths to frequencies
-            frequencies = c_cgs / (wl_array * 1e-8)  # Hz
-            
-            # Use Jorg's exact physics continuum calculation
-            continuum_opacity = total_continuum_absorption_exact_physics_only(
+            wl_array = np.asarray(wl_array)
+            if cntm_step is None or cntm_step <= 0:
+                # Full-resolution continuum (fallback)
+                frequencies = c_cgs / (wl_array * 1e-8)
+                continuum_opacity = total_continuum_absorption_exact_physics_only(
+                    frequencies, T, ne, number_densities
+                )
+                return np.array(continuum_opacity)
+
+            # Korg-style coarse continuum grid with interpolation to output grid
+            wl_min = float(wl_array[0]) - float(line_buffer)
+            wl_max = float(wl_array[-1]) + float(line_buffer)
+            if wl_max <= wl_min:
+                wl_min = float(wl_array[0])
+                wl_max = float(wl_array[-1])
+
+            n_steps = int((wl_max - wl_min) / float(cntm_step)) + 1
+            wl_coarse = wl_min + float(cntm_step) * np.arange(n_steps)
+            if wl_coarse[-1] < wl_max:
+                wl_coarse = np.append(wl_coarse, wl_max)
+
+            frequencies = c_cgs / (wl_coarse * 1e-8)
+            continuum_coarse = total_continuum_absorption_exact_physics_only(
                 frequencies, T, ne, number_densities
             )
-            
-            return np.array(continuum_opacity)
+            continuum_coarse = np.asarray(continuum_coarse, dtype=float)
+            continuum_full = np.interp(
+                wl_array, wl_coarse, continuum_coarse,
+                left=continuum_coarse[0], right=continuum_coarse[-1]
+            )
+
+            return continuum_full
             
         except Exception as e:
             self.stats['continuum_failures'] += 1

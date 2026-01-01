@@ -4,6 +4,7 @@ Provides alpha5 reference opacity calculation for radiative transfer.
 """
 
 from pathlib import Path
+from functools import lru_cache
 
 import numpy as np
 
@@ -21,7 +22,9 @@ ALPHA_5000_BUFFER_ANG = 21.0
 _alpha_5000_default_linelist = None
 
 
+@lru_cache(maxsize=1)
 def _load_alpha_5000_default_linelist():
+    """Load and cache the default alpha 5000 linelist."""
     global _alpha_5000_default_linelist
     if _alpha_5000_default_linelist is not None:
         return _alpha_5000_default_linelist
@@ -76,9 +79,17 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
                                electron_densities=None, partition_funcs=None,
                                ionization_energies=None, log_equilibrium_constants=None,
                                microturbulence_kms=1.0, line_cutoff_threshold=3e-4,
-                               verbose=False):
+                               use_chemical_equilibrium_from=None, verbose=False):
     """
     Calculate alpha5 reference opacity for radiative transfer anchoring.
+
+    Parameters
+    ----------
+    use_chemical_equilibrium_from : dict, optional
+        Pre-computed chemical equilibrium results with keys:
+        - 'electron_densities': array of electron densities per layer
+        - 'number_densities': dict of species number densities per layer
+        When provided, reuses these results instead of recalculating (Korg.jl optimization).
     """
     if verbose:
         print("Calculating alpha5 reference opacity...")
@@ -103,13 +114,23 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
     if partition_funcs is None:
         partition_funcs = create_default_partition_functions()
 
-    if number_densities is None or electron_densities is None:
+    # OPTIMIZATION: Reuse chemical equilibrium results if provided (Korg.jl approach)
+    if use_chemical_equilibrium_from is not None:
+        if verbose:
+            print("   🔄 Reusing chemical equilibrium results (no CE recalculation)")
+        electron_densities = np.asarray(use_chemical_equilibrium_from['electron_densities'])
+        number_densities = use_chemical_equilibrium_from['number_densities']
+    elif number_densities is None or electron_densities is None:
+        # Only calculate CE if not provided and not reused
         abs_abundances = 10 ** (A_X - 12)
         abs_abundances = abs_abundances / np.sum(abs_abundances)
         abs_abundances = {Z: float(abs_abundances[Z - 1]) for Z in range(1, 93)}
 
         number_densities = {}
         electron_densities = np.zeros(n_layers)
+
+        if verbose:
+            print("   ⚠️  Calculating chemical equilibrium (consider passing use_chemical_equilibrium_from)")
 
         for i in range(n_layers):
             ne, n_dict = chemical_equilibrium(
