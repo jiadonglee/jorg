@@ -832,95 +832,156 @@ class KorgLineProcessor:
         ub_j = jnp.asarray(ub, dtype=jnp.int32)
         line_mask_j = jnp.asarray(line_mask, dtype=temps_j.dtype)
 
-        beta_j = 1.0 / (kboltz_eV * temps_j)
-        temp_stark = (temps_j / 10000.0)**(1.0 / 6.0)
-        temp_vdw = (temps_j / 10000.0)**0.3
-        temp_vbar = jnp.sqrt(8.0 * kboltz_cgs * temps_j / PI)
-        inv_mu_const = 1.0 / (1.008 * amu_cgs)
-        sigma_line_const = (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs**2)
-
-        arange_window = jnp.arange(max_window_pts, dtype=jnp.int32)
-
-        def batch_body(i, alpha_matrix):
-            start = i * batch_size
-            line_wl = jax.lax.dynamic_slice(line_wl_j, (start,), (batch_size,))
-            log_gf = jax.lax.dynamic_slice(log_gf_j, (start,), (batch_size,))
-            E_lower = jax.lax.dynamic_slice(E_lower_j, (start,), (batch_size,))
-            gamma_rad = jax.lax.dynamic_slice(gamma_rad_j, (start,), (batch_size,))
-            gamma_stark = jax.lax.dynamic_slice(gamma_stark_j, (start,), (batch_size,))
-            vdw_sigma = jax.lax.dynamic_slice(vdw_sigma_j, (start,), (batch_size,))
-            vdw_alpha = jax.lax.dynamic_slice(vdw_alpha_j, (start,), (batch_size,))
-            vdw_base_gamma = jax.lax.dynamic_slice(vdw_base_gamma_j, (start,), (batch_size,))
-            species_idx = jax.lax.dynamic_slice(species_idx_j, (start,), (batch_size,))
-            atomic_mass = jax.lax.dynamic_slice(atomic_mass_j, (start,), (batch_size,))
-            is_molecule = jax.lax.dynamic_slice(is_molecule_j, (start,), (batch_size,))
-            lb_b = jax.lax.dynamic_slice(lb_j, (start,), (batch_size,))
-            ub_b = jax.lax.dynamic_slice(ub_j, (start,), (batch_size,))
-            line_mask = jax.lax.dynamic_slice(line_mask_j, (start,), (batch_size,))
-
-            sigma = line_wl[:, None] * jnp.sqrt(
-                kboltz_cgs * temps_j[None, :] / atomic_mass[:, None] + (microturbulence_cm_s**2) / 2.0
-            ) / c_cgs
-            sigma = jnp.maximum(sigma, 1e-30)
-
-            is_atom = 1.0 - is_molecule
-            Gamma = gamma_rad[:, None] + is_atom[:, None] * (electron_densities_j[None, :] * (gamma_stark[:, None] * temp_stark[None, :]))
-
-            inv_mu = inv_mu_const + 1.0 / atomic_mass
-            vbar = temp_vbar[None, :] * jnp.sqrt(inv_mu[:, None])
-            gamma_factor = jax_gamma((4.0 - vdw_alpha) / 2.0)
-            v0 = 1e6
-            vdw_abo = 2.0 * (4.0 / PI)**(vdw_alpha[:, None] / 2.0) * gamma_factor[:, None] * v0 * vdw_sigma[:, None] * (vbar / v0)**(1.0 - vdw_alpha[:, None])
-            vdw_simple = vdw_sigma[:, None] * temp_vdw[None, :]
-            vdw_unsold = vdw_sigma[:, None] * vdw_base_gamma[:, None] * temp_vdw[None, :]
-            vdw_gamma = jnp.where(vdw_alpha[:, None] == -1.0, vdw_simple,
-                                  jnp.where(vdw_alpha[:, None] == -2.0, vdw_unsold, vdw_abo))
-            Gamma = Gamma + is_atom[:, None] * (n_h_neutral_j[None, :] * vdw_gamma)
-
-            gamma = Gamma * line_wl[:, None]**2 / (4.0 * PI * c_cgs)
-
-            E_upper = E_lower + hplanck_eV * c_cgs / line_wl
-            levels_factor = jnp.exp(-beta_j[None, :] * E_lower[:, None]) - jnp.exp(-beta_j[None, :] * E_upper[:, None])
-            gf = jnp.power(10.0, log_gf)
-            cross_section = sigma_line_const * line_wl**2
-            n_div_U_line = n_div_U_array_j[species_idx]
-            amplitude = gf[:, None] * cross_section[:, None] * levels_factor * n_div_U_line
-            amplitude = amplitude * line_mask[:, None]
-
-            inv_sigma_sqrt2 = 1.0 / (sigma * jnp.sqrt(2.0))
-            scaling = inv_sigma_sqrt2 / jnp.sqrt(PI) * amplitude
-            alpha = gamma * inv_sigma_sqrt2
-
-            window_idx = lb_b[:, None] + arange_window[None, :]
-            window_mask = window_idx < ub_b[:, None]
-            window_idx_clipped = jnp.clip(window_idx, 0, n_wavelengths - 1)
-            wl_window = jnp.take(wl_array_cm_j, window_idx_clipped)
-
-            v = jnp.abs(wl_window[:, None, :] - line_wl[:, None, None]) * inv_sigma_sqrt2[:, :, None]
-            voigt_values = _voigt_hjerting_vectorized_jax(alpha[:, :, None], v)
-            line_alpha = voigt_values * scaling[:, :, None]
-            line_alpha = jnp.nan_to_num(line_alpha, nan=0.0, posinf=0.0, neginf=0.0)
-
-            line_alpha = line_alpha * window_mask[:, None, :] * line_mask[:, None, None]
-            alpha_matrix = alpha_matrix.at[:, window_idx_clipped].add(jnp.transpose(line_alpha, (1, 0, 2)))
-
-            return alpha_matrix
-
         # OPTIMIZED: Use cached JIT compilation instead of compiling on every call
         # This prevents the 2-5 second compilation overhead on each invocation
+        # IMPORTANT: Line data must be passed as inputs so log(gf) changes take effect.
         cache_key = f"batch_processor_{n_batches}_{batch_size}_{n_layers}_{n_wavelengths}_{temps_j.dtype}"
 
         def compile_batch_processor():
             """Compile the batch processor with JIT for reuse."""
             @jax.jit
-            def run_batches_compiled(alpha_init):
+            def run_batches_compiled(
+                alpha_init,
+                line_wl_j,
+                log_gf_j,
+                E_lower_j,
+                gamma_rad_j,
+                gamma_stark_j,
+                vdw_sigma_j,
+                vdw_alpha_j,
+                vdw_base_gamma_j,
+                species_idx_j,
+                atomic_mass_j,
+                is_molecule_j,
+                lb_j,
+                ub_j,
+                line_mask_j,
+                n_div_U_array_j,
+                n_h_neutral_j,
+                wl_array_cm_j,
+                temps_j,
+                electron_densities_j,
+                microturbulence_cm_s,
+            ):
+                beta_j = 1.0 / (kboltz_eV * temps_j)
+                temp_stark = (temps_j / 10000.0)**(1.0 / 6.0)
+                temp_vdw = (temps_j / 10000.0)**0.3
+                temp_vbar = jnp.sqrt(8.0 * kboltz_cgs * temps_j / PI)
+                inv_mu_const = 1.0 / (1.008 * amu_cgs)
+                sigma_line_const = (PI * ELECTRON_CHARGE**2 / ELECTRON_MASS / c_cgs**2)
+                arange_window = jnp.arange(max_window_pts, dtype=jnp.int32)
+
+                def batch_body(i, alpha_matrix):
+                    start = i * batch_size
+                    line_wl = jax.lax.dynamic_slice(line_wl_j, (start,), (batch_size,))
+                    log_gf = jax.lax.dynamic_slice(log_gf_j, (start,), (batch_size,))
+                    E_lower = jax.lax.dynamic_slice(E_lower_j, (start,), (batch_size,))
+                    gamma_rad = jax.lax.dynamic_slice(gamma_rad_j, (start,), (batch_size,))
+                    gamma_stark = jax.lax.dynamic_slice(gamma_stark_j, (start,), (batch_size,))
+                    vdw_sigma = jax.lax.dynamic_slice(vdw_sigma_j, (start,), (batch_size,))
+                    vdw_alpha = jax.lax.dynamic_slice(vdw_alpha_j, (start,), (batch_size,))
+                    vdw_base_gamma = jax.lax.dynamic_slice(vdw_base_gamma_j, (start,), (batch_size,))
+                    species_idx = jax.lax.dynamic_slice(species_idx_j, (start,), (batch_size,))
+                    atomic_mass = jax.lax.dynamic_slice(atomic_mass_j, (start,), (batch_size,))
+                    is_molecule = jax.lax.dynamic_slice(is_molecule_j, (start,), (batch_size,))
+                    lb_b = jax.lax.dynamic_slice(lb_j, (start,), (batch_size,))
+                    ub_b = jax.lax.dynamic_slice(ub_j, (start,), (batch_size,))
+                    line_mask = jax.lax.dynamic_slice(line_mask_j, (start,), (batch_size,))
+
+                    sigma = line_wl[:, None] * jnp.sqrt(
+                        kboltz_cgs * temps_j[None, :] / atomic_mass[:, None] + (microturbulence_cm_s**2) / 2.0
+                    ) / c_cgs
+                    sigma = jnp.maximum(sigma, 1e-30)
+
+                    is_atom = 1.0 - is_molecule
+                    Gamma = gamma_rad[:, None] + is_atom[:, None] * (
+                        electron_densities_j[None, :] * (gamma_stark[:, None] * temp_stark[None, :])
+                    )
+
+                    inv_mu = inv_mu_const + 1.0 / atomic_mass
+                    vbar = temp_vbar[None, :] * jnp.sqrt(inv_mu[:, None])
+                    gamma_factor = jax_gamma((4.0 - vdw_alpha) / 2.0)
+                    v0 = 1e6
+                    vdw_abo = (
+                        2.0
+                        * (4.0 / PI)**(vdw_alpha[:, None] / 2.0)
+                        * gamma_factor[:, None]
+                        * v0
+                        * vdw_sigma[:, None]
+                        * (vbar / v0)**(1.0 - vdw_alpha[:, None])
+                    )
+                    vdw_simple = vdw_sigma[:, None] * temp_vdw[None, :]
+                    vdw_unsold = vdw_sigma[:, None] * vdw_base_gamma[:, None] * temp_vdw[None, :]
+                    vdw_gamma = jnp.where(
+                        vdw_alpha[:, None] == -1.0,
+                        vdw_simple,
+                        jnp.where(vdw_alpha[:, None] == -2.0, vdw_unsold, vdw_abo),
+                    )
+                    Gamma = Gamma + is_atom[:, None] * (n_h_neutral_j[None, :] * vdw_gamma)
+
+                    gamma = Gamma * line_wl[:, None]**2 / (4.0 * PI * c_cgs)
+
+                    E_upper = E_lower + hplanck_eV * c_cgs / line_wl
+                    levels_factor = jnp.exp(-beta_j[None, :] * E_lower[:, None]) - jnp.exp(
+                        -beta_j[None, :] * E_upper[:, None]
+                    )
+                    gf = jnp.power(10.0, log_gf)
+                    cross_section = sigma_line_const * line_wl**2
+                    n_div_U_line = n_div_U_array_j[species_idx]
+                    amplitude = gf[:, None] * cross_section[:, None] * levels_factor * n_div_U_line
+                    amplitude = amplitude * line_mask[:, None]
+
+                    inv_sigma_sqrt2 = 1.0 / (sigma * jnp.sqrt(2.0))
+                    scaling = inv_sigma_sqrt2 / jnp.sqrt(PI) * amplitude
+                    alpha = gamma * inv_sigma_sqrt2
+
+                    window_idx = lb_b[:, None] + arange_window[None, :]
+                    window_mask = window_idx < ub_b[:, None]
+                    window_idx_clipped = jnp.clip(window_idx, 0, n_wavelengths - 1)
+                    wl_window = jnp.take(wl_array_cm_j, window_idx_clipped)
+
+                    v = jnp.abs(wl_window[:, None, :] - line_wl[:, None, None]) * inv_sigma_sqrt2[:, :, None]
+                    voigt_values = _voigt_hjerting_vectorized_jax(alpha[:, :, None], v)
+                    line_alpha = voigt_values * scaling[:, :, None]
+                    line_alpha = jnp.nan_to_num(line_alpha, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    line_alpha = line_alpha * window_mask[:, None, :] * line_mask[:, None, None]
+                    alpha_matrix = alpha_matrix.at[:, window_idx_clipped].add(
+                        jnp.transpose(line_alpha, (1, 0, 2))
+                    )
+
+                    return alpha_matrix
+
                 return jax.lax.fori_loop(0, n_batches, batch_body, alpha_init)
+
             return run_batches_compiled
 
         run_batches_cached = _get_cached_jit_function(cache_key, compile_batch_processor)
 
         alpha_init = jnp.zeros((n_layers, n_wavelengths), dtype=temps_j.dtype)
-        alpha_matrix_j = run_batches_cached(alpha_init)
+        alpha_matrix_j = run_batches_cached(
+            alpha_init,
+            line_wl_j,
+            log_gf_j,
+            E_lower_j,
+            gamma_rad_j,
+            gamma_stark_j,
+            vdw_sigma_j,
+            vdw_alpha_j,
+            vdw_base_gamma_j,
+            species_idx_j,
+            atomic_mass_j,
+            is_molecule_j,
+            lb_j,
+            ub_j,
+            line_mask_j,
+            n_div_U_array_j,
+            n_h_neutral_j,
+            wl_array_cm_j,
+            temps_j,
+            electron_densities_j,
+            microturbulence_cm_s,
+        )
 
         alpha_matrix = np.asarray(alpha_matrix_j)
 

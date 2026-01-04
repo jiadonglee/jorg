@@ -8,16 +8,15 @@ analysis, including both spectral fitting and equivalent width analysis.
 Key Features:
 - GPU-accelerated optimization with automatic differentiation
 - Spectral fitting with chi-squared minimization
+- Interactive log(gf) fitting tools for oscillator strength determination
+- Equivalent width calculation from synthetic spectra
 - Classical stellar parameter determination via equivalent widths
-- Enhanced continuum opacity integration (102.5% agreement with Korg.jl)
-- Batch processing for multiple spectra
-- Robust error handling and parameter bounds
 
 Main Functions:
 - fit_spectrum: Full spectral fitting with BFGS optimization
-- ews_to_abundances: Abundance determination from equivalent widths
-- ews_to_stellar_parameters: Classical stellar parameter analysis
-- calculate_equivalent_widths: Robust EW computation
+- calculate_equivalent_width: Equivalent width calculation for single line
+- calculate_equivalent_widths: Batch equivalent width computation
+- LineFittingSession: Interactive log(gf) fitting to observed EWs
 
 Performance:
 - JAX JIT compilation for optimized machine code
@@ -31,49 +30,45 @@ Status: Development Phase
 """
 
 # Core fitting functions
-from .core import (
-    fit_spectrum,
-    FitResult,
-    FitParameters,
-    validate_fit_parameters
-)
+_core_import_error = None
+try:
+    from .core import (
+        fit_spectrum,
+        FitResult,
+        FitParameters,
+        validate_fit_parameters
+    )
+except Exception as exc:  # pragma: no cover - optional core dependency
+    _core_import_error = exc
 
-# Equivalent width analysis  
-from .ew_fitting import (
+    def _core_unavailable(*_args, **_kwargs):
+        raise ImportError(
+            "jorg.fit.core could not be imported; fit_spectrum and related APIs "
+            "are unavailable in this environment."
+        ) from _core_import_error
+
+    fit_spectrum = _core_unavailable
+    validate_fit_parameters = _core_unavailable
+    FitResult = None
+    FitParameters = None
+
+# Equivalent width calculation (NEW: native Python implementation)
+from .equivalent_width import (
+    calculate_equivalent_width,
     calculate_equivalent_widths,
-    ews_to_abundances,
-    ews_to_stellar_parameters,
-    EWFitResult
+    equivalent_width_from_linelist,
+    EWCalculator,
+    EWResult,
+    EWFitResult,
+    calculate_EW,
+    calculate_EWs,
 )
 
-# Optimization utilities
-from .optimization import (
-    create_optimizer,
-    chi_squared_objective,
-    stellar_parameter_equations
-)
-
-# Parameter handling
-from .parameter_scaling import (
-    transform_parameters,
-    inverse_transform_parameters,
-    get_parameter_bounds,
-    ParameterBounds
-)
-
-# Line spread function utilities
-from .lsf import (
-    compute_lsf_matrix,
-    apply_lsf_convolution,
-    create_gaussian_lsf
-)
-
-# Fitting utilities
-from .utils import (
-    validate_observed_spectrum,
-    setup_wavelength_windows,
-    apply_continuum_adjustment,
-    FittingError
+# Interactive log(gf) fitting (NEW)
+from .interactive_fitting import (
+    LineFittingSession,
+    LineFitState,
+    FittingSessionResult,
 )
 
 __all__ = [
@@ -82,38 +77,25 @@ __all__ = [
     'FitResult',
     'FitParameters',
     'validate_fit_parameters',
-    
-    # Equivalent width analysis
+
+    # Equivalent width calculation (NEW)
+    'calculate_equivalent_width',
     'calculate_equivalent_widths',
-    'ews_to_abundances', 
-    'ews_to_stellar_parameters',
+    'equivalent_width_from_linelist',
+    'EWCalculator',
+    'EWResult',
     'EWFitResult',
-    
-    # Optimization
-    'create_optimizer',
-    'chi_squared_objective',
-    'stellar_parameter_equations',
-    
-    # Parameter handling
-    'transform_parameters',
-    'inverse_transform_parameters',
-    'get_parameter_bounds',
-    'ParameterBounds',
-    
-    # LSF utilities
-    'compute_lsf_matrix',
-    'apply_lsf_convolution',
-    'create_gaussian_lsf',
-    
-    # Utilities
-    'validate_observed_spectrum',
-    'setup_wavelength_windows',
-    'apply_continuum_adjustment',
-    'FittingError'
+    'calculate_EW',
+    'calculate_EWs',
+
+    # Interactive log(gf) fitting (NEW)
+    'LineFittingSession',
+    'LineFitState',
+    'FittingSessionResult',
 ]
 
 # Module metadata
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 __author__ = 'Jorg Development Team'
 __email__ = 'jorg@stellar.synthesis'
 __description__ = 'JAX-optimized parameter fitting for stellar spectral analysis'

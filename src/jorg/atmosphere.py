@@ -418,6 +418,27 @@ def interpolate_marcs(Teff: float,
 
 # Convenience functions for backward compatibility and specific use cases
 
+def interpolate_marcs_atmosphere(
+    teff: float,
+    logg: float,
+    metallicity: float = 0.0,
+    alpha_enhancement: float = 0.0,
+    **kwargs
+) -> ModelAtmosphere:
+    """
+    Compatibility wrapper for older callers expecting interpolate_marcs_atmosphere().
+
+    Parameters use [M/H] and [alpha/H]; convert to [alpha/M] for interpolate_marcs().
+    """
+    alpha_m = alpha_enhancement - metallicity
+    return interpolate_marcs(
+        Teff=teff,
+        logg=logg,
+        m_H=metallicity,
+        alpha_m=alpha_m,
+        **kwargs
+    )
+
 def interpolate_marcs_from_abundances(Teff: float,
                                     logg: float, 
                                     A_X: Dict[int, float],

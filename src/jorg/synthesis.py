@@ -1031,6 +1031,44 @@ def synthesize(atm, linelist=None, A_X=None, wavelengths=(4000.0, 7000.0),
     )
 
 
+def synthesize_spectrum(
+    wavelengths,
+    atmosphere,
+    linelist,
+    abundances=None,
+    A_X=None,
+    vmic: float = 1.0,
+    m_H: float = 0.0,
+    alpha_H: Optional[float] = None,
+    continuum_method: Optional[str] = None,
+    **kwargs
+):
+    """
+    Compatibility wrapper returning (flux, continuum) arrays.
+
+    continuum_method is accepted for backward compatibility and ignored.
+    """
+    if A_X is None:
+        A_X = create_korg_compatible_abundance_array(
+            m_H=m_H,
+            alpha_H=alpha_H if alpha_H is not None else m_H,
+            abundances=abundances,
+        )
+
+    rectify = kwargs.pop('rectify', False)
+    result = synthesize_korg_compatible(
+        atm=atmosphere,
+        linelist=linelist,
+        A_X=A_X,
+        wavelengths=np.asarray(wavelengths),
+        vmic=vmic,
+        return_cntm=True,
+        rectify=rectify,
+        **kwargs
+    )
+    return np.asarray(result.flux), np.asarray(result.cntm)
+
+
 def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0), 
           linelist=None, rectify=True, rectify_mode="continuum", rectify_percentile=99.5,
           R=float('inf'), vsini=0, vmic=1.0,
@@ -1663,9 +1701,136 @@ DEBUGGING SESSION COMPLETED - TARGET: <1% Korg.jl Agreement
     to achieve <1% disagreement with Korg.jl across all 3 stellar types.
 """
 
-# Export main functions  
-__all__ = ['synth', 'synthesize', 'synthesize_korg_compatible', 'SynthesisResult', 
-           'create_korg_compatible_abundance_array', 'validate_synthesis_setup', 
+
+def synthesize_with_loggf_adjustments(
+    Teff: float,
+    logg: float,
+    m_H: float,
+    wavelengths: Union[Tuple[float, float], np.ndarray],
+    loggf_adjustments: Dict[float, float],
+    alpha_H: Optional[float] = None,
+    linelist: Optional[List] = None,
+    A_X: Optional[np.ndarray] = None,
+    vmic: float = 1.0,
+    hydrogen_lines: bool = True,
+    wavelength_tolerance: float = 0.01,
+    **kwargs
+) -> SynthesisResult:
+    """
+    Synthesize spectrum with log(gf) adjustments for individual lines.
+
+    This is a convenience function for interactive log(gf) fitting. It applies
+    adjustments to the linelist before synthesis, keeping atmospheric model
+    and abundances fixed.
+
+    Parameters
+    ----------
+    Teff : float
+        Effective temperature in K
+    logg : float
+        Surface gravity (log g)
+    m_H : float
+        Metallicity [metals/H]
+    wavelengths : tuple or np.ndarray
+        Wavelength range (wl_min, wl_max) or array in Angstroms
+    loggf_adjustments : dict
+        Dictionary of {wavelength_A: delta_loggf} for lines to modify.
+        Positive values increase line strength, negative decrease it.
+    alpha_H : float, optional
+        Alpha element enhancement [α/H]. If None, defaults to m_H.
+    linelist : list, optional
+        Spectral line list. If None, uses built-in VALD solar linelist.
+    A_X : np.ndarray, optional
+        Abundance array. If None, created from m_H and alpha_H.
+    vmic : float, optional
+        Microturbulent velocity in km/s (default: 1.0)
+    hydrogen_lines : bool, optional
+        Include hydrogen lines (default: True)
+    wavelength_tolerance : float, optional
+        Tolerance for matching wavelengths in Angstroms (default: 0.01)
+    **kwargs
+        Additional arguments passed to synthesize_korg_compatible()
+
+    Returns
+    -------
+    SynthesisResult
+        Synthesis result with modified log(gf) values applied
+
+    Examples
+    --------
+    >>> from jorg.synthesis import synthesize_with_loggf_adjustments
+    >>>
+    >>> # Adjust individual lines
+    >>> result = synthesize_with_loggf_adjustments(
+    ...     5780, 4.44, 0.0, (5000, 5010),
+    ...     loggf_adjustments={5001.2: 0.1, 5005.8: -0.05}
+    ... )
+    >>>
+    >>> # Compare with reference
+    >>> from jorg.synthesis import synth
+    >>> reference = synth(5780, 4.44, 0.0, (5000, 5010))
+    >>>
+    >>> # Calculate equivalent widths
+    >>> from jorg.fit.equivalent_width import calculate_equivalent_widths
+    >>> ews = calculate_equivalent_widths(result, line_centers=[5001.2])
+
+    Notes
+    -----
+    - Wavelengths in loggf_adjustments are assumed to be in air (observed)
+    - The original linelist is never modified
+    - For fitting loops, consider using LogGFModifier directly for efficiency
+    """
+    from .lines.linelist_modifier import LogGFModifier
+    from .lines.linelist_data import get_VALD_solar_linelist
+    from .atmosphere import interpolate_marcs
+
+    # Get default linelist if not provided
+    if linelist is None:
+        linelist = get_VALD_solar_linelist()
+
+    # Apply adjustments
+    modifier = LogGFModifier(linelist, wavelength_tolerance=wavelength_tolerance)
+
+    for wl, delta_loggf in loggf_adjustments.items():
+        try:
+            modifier.adjust_line(wl, delta_loggf)
+        except ValueError as e:
+            import warnings
+            warnings.warn(f"Could not adjust line at {wl:.2f} Å: {e}")
+
+    modified_linelist = modifier.apply_modifications()
+
+    # Create abundance array if not provided
+    if A_X is None:
+        A_X = create_korg_compatible_abundance_array(m_H, alpha_H if alpha_H is not None else m_H)
+
+    # Get atmosphere
+    atm = interpolate_marcs(Teff, logg, m_H)
+
+    # Synthesize
+    result = synthesize_korg_compatible(
+        atm=atm,
+        linelist=modified_linelist,
+        A_X=A_X,
+        wavelengths=wavelengths,
+        vmic=vmic,
+        hydrogen_lines=hydrogen_lines,
+        **kwargs
+    )
+
+    # Store modifications info in result
+    result.loggf_adjustments = modifier.get_modifications()
+    result.original_linelist = linelist
+    result.modified_linelist = modified_linelist
+
+    return result
+
+
+# Export main functions
+__all__ = ['synth', 'synthesize', 'synthesize_korg_compatible', 'SynthesisResult',
+           'synthesize_spectrum',
+           'synthesize_with_loggf_adjustments',  # New log(gf) adjustment function
+           'create_korg_compatible_abundance_array', 'validate_synthesis_setup',
            'diagnose_synthesis_result', 'test_voigt_integration',
            'validate_proper_physics_integration',  # New physics validation function
            # Export newly validated Voigt functions for direct use
