@@ -102,8 +102,12 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
         electron_density_guess = np.array([layer.electron_number_density for layer in layers])
     else:
         temperatures = np.array(atm["temperature"])
-        number_density_layers = np.array(atm["number_density"])
-        electron_density_guess = np.array(atm["electron_density"])
+        number_density_layers = None
+        electron_density_guess = None
+        if "number_density" in atm:
+            number_density_layers = np.array(atm["number_density"])
+        if "electron_density" in atm:
+            electron_density_guess = np.array(atm["electron_density"])
 
     n_layers = len(temperatures)
 
@@ -121,6 +125,8 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
         electron_densities = np.asarray(use_chemical_equilibrium_from['electron_densities'])
         number_densities = use_chemical_equilibrium_from['number_densities']
     elif number_densities is None or electron_densities is None:
+        if number_density_layers is None or electron_density_guess is None:
+            raise ValueError("atm must include number_density and electron_density when computing chemical equilibrium.")
         # Only calculate CE if not provided and not reused
         abs_abundances = 10 ** (A_X - 12)
         abs_abundances = abs_abundances / np.sum(abs_abundances)
