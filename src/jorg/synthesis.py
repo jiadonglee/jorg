@@ -142,6 +142,19 @@ import time
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
 
+# GPU/device utilities
+try:
+    from .gpu import init_jax, get_device_info, timed_block, is_gpu_available
+    _GPU_AVAILABLE = True
+except ImportError:
+    _GPU_AVAILABLE = False
+
+# Initialize JAX and log device info on module import
+if _GPU_AVAILABLE:
+    _DEVICE_INFO = init_jax(use_float32_on_gpu=True, verbose=False)
+else:
+    _DEVICE_INFO = {'device_kind': 'cpu', 'use_gpu': False}
+
 # Jorg physics modules
 from .atmosphere import interpolate_marcs as interpolate_atmosphere
 # Import NEW cubic interpolation
@@ -156,13 +169,7 @@ from .statmech import (
     create_default_log_equilibrium_constants,
     Species, Formula
 )
-# Import NEW FIXED implementations
-try:
-    from .statmech.exact_partition_functions import create_exact_partition_functions
-    from .statmech.full_molecular_equilibrium import FullMolecularEquilibrium
-except ImportError:
-    create_exact_partition_functions = None
-    FullMolecularEquilibrium = None
+# Optional helpers removed during trimming.
 # Korg.jl-equivalent chemical equilibrium solver (Newton + molecular equilibrium)
 from .statmech.korg_chemical_equilibrium import chemical_equilibrium
 # Import new proper physics implementations (August 2025 hardcode fixes)
@@ -483,20 +490,9 @@ def synthesize_korg_compatible(
             if verbose:
                 print("  🎯 Using Korg-compatible partition functions (atomic + molecular)")
         except Exception as e:
-            # Fallback to exact partition functions if available
-            if create_exact_partition_functions is not None:
-                try:
-                    partition_funcs = create_exact_partition_functions()
-                    if verbose:
-                        print("  🎯 Using EXACT partition functions as fallback")
-                except Exception as e2:
-                    partition_funcs = create_default_partition_functions()
-                    if verbose:
-                        print(f"  ⚠️ Fallback to default partition functions: {e}, {e2}")
-            else:
-                partition_funcs = create_default_partition_functions()
-                if verbose:
-                    print(f"  ⚠️ Fallback to default partition functions: {e}")
+            raise RuntimeError(
+                "Partition function data not available. Set JORG_DATA_DIR to your data bundle."
+            ) from e
     
     if log_equilibrium_constants is None:
         # Korg.jl-compatible molecular equilibrium constants
@@ -594,6 +590,8 @@ def synthesize_korg_compatible(
     ce_source = _normalize_ce_source(use_chemical_equilibrium_from)
     if verbose and ce_source is None:
         print("ℹ️  Chemical equilibrium is solved per layer (grid-independent); reuse it for grid sweeps.")
+        if _GPU_AVAILABLE and _DEVICE_INFO.get('use_gpu'):
+            print(f"🚀 GPU acceleration enabled ({_DEVICE_INFO.get('device_kind', 'unknown')})")
     elif verbose:
         print("✅ Reusing chemical equilibrium for this synthesis.")
 
@@ -837,13 +835,16 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
         B_mid = source_matrix[0, len(wl_cm)//2]
         print(f"   Example: B_λ({wl_mid*1e8:.0f}Å, {T_surface:.0f}K) = {B_mid:.3e} erg/s/cm²/cm/sr")
     
-    # CRITICAL FIX: Calculate proper α5 reference instead of np.ones()
+    # α5 reference for anchored τ integration:
+    # Korg.jl anchors optical depth to τ_5000 from the atmosphere, which corresponds to the
+    # continuum opacity at 5000 Å (not total opacity including lines). Using total opacity
+    # here breaks the τ scaling and can distort both line depths and the returned continuum.
     alpha5_reference = None
     if alpha_continuum is not None:
         wl_array = np.asarray(wavelengths)
         idx_matches = np.where(np.isclose(wl_array, 5000.0, atol=1e-6))[0]
-        if idx_matches.size:
-            alpha5_reference = alpha_matrix[:, idx_matches[0]]
+        if idx_matches.size and alpha_continuum.shape == alpha_matrix.shape:
+            alpha5_reference = alpha_continuum[:, idx_matches[0]]
 
     if alpha5_reference is None:
         ce_source = None
@@ -1356,12 +1357,11 @@ def synthesize_spectrum(
     return np.asarray(result.flux), np.asarray(result.cntm)
 
 
-def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0), 
+def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
           linelist=None, rectify=True, rectify_mode="continuum", rectify_percentile=99.5,
           R=float('inf'), vsini=0, vmic=1.0,
-          hydrogen_lines=True, mu_points=20, 
+          hydrogen_lines=True, mu_points=20,
           rt_method="korg_default", use_cubic_interpolation=False,
-          use_exact_partition_functions=True, use_full_molecular_equilibrium=True,
           format_A_X_kwargs=None, synthesize_kwargs=None, verbose=False, **abundances):
     """
     Enhanced stellar synthesis interface (fully compatible with Korg.jl synth())
@@ -1409,11 +1409,6 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
         Radiative transfer method: 'korg_default', 'feautrier', 'short_char', 'hermite'
     use_cubic_interpolation : bool, optional
         Use cubic spline atmosphere interpolation (smoother, more accurate)
-    use_exact_partition_functions : bool, optional
-        **JANUARY 2025 UPGRADE**: Use exact Korg.jl partition functions (26% improvement for Fe I)
-        Fixes 17.5%-29.4% systematic electron density bias in chemical equilibrium solver
-    use_full_molecular_equilibrium : bool, optional
-        Use full 86+ molecular species (vs ~20 default)
     format_A_X_kwargs : dict, optional
         Advanced abundance formatting options
     synthesize_kwargs : dict, optional
@@ -1485,24 +1480,15 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
     synthesize_kwargs.setdefault('rectify_mode', rectify_mode)
     synthesize_kwargs.setdefault('rectify_percentile', rectify_percentile)
     
-    # Handle partition functions
-    if use_exact_partition_functions and create_exact_partition_functions is not None:
-        try:
-            synthesize_kwargs['partition_funcs'] = create_exact_partition_functions()
-        except:
-            pass  # Fallback to default
-    
-    # Handle molecular equilibrium
-    if use_full_molecular_equilibrium and FullMolecularEquilibrium is not None:
-        try:
-            mol_eq = FullMolecularEquilibrium()
-            log_K = {}
-            for molecule in mol_eq.get_all_molecular_species():
-                K = mol_eq.get_equilibrium_constant(molecule, 5000.0)
-                log_K[molecule] = np.log10(K)
-            synthesize_kwargs['log_equilibrium_constants'] = log_K
-        except:
-            pass  # Fallback to default
+    # Populate defaults for partition functions / molecular equilibrium constants.
+    try:
+        synthesize_kwargs.setdefault('partition_funcs', create_default_partition_functions())
+    except Exception:
+        pass
+    try:
+        synthesize_kwargs.setdefault('log_equilibrium_constants', create_default_log_equilibrium_constants())
+    except Exception:
+        pass
         
     # Create enhanced abundance array with alpha and individual elements
     A_X = format_abundances(

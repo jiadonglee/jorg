@@ -22,6 +22,16 @@ from .species import Species, MAX_ATOMIC_NUMBER
 from ..constants import kboltz_eV, kboltz_cgs, me_cgs, hplanck_cgs
 
 
+def _sign_no_zero(x):
+    """sign(x) but treat 0 as +1 to keep derivatives well-defined."""
+    s = np.sign(x)
+    if np.isscalar(s):
+        return 1.0 if s == 0 else float(s)
+    s = s.astype(np.float64, copy=False)
+    s[s == 0] = 1.0
+    return s
+
+
 def translational_U(mass_cgs: float, temperature: float) -> float:
     """
     Translational partition function contribution for free particles
@@ -112,11 +122,17 @@ def saha_ion_weights(temperature: float, ne: float, atomic_number: int,
     return wII, wIII
 
 
-def setup_chemical_equilibrium_residuals(temperature: float, n_total: float,
-                                        absolute_abundances: np.ndarray,
-                                        ionization_energies: Dict[int, Tuple],
-                                        partition_funcs: Dict[Species, Callable],
-                                        log_equilibrium_constants: Dict = None):
+def setup_chemical_equilibrium_residuals(
+    temperature: float,
+    n_total: float,
+    absolute_abundances: np.ndarray,
+    ionization_energies: Dict[int, Tuple],
+    partition_funcs: Dict[Species, Callable],
+    log_equilibrium_constants: Dict = None,
+    *,
+    wII_ne_precomputed: np.ndarray = None,
+    wIII_ne2_precomputed: np.ndarray = None,
+):
     """
     Setup residual function for chemical equilibrium nonlinear system
 
@@ -151,104 +167,287 @@ def setup_chemical_equilibrium_residuals(temperature: float, n_total: float,
         Residual function for scipy.optimize.root
     """
 
-    # Precompute Saha weights with ne=1 (will scale later)
-    wII_ne = np.zeros(MAX_ATOMIC_NUMBER)
-    wIII_ne2 = np.zeros(MAX_ATOMIC_NUMBER)
+    if wII_ne_precomputed is not None and wIII_ne2_precomputed is not None:
+        wII_ne = np.asarray(wII_ne_precomputed, dtype=np.float64)
+        wIII_ne2 = np.asarray(wIII_ne2_precomputed, dtype=np.float64)
+        if wII_ne.shape != (MAX_ATOMIC_NUMBER,) or wIII_ne2.shape != (MAX_ATOMIC_NUMBER,):
+            raise ValueError("Precomputed Saha weight arrays must have shape (92,).")
+    else:
+        # Precompute Saha weights with ne=1 (will scale later)
+        wII_ne = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+        wIII_ne2 = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
 
-    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
-        if Z in ionization_energies:
-            wII, wIII = saha_ion_weights(temperature, 1.0, Z, ionization_energies, partition_funcs)
-            wII_ne[Z-1] = wII
-            wIII_ne2[Z-1] = wIII
+        for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+            if Z in ionization_energies:
+                wII, wIII = saha_ion_weights(temperature, 1.0, Z, ionization_energies, partition_funcs)
+                wII_ne[Z - 1] = wII
+                wIII_ne2[Z - 1] = wIII
 
-    def residuals(x):
-        """
-        Residual function matching Korg.jl/src/statmech.jl:291-342
-        """
-        # Extract electron density (scaled by 1e-5 for numerical stability)
+    # Preprocess molecules for faster evaluation (and Jacobian assembly)
+    molecules = None
+    if log_equilibrium_constants is not None:
+        molecules = []
+        for mol_species, log_K_func in log_equilibrium_constants.items():
+            try:
+                atoms = tuple(mol_species.get_atoms())
+                if len(atoms) == 0:
+                    continue
+                atom_indices = np.asarray([Z - 1 for Z in atoms], dtype=np.int64)
+                uniq, counts = np.unique(atom_indices, return_counts=True)
+                molecules.append(
+                    {
+                        "species": mol_species,
+                        "logK": log_K_func,
+                        "uniq": uniq,
+                        "counts": counts.astype(np.float64),
+                        "n_atoms": float(len(atoms)),
+                        "charge": int(getattr(mol_species, "charge", 0)),
+                        # Charged diatomic: first atom ionized, second neutral (matches existing code)
+                        "idx1": int(atom_indices[0]) if len(atom_indices) >= 1 else None,
+                        "idx2": int(atom_indices[1]) if len(atom_indices) >= 2 else None,
+                    }
+                )
+            except Exception:
+                continue
+
+    if molecules:
+        log_T = float(np.log(temperature))
+        log_kT = float(np.log10(kboltz_cgs * temperature))
+        molecules_with_constants = []
+        for mol in molecules:
+            try:
+                logKp = float(mol["logK"](log_T))  # log10(K_p)
+                log_nK = logKp - (mol["n_atoms"] - 1.0) * log_kT
+                if not np.isfinite(log_nK):
+                    continue
+                mol = dict(mol)
+                mol["log_nK"] = float(log_nK)
+                molecules_with_constants.append(mol)
+            except Exception:
+                continue
+        molecules = molecules_with_constants or None
+
+    cache = {"x_f": None, "F": None, "common": None, "x_j": None, "J": None}
+
+    def _compute_common(x):
+        x = np.asarray(x, dtype=np.float64)
+        sign_ne = _sign_no_zero(x[-1])
         ne = abs(x[-1]) * n_total * 1e-5
+        ne = max(float(ne), 1e-300)
 
-        # Extract neutral fractions and compute number densities
-        neutral_fractions = np.abs(x[:-1])  # abs() prevents negative densities
+        sign_f = _sign_no_zero(x[:-1])
+        neutral_fractions = np.abs(x[:-1])
         atom_number_densities = absolute_abundances * (n_total - ne)
         neutral_number_densities = atom_number_densities * neutral_fractions
 
-        # Initialize residuals
-        F = np.zeros_like(x)
+        inv_ne = 1.0 / ne
+        inv_ne2 = inv_ne * inv_ne
+        wII = wII_ne * inv_ne
+        wIII = wIII_ne2 * inv_ne2
 
-        # Element conservation and charge neutrality
-        # Source: Korg.jl/src/statmech.jl:303-312
-        for Z in range(1, MAX_ATOMIC_NUMBER + 1):
-            wII = wII_ne[Z-1] / ne
-            wIII = wIII_ne2[Z-1] / (ne * ne)
+        R_elem = atom_number_densities - (1.0 + wII + wIII) * neutral_number_densities
+        R_charge = float(np.sum((wII + 2.0 * wIII) * neutral_number_densities) - ne)
 
-            # Element conservation: n(X_total) = n(X I) + n(X II) + n(X III)
-            # Residual: n(X_total) - (1 + wII + wIII) * n(X I)
-            F[Z-1] = atom_number_densities[Z-1] - (1 + wII + wIII) * neutral_number_densities[Z-1]
+        log_neutral = None
+        active = None
+        n_tot_minus_ne = None
 
-            # Charge neutrality contribution from this element
-            # Each X II contributes 1 electron, each X III contributes 2 electrons
-            F[-1] += (wII + 2 * wIII) * neutral_number_densities[Z-1]
+        if molecules:
+            log_neutral = np.log10(np.maximum(neutral_number_densities, 1e-100))
+            active = neutral_number_densities > 1e-100
+            n_tot_minus_ne = float(n_total - ne)
+            if abs(n_tot_minus_ne) < 1e-300:
+                n_tot_minus_ne = 1e-300 if n_tot_minus_ne >= 0 else -1e-300
 
-        # Charge neutrality: Σ electrons from ions = ne
-        # Source: Korg.jl/src/statmech.jl:312
-        F[-1] -= ne
-
-        # Add molecular contributions if provided
-        # Source: Korg.jl/src/statmech.jl:314-337
-        if log_equilibrium_constants is not None:
-            # Convert to log10 space for stability (matches Korg.jl)
-            log_neutral_densities = np.log10(np.maximum(neutral_number_densities, 1e-100))
-
-            for mol_species, log_K_func in log_equilibrium_constants.items():
+            for mol in molecules:
                 try:
-                    log_T = np.log(temperature)
-                    log_K_partial_pressure = log_K_func(log_T)  # log10(K_p)
+                    log_nK = mol["log_nK"]
+                    if mol["charge"] == 1:
+                        idx1 = mol["idx1"]
+                        idx2 = mol["idx2"]
+                        if idx1 is None or idx2 is None:
+                            continue
+                        wII_1 = wII[idx1]
+                        if wII_1 <= 0.0:
+                            continue
+                        log_n_mol = log_neutral[idx1] + np.log10(wII_1) + log_neutral[idx2] - log_nK
+                        n_mol = float(10.0 ** log_n_mol)
+                        if not np.isfinite(n_mol) or n_mol == 0.0:
+                            continue
+                        R_elem[idx1] -= n_mol
+                        R_elem[idx2] -= n_mol
+                        R_charge += n_mol
+                    else:
+                        idx = mol["uniq"]
+                        stoich = mol["counts"]
+                        if idx.size == 0:
+                            continue
+                        log_n_mol = float(np.dot(stoich, log_neutral[idx]) - log_nK)
+                        n_mol = float(10.0 ** log_n_mol)
+                        if not np.isfinite(n_mol) or n_mol == 0.0:
+                            continue
+                        R_elem[idx] -= stoich * n_mol
+                except Exception:
+                    continue
 
-                    # Convert from partial pressure to number density form in log10
-                    # log10(K_n) = log10(K_p) - (n_atoms - 1) * log10(kT)
-                    n_atoms = len(mol_species.formula.atoms)
-                    log_nK = log_K_partial_pressure - (n_atoms - 1) * np.log10(kboltz_cgs * temperature)
+        denom_elem = np.maximum(atom_number_densities, 1e-100)
+        denom_charge = ne * 1e-5
 
-                    # Get constituent atoms
-                    atoms = list(mol_species.get_atoms())
+        F = np.zeros_like(x)
+        F[:-1] = R_elem / denom_elem
+        F[-1] = R_charge / denom_charge
 
-                    if mol_species.charge == 1:  # Charged diatomic
-                        # First atom is ionized, second is neutral
-                        Z1, Z2 = atoms[0], atoms[1]
-                        wII_1 = wII_ne[Z1-1] / ne
+        return {
+            "x": x,
+            "sign_f": sign_f,
+            "sign_ne": sign_ne,
+            "neutral_fractions": neutral_fractions,
+            "atom_number_densities": atom_number_densities,
+            "neutral_number_densities": neutral_number_densities,
+            "wII": wII,
+            "wIII": wIII,
+            "inv_ne": inv_ne,
+            "R_elem": R_elem,
+            "R_charge": R_charge,
+            "denom_elem": denom_elem,
+            "denom_charge": denom_charge,
+            "log_neutral": log_neutral,
+            "active": active,
+            "n_tot_minus_ne": n_tot_minus_ne,
+            "F": F,
+        }
 
-                        # n_mol = n(Z1 II) * n(Z2 I) / K
-                        log_n1_II = log_neutral_densities[Z1-1] + np.log10(wII_1)
-                        log_n2_I = log_neutral_densities[Z2-1]
-                        log_n_mol = log_n1_II + log_n2_I - log_nK
-                        n_mol = 10**log_n_mol
+    def residuals(x):
+        x = np.asarray(x, dtype=np.float64)
+        if cache["x_f"] is not None and np.array_equal(x, cache["x_f"]):
+            return cache["F"]
+        common = _compute_common(x)
+        cache["x_f"] = common["x"].copy()
+        cache["F"] = common["F"]
+        cache["common"] = common
+        return common["F"]
 
-                        # Subtract molecules from element conservation
-                        F[Z1-1] -= n_mol
-                        F[Z2-1] -= n_mol
-                        # Add electron from ionized molecule
-                        F[-1] += n_mol
+    def jacobian(x):
+        x = np.asarray(x, dtype=np.float64)
+        if cache["x_j"] is not None and np.array_equal(x, cache["x_j"]):
+            return cache["J"]
 
-                    else:  # Neutral molecule
-                        # n_mol = Π n(atoms) / K
-                        log_n_mol = sum(log_neutral_densities[Z-1] for Z in atoms) - log_nK
-                        n_mol = 10**log_n_mol
+        if cache["x_f"] is not None and np.array_equal(x, cache["x_f"]) and cache["common"] is not None:
+            common = cache["common"]
+        else:
+            common = _compute_common(x)
 
-                        # Subtract molecules from each constituent element
-                        for Z in atoms:
-                            F[Z-1] -= n_mol
+        neutral_fractions = common["neutral_fractions"]
+        atom_number_densities = common["atom_number_densities"]
+        neutral_number_densities = common["neutral_number_densities"]
+        wII = common["wII"]
+        wIII = common["wIII"]
+        inv_ne = common["inv_ne"]
 
-                except (KeyError, IndexError, ValueError):
-                    continue  # Skip problematic molecules
+        dR_df = np.zeros((MAX_ATOMIC_NUMBER, MAX_ATOMIC_NUMBER), dtype=np.float64)
+        np.fill_diagonal(dR_df, -(1.0 + wII + wIII) * atom_number_densities)
 
-        # Normalize residuals for numerical stability
-        # Source: Korg.jl/src/statmech.jl:339-340
-        F[:-1] /= np.maximum(atom_number_densities, 1e-100)
-        F[-1] /= (ne * 1e-5)
+        A = absolute_abundances
+        dn_dne = -A * neutral_fractions
+        dS_dne = -(wII + 2.0 * wIII) * inv_ne
+        dR_dne = (-A) - ((1.0 + wII + wIII) * dn_dne + neutral_number_densities * dS_dne)
 
-        return F
+        Q = wII + 2.0 * wIII
+        dR_charge_df = Q * atom_number_densities
+        dQ_dne = -(wII + 4.0 * wIII) * inv_ne
+        dR_charge_dne = float(np.sum(Q * dn_dne + neutral_number_densities * dQ_dne) - 1.0)
 
+        if molecules and common["log_neutral"] is not None:
+            log_neutral = common["log_neutral"]
+            active = common["active"]
+            n_tot_minus_ne = common["n_tot_minus_ne"]
+
+            for mol in molecules:
+                try:
+                    log_nK = mol["log_nK"]
+                    if mol["charge"] == 1:
+                        idx1 = mol["idx1"]
+                        idx2 = mol["idx2"]
+                        if idx1 is None or idx2 is None:
+                            continue
+                        wII_1 = wII[idx1]
+                        if wII_1 <= 0.0:
+                            continue
+                        log_n_mol = log_neutral[idx1] + np.log10(wII_1) + log_neutral[idx2] - log_nK
+                        n_mol = float(10.0 ** log_n_mol)
+                        if not np.isfinite(n_mol) or n_mol == 0.0:
+                            continue
+
+                        f1 = max(float(neutral_fractions[idx1]), 1e-300)
+                        f2 = max(float(neutral_fractions[idx2]), 1e-300)
+                        dnmol_df1 = (n_mol / f1) if active[idx1] else 0.0
+                        dnmol_df2 = (n_mol / f2) if active[idx2] else 0.0
+
+                        dR_df[idx1, idx1] -= dnmol_df1
+                        dR_df[idx1, idx2] -= dnmol_df2
+                        dR_df[idx2, idx1] -= dnmol_df1
+                        dR_df[idx2, idx2] -= dnmol_df2
+
+                        dR_charge_df[idx1] += dnmol_df1
+                        dR_charge_df[idx2] += dnmol_df2
+
+                        active_count = float(active[idx1]) + float(active[idx2])
+                        dnmol_dne = n_mol * (-inv_ne - active_count / n_tot_minus_ne)
+                        dR_dne[idx1] -= dnmol_dne
+                        dR_dne[idx2] -= dnmol_dne
+                        dR_charge_dne += dnmol_dne
+                    else:
+                        idx = mol["uniq"]
+                        stoich = mol["counts"]
+                        if idx.size == 0:
+                            continue
+                        log_n_mol = float(np.dot(stoich, log_neutral[idx]) - log_nK)
+                        n_mol = float(10.0 ** log_n_mol)
+                        if not np.isfinite(n_mol) or n_mol == 0.0:
+                            continue
+
+                        active_idx = active[idx]
+                        if np.any(active_idx):
+                            f_u = np.maximum(neutral_fractions[idx], 1e-300)
+                            dnmol_df = np.zeros_like(stoich)
+                            dnmol_df[active_idx] = stoich[active_idx] * n_mol / f_u[active_idx]
+                            dR_df[np.ix_(idx, idx)] -= stoich[:, None] * dnmol_df[None, :]
+
+                        n_active = float(np.sum(stoich[active_idx])) if np.any(active_idx) else 0.0
+                        if n_active != 0.0:
+                            dnmol_dne = -n_active * n_mol / n_tot_minus_ne
+                            dR_dne[idx] -= stoich * dnmol_dne
+                except Exception:
+                    continue
+
+        denom_elem = common["denom_elem"]
+        denom_charge = common["denom_charge"]
+        R_elem = common["R_elem"]
+        R_charge = common["R_charge"]
+        sign_f = common["sign_f"]
+        sign_ne = common["sign_ne"]
+
+        J = np.zeros((MAX_ATOMIC_NUMBER + 1, MAX_ATOMIC_NUMBER + 1), dtype=np.float64)
+        J[:MAX_ATOMIC_NUMBER, :MAX_ATOMIC_NUMBER] = (dR_df / denom_elem[:, None]) * sign_f[None, :]
+
+        use_denom = atom_number_densities > 1e-100
+        dF_dne = dR_dne / denom_elem
+        if np.any(use_denom):
+            dF_dne = dF_dne + (R_elem * A / (denom_elem * denom_elem)) * use_denom
+
+        dne_dx = sign_ne * n_total * 1e-5
+        J[:MAX_ATOMIC_NUMBER, -1] = dF_dne * dne_dx
+
+        J[-1, :MAX_ATOMIC_NUMBER] = (dR_charge_df / denom_charge) * sign_f
+        dF_charge_dne = (dR_charge_dne / denom_charge) - (R_charge * 1e-5) / (denom_charge * denom_charge)
+        J[-1, -1] = dF_charge_dne * dne_dx
+
+        cache["x_j"] = common["x"].copy()
+        cache["J"] = J
+        return J
+
+    residuals.jacobian = jacobian
+    residuals.molecules = molecules
     return residuals
 
 
@@ -307,30 +506,56 @@ def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
 
     # Compute initial guess by neglecting molecules
     # Source: Korg.jl/src/statmech.jl:124-128
-    neutral_fraction_guess = np.zeros(MAX_ATOMIC_NUMBER)
+    neutral_fraction_guess = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+    wII_ne = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+    wIII_ne2 = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+
+    ne_guess = max(float(model_atm_ne), 1e-300)
+    ne_guess2 = ne_guess * ne_guess
+
     for Z in range(1, MAX_ATOMIC_NUMBER + 1):
         if Z in ionization_energies:
-            wII, wIII = saha_ion_weights(temperature, model_atm_ne, Z, ionization_energies, partition_funcs)
-            neutral_fraction_guess[Z-1] = 1.0 / (1.0 + wII + wIII)
+            wII, wIII = saha_ion_weights(temperature, ne_guess, Z, ionization_energies, partition_funcs)
+            neutral_fraction_guess[Z - 1] = 1.0 / (1.0 + wII + wIII)
+            wII_ne[Z - 1] = wII * ne_guess
+            wIII_ne2[Z - 1] = wIII * ne_guess2
 
     # Initial guess: [neutral_fractions, ne/n_total*1e5]
     x0 = np.concatenate([neutral_fraction_guess, [model_atm_ne / n_total * 1e5]])
 
     # Setup residual function
     residuals_func = setup_chemical_equilibrium_residuals(
-        temperature, n_total, abs_abund_array,
-        ionization_energies, partition_funcs, log_equilibrium_constants
+        temperature,
+        n_total,
+        abs_abund_array,
+        ionization_energies,
+        partition_funcs,
+        log_equilibrium_constants,
+        wII_ne_precomputed=wII_ne,
+        wIII_ne2_precomputed=wIII_ne2,
     )
 
     # Solve nonlinear system
     # Source: Korg.jl/src/statmech.jl:192-205
     try:
-        sol = root(residuals_func, x0, method='hybr', options={'xtol': 1e-8, 'maxfev': 1000})
+        sol = root(
+            residuals_func,
+            x0,
+            method='hybr',
+            jac=getattr(residuals_func, "jacobian", None),
+            options={'xtol': 1e-8, 'maxfev': 1000},
+        )
 
         if not sol.success:
             # Try again with very small ne guess (Korg.jl fallback)
             x0[-1] = 1e-5
-            sol = root(residuals_func, x0, method='hybr', options={'xtol': 1e-8, 'maxfev': 1000})
+            sol = root(
+                residuals_func,
+                x0,
+                method='hybr',
+                jac=getattr(residuals_func, "jacobian", None),
+                options={'xtol': 1e-8, 'maxfev': 1000},
+            )
 
             if not sol.success:
                 raise RuntimeError(f"Chemical equilibrium solver failed: {sol.message}")
@@ -352,50 +577,80 @@ def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
 
     # Build species densities dict
     # Source: Korg.jl/src/statmech.jl:141-162
-    species_densities = {}
+    species_densities: Dict[Species, float] = {}
 
-    # Neutral atomic species
-    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
-        species = Species.from_atomic_number(Z, 0)
-        species_densities[species] = (n_total - ne) * abs_abund_array[Z-1] * neutral_fractions[Z-1]
+    n0 = (n_total - ne) * abs_abund_array * neutral_fractions
+    inv_ne = 1.0 / max(float(ne), 1e-300)
+    wII_sol = wII_ne * inv_ne
+    wIII_sol = wIII_ne2 * (inv_ne * inv_ne)
 
-    # Ionized atomic species
     for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        n_neutral = float(n0[Z - 1])
+        species_densities[Species.from_atomic_number(Z, 0)] = n_neutral
         if Z in ionization_energies:
-            wII, wIII = saha_ion_weights(temperature, ne, Z, ionization_energies, partition_funcs)
+            species_densities[Species.from_atomic_number(Z, 1)] = float(wII_sol[Z - 1] * n_neutral)
+            species_densities[Species.from_atomic_number(Z, 2)] = float(wIII_sol[Z - 1] * n_neutral)
 
-            n_neutral = species_densities[Species.from_atomic_number(Z, 0)]
-            species_densities[Species.from_atomic_number(Z, 1)] = wII * n_neutral
-            species_densities[Species.from_atomic_number(Z, 2)] = wIII * n_neutral
-
-    # Molecular species
+    # Molecular species (reuse precomputed equilibrium constants from the residual function)
     if log_equilibrium_constants is not None:
-        log_T = np.log(temperature)
+        mols = getattr(residuals_func, "molecules", None)
+        if mols:
+            n1 = wII_sol * n0
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_n0 = np.log10(n0)
+                log_n1 = np.log10(n1)
 
-        for mol_species, log_K_func in log_equilibrium_constants.items():
-            try:
-                log_K_partial = log_K_func(log_T)  # log10(K_p)
-                n_atoms = len(mol_species.formula.atoms)
-                log_nK = log_K_partial - (n_atoms - 1) * np.log10(kboltz_cgs * temperature)
+            for mol in mols:
+                try:
+                    log_nK = float(mol["log_nK"])
+                    mol_species = mol["species"]
+                    if mol["charge"] == 1:
+                        idx1 = mol["idx1"]
+                        idx2 = mol["idx2"]
+                        if idx1 is None or idx2 is None:
+                            continue
+                        log_n_mol = float(log_n1[idx1] + log_n0[idx2] - log_nK)
+                        if not np.isfinite(log_n_mol):
+                            continue
+                        species_densities[mol_species] = float(10.0 ** log_n_mol)
+                    else:
+                        idx = mol["uniq"]
+                        stoich = mol["counts"]
+                        if idx.size == 0:
+                            continue
+                        log_n_mol = float(np.dot(stoich, log_n0[idx]) - log_nK)
+                        if not np.isfinite(log_n_mol):
+                            continue
+                        species_densities[mol_species] = float(10.0 ** log_n_mol)
+                except Exception:
+                    continue
+        else:
+            log_T = np.log(temperature)
+            for mol_species, log_K_func in log_equilibrium_constants.items():
+                try:
+                    log_K_partial = log_K_func(log_T)  # log10(K_p)
+                    n_atoms = len(mol_species.formula.atoms)
+                    log_nK = log_K_partial - (n_atoms - 1) * np.log10(kboltz_cgs * temperature)
 
-                atoms = list(mol_species.get_atoms())
+                    atoms = list(mol_species.get_atoms())
 
-                if mol_species.charge == 1:
-                    Z1, Z2 = atoms[0], atoms[1]
-                    n1_II = species_densities[Species.from_atomic_number(Z1, 1)]
-                    n2_I = species_densities[Species.from_atomic_number(Z2, 0)]
+                    if mol_species.charge == 1:
+                        Z1, Z2 = atoms[0], atoms[1]
+                        n1_II = species_densities[Species.from_atomic_number(Z1, 1)]
+                        n2_I = species_densities[Species.from_atomic_number(Z2, 0)]
 
-                    if n1_II > 0 and n2_I > 0:
-                        n_mol = 10**(np.log10(n1_II) + np.log10(n2_I) - log_nK)
-                        species_densities[mol_species] = n_mol
-                else:
-                    element_log_ns = [np.log10(species_densities[Species.from_atomic_number(Z, 0)])
-                                     for Z in atoms]
-                    if all(np.isfinite(element_log_ns)):
-                        n_mol = 10**(sum(element_log_ns) - log_nK)
-                        species_densities[mol_species] = n_mol
-            except (KeyError, ValueError):
-                continue
+                        if n1_II > 0 and n2_I > 0:
+                            n_mol = 10 ** (np.log10(n1_II) + np.log10(n2_I) - log_nK)
+                            species_densities[mol_species] = n_mol
+                    else:
+                        element_log_ns = [
+                            np.log10(species_densities[Species.from_atomic_number(Z, 0)]) for Z in atoms
+                        ]
+                        if all(np.isfinite(element_log_ns)):
+                            n_mol = 10 ** (sum(element_log_ns) - log_nK)
+                            species_densities[mol_species] = n_mol
+                except (KeyError, ValueError):
+                    continue
 
     return ne, species_densities
 

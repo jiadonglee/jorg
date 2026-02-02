@@ -34,6 +34,7 @@ from ..constants import (
     bohr_radius_cgs, electron_charge_cgs, electron_mass_cgs, eV_to_cgs, ATOMIC_MASS_UNIT
 )
 from ..statmech.species import get_mass
+from ..data import get_data_path
 from .profiles import line_profile
 from .broadening import scaled_vdw, doppler_width
 
@@ -486,11 +487,12 @@ def load_stark_profiles(data_file: Optional[Path] = None) -> Dict:
         return {}
         
     if data_file is None:
-        # Try to find the default data file
-        data_dir = Path(__file__).parent.parent.parent.parent / "data"
-        data_file = data_dir / "Stehle-Hutchson-hydrogen-profiles.h5"
+        try:
+            data_file = get_data_path("Stehle-Hutchson-hydrogen-profiles.h5")
+        except FileNotFoundError:
+            data_file = None
         
-    if not data_file.exists():
+    if data_file is None or not data_file.exists():
         print(f"Warning: Stark profile data file not found at {data_file}")
         print("Returning empty profiles. Download from Korg.jl data directory if needed.")
         return {}

@@ -8,6 +8,7 @@ from typing import Optional, Union, List, Dict, Any
 import warnings
 
 from .linelist import read_linelist
+from ..data import get_data_path
 
 
 def get_VALD_solar_linelist() -> List:
@@ -35,12 +36,8 @@ def get_VALD_solar_linelist() -> List:
     """
     # Try to find the VALD solar linelist in standard locations
     possible_paths = [
-        # Primary location - matches Korg.jl data structure
-        "/Users/jdli/Project/Korg.jl/data/linelists/vald_extract_stellar_solar_threshold001.vald",
-        # Alternative locations
-        "/Users/jdli/Project/Korg.jl/misc/Tutorial notebooks/basics/linelist.vald",
-        # Relative to this file
-        Path(__file__).parent.parent.parent.parent / "data" / "linelists" / "vald_extract_stellar_solar_threshold001.vald"
+        get_data_path("vald_extract_stellar_solar_threshold001.vald", must_exist=False),
+        get_data_path("linelists", "vald_extract_stellar_solar_threshold001.vald", must_exist=False),
     ]
     
     for vald_path in possible_paths:

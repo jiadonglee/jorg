@@ -19,11 +19,9 @@ import jax.numpy as jnp
 import jax
 import numpy as np
 import h5py
-from pathlib import Path
 from typing import Dict, Tuple, List
-import warnings
-
 from ..constants import hplanck_eV
+from ..data import get_data_path
 
 # Exact ionization energy for H I (matches Korg.jl)
 CHI_H_EV = 13.598434005136  # eV
@@ -52,17 +50,13 @@ def _load_nahar_h_i_data() -> Tuple[Dict, Dict, jnp.ndarray]:
     if _nahar_h_i_data is not None:
         return _energy_grids, _cross_section_grids, _n_levels
     
-    # Path to Korg's H I cross-section data file
-    korg_data_path = Path(__file__).parent.parent.parent.parent.parent / "data" / "bf_cross-sections" / "individual_H_cross-sections.h5"
-    
-    # Fallback path for different execution contexts
-    fallback_path = Path("/Users/jdli/Project/Korg.jl/data/bf_cross-sections/individual_H_cross-sections.h5")
-    
-    if not korg_data_path.exists():
-        korg_data_path = fallback_path
-    
-    if not korg_data_path.exists():
-        raise FileNotFoundError(f"Korg H I cross-section data not found at {korg_data_path}")
+    try:
+        korg_data_path = get_data_path("bf_cross-sections", "individual_H_cross-sections.h5")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "H I bound-free cross-section data not found. "
+            "Set JORG_DATA_DIR to your data bundle."
+        ) from exc
     
     # Load data from HDF5 file
     with h5py.File(korg_data_path, 'r') as f:

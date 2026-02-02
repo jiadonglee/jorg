@@ -10,7 +10,7 @@ ARCHITECTURE: Direct translation of Korg.jl's proven approach:
 - Direct number density handling from chemical equilibrium
 - Built-in line windowing and Voigt profile calculation
 
-REFERENCE: /Users/jdli/Project/Korg.jl/src/line_absorption.jl
+REFERENCE: Korg.jl/src/line_absorption.jl
 """
 
 import numpy as np

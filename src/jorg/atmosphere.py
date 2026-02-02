@@ -30,10 +30,19 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, NamedTuple
 from dataclasses import dataclass
 import warnings
-from scipy.interpolate import CubicSpline
+# PHASE 1.3 OPTIMIZATION: Replace SciPy with JAX interpolation
+try:
+    from scipy.interpolate import CubicSpline
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+# Import JAX interpolation (v2 optimization)
+from .interpolation_jax import cubic_spline_nd
 
 # Import Jorg constants
 from .constants import kboltz_cgs, G_cgs, solar_mass_cgs
+from .data import get_data_root
 
 
 @dataclass
@@ -131,9 +140,14 @@ def _resolve_marcs_grid_path(grid_data_dir: Optional[Union[str, Path]], filename
         candidates.append(base / filename)
         candidates.append(base / "marcs_grids" / filename)
 
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates.append(repo_root / "data" / "marcs_grids" / filename)
-    candidates.append(repo_root / "data" / filename)
+    env_grid_dir = os.environ.get("JORG_MARCS_GRID_DIR")
+    if env_grid_dir:
+        base = Path(env_grid_dir).expanduser()
+        candidates.append(base / filename)
+
+    data_root = get_data_root()
+    candidates.append(data_root / "marcs_grids" / filename)
+    candidates.append(data_root / filename)
 
     for candidate in candidates:
         if candidate.exists():
@@ -143,7 +157,10 @@ def _resolve_marcs_grid_path(grid_data_dir: Optional[Union[str, Path]], filename
     if artifact_match is not None:
         return str(artifact_match)
 
-    raise FileNotFoundError(f"MARCS grid file not found: {filename}")
+    raise FileNotFoundError(
+        f"MARCS grid file not found: {filename}. "
+        "Set JORG_MARCS_GRID_DIR or JORG_DATA_DIR to your MARCS bundle."
+    )
 
 
 def multilinear_interpolation(params: jnp.ndarray, 
@@ -225,16 +242,38 @@ def multilinear_interpolation(params: jnp.ndarray,
 def _cubic_interpolation_cool_dwarf(params: np.ndarray,
                                     nodes: List[jnp.ndarray],
                                     grid: jnp.ndarray,
-                                    param_names: List[str]) -> np.ndarray:
+                                    param_names: List[str],
+                                    use_jax: bool = True) -> np.ndarray:
     """
     Cubic interpolation for cool dwarf grid (matches Korg's cubic spline behavior).
 
     The cool dwarf grid is stored in HDF5 as [C, alpha, mH, logg, Teff, quantities, layers].
     We interpolate along the 5 parameter axes only, leaving quantities/layers untouched.
+
+    PHASE 1.3 OPTIMIZATION: Now supports JAX interpolation for GPU acceleration!
+
+    Parameters
+    ----------
+    params : np.ndarray
+        Parameter values to interpolate at [Teff, logg, mH, alpha, C]
+    nodes : List[jnp.ndarray]
+        Grid node values for each parameter
+    grid : jnp.ndarray
+        Atmosphere grid data
+    param_names : List[str]
+        Names of parameters (for error messages)
+    use_jax : bool, optional
+        If True, use JAX interpolation (GPU-accelerated, JIT-compilable).
+        If False, use SciPy (original implementation).
+        Default: True
+
+    Returns
+    -------
+    np.ndarray
+        Interpolated atmosphere [layers, quantities]
     """
     nodes_np = [np.asarray(node) for node in nodes]
     params_np = np.asarray(params, dtype=float)
-    grid_np = np.asarray(grid, dtype=float)
 
     for value, node, name in zip(params_np, nodes_np, param_names):
         if value < node[0] or value > node[-1]:
@@ -246,12 +285,28 @@ def _cubic_interpolation_cool_dwarf(params: np.ndarray,
     axis_nodes = [nodes_np[4], nodes_np[3], nodes_np[2], nodes_np[1], nodes_np[0]]
     axis_params = [params_np[4], params_np[3], params_np[2], params_np[1], params_np[0]]
 
-    data = grid_np
-    for node, value in zip(axis_nodes, axis_params):
-        spline = CubicSpline(node, data, axis=0, extrapolate=False)
-        data = spline(value)
+    if use_jax:
+        # JAX version - JIT-compilable and GPU-accelerated
+        data = jnp.asarray(grid, dtype=jnp.float64)
+        for node, value in zip(axis_nodes, axis_params):
+            # Convert node to JAX array
+            node_jax = jnp.asarray(node, dtype=jnp.float64)
+            # Interpolate along axis 0 using JAX cubic spline
+            data = cubic_spline_nd(node_jax, data, axis=0, x_query=value)
 
-    return data.T  # [layers, quantities]
+        return np.asarray(data.T)  # [layers, quantities]
+    else:
+        # Original SciPy version - fallback for validation
+        if not SCIPY_AVAILABLE:
+            raise ImportError("SciPy not available. Install scipy or use use_jax=True")
+
+        grid_np = np.asarray(grid, dtype=float)
+        data = grid_np
+        for node, value in zip(axis_nodes, axis_params):
+            spline = CubicSpline(node, data, axis=0, extrapolate=False)
+            data = spline(value)
+
+        return data.T  # [layers, quantities]
 
 
 def create_atmosphere_from_quantities(atm_quants: jnp.ndarray, 
@@ -356,11 +411,6 @@ def interpolate_marcs(Teff: float,
         warnings.warn(f"logg {logg} outside typical range [0.0, 5.5]")
     if not (-5.0 <= m_H <= 1.0):
         warnings.warn(f"[M/H] {m_H} outside typical range [-5.0, 1.0]")
-    
-    # Set default grid data directory
-    if grid_data_dir is None:
-        current_dir = Path(__file__).parent
-        grid_data_dir = current_dir.parent.parent / "data" / "marcs_grids"
     
     # Prepare parameters for interpolation
     params = jnp.array([Teff, logg, m_H, alpha_m, C_m])

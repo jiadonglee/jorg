@@ -169,9 +169,15 @@ test_output/
 benchmarks/results/
 comparison_tests/output/
 test_fig/
-data/atmospheres/
-data/linelists/
+data/*
+!data/README.md
 !data/test_linelists/
+comparison_outputs/
+examples/comparison_outputs/
+comparison_plots/
+examples/comparison_plots/
+examples/output/
+valid/
 
 # Temporary files
 *.tmp

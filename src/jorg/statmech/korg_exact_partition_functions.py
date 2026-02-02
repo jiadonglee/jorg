@@ -17,6 +17,7 @@ import warnings
 import os
 
 from .species import Species
+from ..data import get_data_path
 
 
 class KorgExactPartitionFunctions:
@@ -37,22 +38,15 @@ class KorgExactPartitionFunctions:
             Path to partition_funcs.h5. If None, searches standard locations.
         """
         if data_file is None:
-            # Search for the HDF5 file in standard locations
-            search_paths = [
-                '/Users/jdli/Project/Korg.jl/data/atomic_partition_funcs/partition_funcs.h5',
-                '../../../data/atomic_partition_funcs/partition_funcs.h5',
-                '../../data/atomic_partition_funcs/partition_funcs.h5',
-                './data/atomic_partition_funcs/partition_funcs.h5',
-            ]
-
-            for path in search_paths:
-                if os.path.exists(path):
-                    data_file = path
-                    break
+            try:
+                data_file = str(get_data_path("atomic_partition_funcs", "partition_funcs.h5"))
+            except FileNotFoundError:
+                data_file = None
 
             if data_file is None:
                 raise FileNotFoundError(
-                    "Could not find partition_funcs.h5. Please specify data_file path."
+                    "Could not find partition_funcs.h5. "
+                    "Set JORG_DATA_DIR or specify data_file."
                 )
 
         self.data_file = data_file

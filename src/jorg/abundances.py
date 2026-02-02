@@ -147,7 +147,7 @@ ELEMENT_TO_Z = {
 }
 
 # Asplund et al. 2020 solar abundances - EXACT MATCH to Korg.jl atomic_data.jl
-# Source: /Users/jdli/Project/Korg.jl/src/atomic_data.jl lines 42-52
+# Source: Korg.jl/src/atomic_data.jl lines 42-52
 ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
     12.00,  # 1 H
     10.91,  # 2 He  
@@ -244,7 +244,7 @@ ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
 ])
 
 # Grevesse et al. 2007 solar abundances - matches Korg.jl grevesse_2007_solar_abundances
-# Source: /Users/jdli/Project/Korg.jl/src/atomic_data.jl lines 55-66
+# Source: Korg.jl/src/atomic_data.jl lines 55-66
 GREVESSE_2007_SOLAR_ABUNDANCES = jnp.array([
     12.00, 10.93, 1.05, 1.38, 2.70, 8.39, 7.78, 8.66, 4.56, 7.84,
     6.17, 7.53, 6.37, 7.51, 5.36, 7.14, 5.50, 6.18, 5.08, 6.31,

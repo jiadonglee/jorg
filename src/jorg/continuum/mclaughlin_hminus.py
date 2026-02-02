@@ -15,10 +15,10 @@ import jax.numpy as jnp
 import jax
 import numpy as np
 import h5py
-from pathlib import Path
 from typing import Tuple
 
 from ..constants import hplanck_eV
+from ..data import get_data_path
 
 # Exact Korg.jl constants
 _H_MINUS_ION_ENERGY_EV = 0.754204  # eV, McLaughlin+ 2017 value
@@ -50,11 +50,12 @@ def _load_mclaughlin_data() -> Tuple[jnp.ndarray, jnp.ndarray, float, float]:
     if _mclaughlin_frequencies is not None:
         return _mclaughlin_frequencies, _mclaughlin_cross_sections, _min_interp_nu, _low_nu_coefficient
     
-    # Path to Korg's McLaughlin data file
-    korg_data_path = Path(__file__).parent.parent.parent.parent / "data" / "McLaughlin2017Hminusbf.h5"
-    
-    if not korg_data_path.exists():
-        raise FileNotFoundError(f"Korg McLaughlin data not found at {korg_data_path}")
+    try:
+        korg_data_path = get_data_path("McLaughlin2017Hminusbf.h5")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "McLaughlin H- data not found. Set JORG_DATA_DIR to your data bundle."
+        ) from exc
     
     # Load data from HDF5 file
     with h5py.File(korg_data_path, 'r') as f:

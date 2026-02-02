@@ -13,19 +13,11 @@ import h5py
 from typing import Dict, Tuple, Any, Optional
 from functools import lru_cache
 import os
-from pathlib import Path
 
 from ..statmech.species import Species
+from ..data import get_data_path
 from ..constants import SPEED_OF_LIGHT
 
-
-# Path to Korg.jl data directory 
-# From /Jorg/src/jorg/continuum/metals_bf.py: continuum->jorg->src->Jorg->Korg.jl (5 parents up)
-_KORG_DATA_DIR = Path(__file__).parent.parent.parent.parent.parent / "data"
-_BF_DATA_FILE = _KORG_DATA_DIR / "bf_cross-sections" / "bf_cross-sections.h5"
-
-# Fallback path if the above doesn't work (for different execution contexts)
-_FALLBACK_BF_DATA_FILE = Path("/Users/jdli/Project/Korg.jl/data/bf_cross-sections/bf_cross-sections.h5")
 
 
 class MetalBoundFreeData:
@@ -45,16 +37,18 @@ class MetalBoundFreeData:
             Path to the HDF5 data file. If None, uses default Korg.jl data file.
         """
         if data_file is None:
-            data_file = str(_BF_DATA_FILE)
-            # Try fallback path if primary path doesn't exist
-            if not os.path.exists(data_file):
-                data_file = str(_FALLBACK_BF_DATA_FILE)
+            try:
+                data_file = str(get_data_path("bf_cross-sections", "bf_cross-sections.h5"))
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    "Metal BF data file not found. "
+                    "Set JORG_DATA_DIR or pass data_file explicitly."
+                ) from exc
             
         if not os.path.exists(data_file):
             raise FileNotFoundError(
                 f"Metal BF data file not found: {data_file}\n"
-                f"Tried primary path: {_BF_DATA_FILE}\n"
-                f"Tried fallback path: {_FALLBACK_BF_DATA_FILE}"
+                "Set JORG_DATA_DIR or pass data_file explicitly."
             )
             
         self.data_file = data_file

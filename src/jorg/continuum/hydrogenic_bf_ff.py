@@ -10,7 +10,6 @@ from jax import jit
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 from typing import Tuple, Optional
-from pathlib import Path
 import os
 
 # Physical constants (CGS units)
@@ -24,6 +23,11 @@ RYDBERG_EV = 13.605693122994      # eV
 
 class VanHoofGauntFactors:
     """Van Hoof et al. (2014) free-free Gaunt factors interpolator."""
+
+    T_EXTREMA = (100.0, 1e6)  # K
+    LAMBDA_EXTREMA = (1.0e-6, 1.0e-2)  # cm (100 Å to 100 μm)
+    Z_EXTREMA = (1, 2)
+    GRID_STEP = 0.1
     
     def __init__(self, data_file: Optional[str] = None):
         """
@@ -45,21 +49,30 @@ class VanHoofGauntFactors:
 
     def _default_data_file(self) -> Optional[str]:
         """Locate the vanHoof2014-nr-gauntff.dat file in the repo."""
-        repo_root = Path(__file__).resolve().parents[4]
-        candidate = repo_root / "data" / "vanHoof2014-nr-gauntff.dat"
-        if candidate.exists():
-            return str(candidate)
-        return None
+        from ..data import get_data_path
+
+        try:
+            return str(get_data_path("vanHoof2014-nr-gauntff.dat"))
+        except FileNotFoundError:
+            return None
     
     def _create_synthetic_data(self):
         """Create synthetic Gaunt factor data for demonstration."""
         # Temperature range: 100 K to 1e6 K
         # Wavelength range: 100 Å to 100 μm
         # Charge range: Z = 1, 2
-        
-        # Create log10 grids
-        self.log10_γ2 = np.linspace(-4.0, 4.0, 81)  # log10(Rydberg*Z²/(k*T))
-        self.log10_u = np.linspace(-4.0, 4.0, 81)   # log10(h*ν/(k*T))
+
+        (gamma2_min, gamma2_max), (u_min, u_max) = self._compute_log_bounds()
+        step = self.GRID_STEP
+        pad = step
+
+        gamma2_start = np.floor((gamma2_min - pad) / step) * step
+        gamma2_end = np.ceil((gamma2_max + pad) / step) * step
+        u_start = np.floor((u_min - pad) / step) * step
+        u_end = np.ceil((u_max + pad) / step) * step
+
+        self.log10_γ2 = np.arange(gamma2_start, gamma2_end + step * 0.5, step)
+        self.log10_u = np.arange(u_start, u_end + step * 0.5, step)
         
         # Create synthetic Gaunt factor table
         # This is a reasonable approximation based on the functional form
@@ -109,6 +122,23 @@ class VanHoofGauntFactors:
         
         return gaunt_factors
 
+    def _compute_log_bounds(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Compute log10 bounds for gamma2 and u based on supported ranges."""
+        def calc_log10_gamma2(Z, T):
+            return np.log10(RYDBERG_EV * Z**2 / (KBOLTZ_EV * T))
+
+        def calc_log10_u(lam, T):
+            return np.log10(HPLANCK_CGS * C_CGS / (lam * KBOLTZ_CGS * T))
+
+        gamma2_vals = [
+            calc_log10_gamma2(Z, T) for Z in self.Z_EXTREMA for T in self.T_EXTREMA
+        ]
+        u_vals = [
+            calc_log10_u(lam, T) for lam in self.LAMBDA_EXTREMA for T in self.T_EXTREMA
+        ]
+
+        return (min(gamma2_vals), max(gamma2_vals)), (min(u_vals), max(u_vals))
+
     def _read_next_data_line(self, file_obj) -> Optional[str]:
         """Read the next non-comment line from the data file."""
         for line in file_obj:
@@ -155,9 +185,9 @@ class VanHoofGauntFactors:
     def _create_interpolator(self):
         """Create 2D interpolator for Gaunt factors."""
         # Define valid bounds
-        T_extrema = [100.0, 1e6]  # K
-        λ_extrema = [1.0e-6, 1.0e-2]  # cm (100 Å to 100 μm)
-        Z_extrema = [1, 2]
+        T_extrema = self.T_EXTREMA
+        λ_extrema = self.LAMBDA_EXTREMA
+        Z_extrema = self.Z_EXTREMA
         
         # Calculate bounds in log space
         def calc_log10_γ2(Z, T):

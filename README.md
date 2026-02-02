@@ -1,7 +1,6 @@
-# Jorg v0.1
+# Jorg
 
-Jorg is a JAX-based stellar spectrum synthesis library for Python. This is the
-v0.1.0 release, focused on Korg.jl API compatibility and fast CPU/GPU execution.
+Jorg (`jorg`) is a JAX-based stellar spectrum synthesis library for Python.
 
 ## Highlights
 - Korg.jl-compatible `synth` and `synthesize` APIs
@@ -28,6 +27,19 @@ wl, flux, cntm = synth(
 )
 ```
 
+## Data files
+Jorg relies on external data (linelists, partition functions, opacity tables, MARCS grids).
+Small tables live under `data/` in the repo; large MARCS grids are not checked in.
+
+Set these environment variables to point at your local data bundle:
+```bash
+export JORG_DATA_DIR=/path/to/jorg/data
+export JORG_MARCS_GRID_DIR=/path/to/marcs_grids  # optional if separate
+```
+
+When running from a cloned repo, Jorg will automatically use the local `data/` directory
+if `JORG_DATA_DIR` is not set.
+
 ## API at a glance
 - `synth(Teff, logg, m_H, ...)` returns `(wavelengths, flux, continuum)`
 - `synthesize(atm, linelist, A_X, ...)` returns `SynthesisResult` with diagnostics
@@ -39,4 +51,4 @@ wl, flux, cntm = synth(
 - NumPy >= 1.20
 
 ## Status
-- v0.1.0 (alpha)
+- v0.3.0 (alpha)

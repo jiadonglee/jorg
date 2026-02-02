@@ -3,7 +3,6 @@ Alpha5 Reference Implementation
 Provides alpha5 reference opacity calculation for radiative transfer.
 """
 
-from pathlib import Path
 from functools import lru_cache
 
 import numpy as np
@@ -14,6 +13,7 @@ from .opacity.korg_line_processor import KorgLineProcessor
 from .statmech.korg_chemical_equilibrium import chemical_equilibrium
 from .statmech import create_default_ionization_energies, create_default_log_equilibrium_constants, create_default_partition_functions
 from .lines.linelist import read_linelist
+from .data import get_data_path
 
 ALPHA_5000_WL_ANG = 5000.0
 ALPHA_5000_WL_CM = ALPHA_5000_WL_ANG * 1e-8
@@ -29,8 +29,7 @@ def _load_alpha_5000_default_linelist():
     if _alpha_5000_default_linelist is not None:
         return _alpha_5000_default_linelist
 
-    base_dir = Path(__file__).resolve().parents[3]
-    default_path = base_dir / "data" / "linelists" / "alpha_5000" / "alpha_5000_lines.csv"
+    default_path = get_data_path("linelists", "alpha_5000", "alpha_5000_lines.csv")
     _alpha_5000_default_linelist = read_linelist(default_path, format="alpha_5000")
     return _alpha_5000_default_linelist
 
@@ -44,35 +43,50 @@ def _line_wavelength_cm(line):
 
 
 def _get_alpha_5000_linelist(linelist):
-    default_linelist = _load_alpha_5000_default_linelist()
-    if linelist is None or len(linelist) == 0:
-        return default_linelist
+    """
+    Get lines near 5000 Å for alpha5 reference calculation.
 
-    lines = linelist.lines if hasattr(linelist, "lines") else linelist
-    wl_min_cm = (ALPHA_5000_WL_ANG - ALPHA_5000_BUFFER_ANG) * 1e-8
-    wl_max_cm = (ALPHA_5000_WL_ANG + ALPHA_5000_BUFFER_ANG) * 1e-8
-    linelist5 = [line for line in lines
-                 if (wl := _line_wavelength_cm(line)) is not None and wl_min_cm <= wl <= wl_max_cm]
+    Uses the provided linelist if it covers the 5000 Å region.
+    Only falls back to default alpha_5000 linelist if needed.
+    """
+    # First, try to extract 5000 Å lines from the provided linelist
+    if linelist is not None and len(linelist) > 0:
+        lines = linelist.lines if hasattr(linelist, "lines") else linelist
+        wl_min_cm = (ALPHA_5000_WL_ANG - ALPHA_5000_BUFFER_ANG) * 1e-8
+        wl_max_cm = (ALPHA_5000_WL_ANG + ALPHA_5000_BUFFER_ANG) * 1e-8
+        linelist5 = [line for line in lines
+                     if (wl := _line_wavelength_cm(line)) is not None and wl_min_cm <= wl <= wl_max_cm]
 
-    if len(linelist5) == 0:
-        return default_linelist
+        if len(linelist5) > 0:
+            linelist5 = sorted(linelist5, key=_line_wavelength_cm)
+            min_wl = _line_wavelength_cm(linelist5[0])
+            max_wl = _line_wavelength_cm(linelist5[-1])
 
-    linelist5 = sorted(linelist5, key=_line_wavelength_cm)
-    min_wl = _line_wavelength_cm(linelist5[0])
-    max_wl = _line_wavelength_cm(linelist5[-1])
+            # Check if the linelist fully covers 5000 Å
+            if min_wl is not None and max_wl is not None:
+                if min_wl <= ALPHA_5000_WL_CM <= max_wl:
+                    # Provided linelist covers 5000 Å - use it directly
+                    return linelist5
 
-    if min_wl is None or max_wl is None:
-        return default_linelist
+                # Partial coverage - try to supplement with default if available
+                try:
+                    default_linelist = _load_alpha_5000_default_linelist()
+                    if min_wl > ALPHA_5000_WL_CM:
+                        fallback = [line for line in default_linelist if _line_wavelength_cm(line) < min_wl]
+                        return sorted(fallback + linelist5, key=_line_wavelength_cm)
+                    if max_wl < ALPHA_5000_WL_CM:
+                        fallback = [line for line in default_linelist if _line_wavelength_cm(line) > max_wl]
+                        return sorted(linelist5 + fallback, key=_line_wavelength_cm)
+                except FileNotFoundError:
+                    # No default available, use what we have
+                    return linelist5
 
-    if min_wl > ALPHA_5000_WL_CM:
-        fallback = [line for line in default_linelist if _line_wavelength_cm(line) < min_wl]
-        return sorted(fallback + linelist5, key=_line_wavelength_cm)
-
-    if max_wl < ALPHA_5000_WL_CM:
-        fallback = [line for line in default_linelist if _line_wavelength_cm(line) > max_wl]
-        return sorted(linelist5 + fallback, key=_line_wavelength_cm)
-
-    return linelist5
+    # No provided linelist or it doesn't cover the region - try default
+    try:
+        return _load_alpha_5000_default_linelist()
+    except FileNotFoundError:
+        # No default linelist available - return empty (continuum-only)
+        return []
 
 
 def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
@@ -165,28 +179,15 @@ def calculate_alpha5_reference(atm, A_X, linelist=None, number_densities=None,
             np.array([frequency_5000]),
             float(temperatures[i]),
             float(electron_densities[i]),
-            layer_number_densities
+            layer_number_densities,
+            partition_funcs=partition_funcs
         )[0])
 
-    linelist5 = _get_alpha_5000_linelist(linelist)
-    if linelist5 is None or len(linelist5) == 0:
-        alpha5_ref = alpha5_continuum
-    else:
-        wl_array_cm = np.array([ALPHA_5000_WL_CM])
-
-        processor = KorgLineProcessor(verbose=verbose)
-        result = processor.process_lines(
-            wl_array_cm=wl_array_cm,
-            temps=temperatures,
-            electron_densities=electron_densities,
-            n_densities=number_densities,
-            partition_fns=partition_funcs,
-            linelist=linelist5,
-            microturbulence_cm_s=microturbulence_kms * 1e5,
-            continuum_opacity=alpha5_continuum[:, None],
-            cutoff_threshold=line_cutoff_threshold
-        )
-        alpha5_ref = alpha5_continuum + result.alpha_matrix[:, 0]
+    # IMPORTANT: τ_5000 in the atmosphere is defined relative to the *continuum* opacity
+    # at 5000 Å. For anchored optical-depth integration, alpha_ref must therefore be the
+    # continuum opacity at 5000 Å as well. Including line opacity here breaks the
+    # consistency between (tau_ref, alpha_ref) and distorts line depths.
+    alpha5_ref = alpha5_continuum
 
     if verbose:
         print(f"Alpha5 reference range: {alpha5_ref.min():.2e} - {alpha5_ref.max():.2e} cm^-1")

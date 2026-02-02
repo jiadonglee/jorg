@@ -26,8 +26,6 @@ synth(
     mu_points: int = 20,
     rt_method: str = "korg_default",
     use_cubic_interpolation: bool = False,
-    use_exact_partition_functions: bool = True,
-    use_full_molecular_equilibrium: bool = True,
     format_A_X_kwargs: Optional[Dict] = None,
     synthesize_kwargs: Optional[Dict] = None,
     verbose: bool = False,
@@ -55,8 +53,6 @@ High-level stellar spectrum synthesis. Matches Korg.jl's `synth()` API.
 | `mu_points` | int | 20 | Angular quadrature points |
 | `rt_method` | str | "korg_default" | RT method: "korg_default", "feautrier", "short_char" |
 | `use_cubic_interpolation` | bool | False | Use cubic atmosphere interpolation |
-| `use_exact_partition_functions` | bool | True | Use exact Korg.jl partition functions |
-| `use_full_molecular_equilibrium` | bool | True | Use full 86+ molecular species |
 | `format_A_X_kwargs` | dict | None | Options for `format_abundances()` |
 | `synthesize_kwargs` | dict | None | Options for `synthesize()` |
 | `verbose` | bool | False | Print progress |

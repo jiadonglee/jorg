@@ -10,12 +10,9 @@ Key Features:
 - Systematic chemical equilibrium for each layer
 - Continuum opacity using exact physics (no hardcoding)
 - Line opacity using validated broadening parameters (no empirical tuning)
-- JAX-optimized processing for performance
 - Full error handling and fallback mechanisms
 """
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 import warnings
@@ -167,7 +164,7 @@ class LayerProcessor:
             self._print_processing_summary(alpha_matrix)
         
         return alpha_matrix, all_number_densities, all_electron_densities
-    
+
     def _process_single_layer(self, layer_idx, atm, abs_abundances, wl_array,
                             linelist, line_buffer, hydrogen_lines, vmic,
                             use_chemical_equilibrium_from, log_g, cntm_step):
@@ -249,17 +246,13 @@ class LayerProcessor:
                 }
                 return ne_solution, layer_number_densities
             
-            # Calculate fresh chemical equilibrium with molecular equilibrium constants
-            from ..statmech import create_default_log_equilibrium_constants
-            log_equilibrium_constants = create_default_log_equilibrium_constants()
-
-            # Use full chemical equilibrium with translational partition function (matches Korg.jl)
+            # Calculate fresh chemical equilibrium (matches Korg.jl)
             ne_solution, number_densities = chemical_equilibrium(
                 temp=T, nt=nt, model_atm_ne=ne_guess,
                 absolute_abundances=abs_abundances,
                 ionization_energies=self.ionization_energies,
                 partition_funcs=self.partition_funcs,
-                log_equilibrium_constants=log_equilibrium_constants
+                log_equilibrium_constants=self.log_equilibrium_constants
             )
             
             # Check convergence (following Korg.jl's warning system)
@@ -447,7 +440,7 @@ class LayerProcessor:
                 # Full-resolution continuum (fallback)
                 frequencies = c_cgs / (wl_array * 1e-8)
                 continuum_opacity = total_continuum_absorption_exact_physics_only(
-                    frequencies, T, ne, number_densities
+                    frequencies, T, ne, number_densities, partition_funcs=self.partition_funcs
                 )
                 return np.array(continuum_opacity)
 
@@ -465,7 +458,7 @@ class LayerProcessor:
 
             frequencies = c_cgs / (wl_coarse * 1e-8)
             continuum_coarse = total_continuum_absorption_exact_physics_only(
-                frequencies, T, ne, number_densities
+                frequencies, T, ne, number_densities, partition_funcs=self.partition_funcs
             )
             continuum_coarse = np.asarray(continuum_coarse, dtype=float)
             continuum_full = np.interp(

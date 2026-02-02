@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jorg"
-version = "0.1.0"
-description = "JAX-based stellar spectral synthesis, API-compatible with Korg.jl"
+version = "0.3.0"
+description = "JAX-based stellar spectral synthesis (jorg)"
 authors = [
     {name = "Jorg Development Team"}
 ]
@@ -71,6 +71,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["jorg*"]
 
 [tool.setuptools.package-data]
 jorg = ["data/*.json", "data/*.txt"]

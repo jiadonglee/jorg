@@ -9,8 +9,6 @@ partition functions, matching Korg.jl's default equilibrium constants.
 from __future__ import annotations
 
 import csv
-import os
-import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Tuple
@@ -20,61 +18,25 @@ import numpy as np
 from scipy.interpolate import CubicSpline
 
 from ..constants import kboltz_cgs, kboltz_eV, hplanck_cgs
+from ..data import get_data_path
+from ..data.isotopic_nuclear_spin_degeneracies import ISOTOPIC_NUCLEAR_SPIN_DEGENERACIES
 from .species import Species, Formula, ATOMIC_MASSES
 from .korg_exact_partition_functions import get_korg_exact_partition_functions
 from ..lines.atomic_data import ISOTOPIC_ABUNDANCES
 
 
-def _candidate_data_roots() -> Iterable[Path]:
-    roots = []
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "data" / "barklem_collet_2016").is_dir():
-            roots.append(parent)
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "data").is_dir() and parent not in roots:
-            roots.append(parent)
-    cwd = Path.cwd()
-    if cwd not in roots:
-        roots.append(cwd)
-    return roots
-
-
 def _resolve_data_path(*parts: str) -> Path:
-    for root in _candidate_data_roots():
-        path = root.joinpath(*parts)
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"Could not find data file: {Path(*parts)}")
+    if parts and parts[0] == "data":
+        parts = parts[1:]
+    return get_data_path(*parts)
 
 
 @lru_cache(maxsize=1)
 def _load_isotopic_nuclear_spin_degeneracies() -> Dict[int, Dict[int, int]]:
     """
-    Parse isotopic nuclear spin degeneracies from Korg.jl's isotopic_data.jl.
+    Load isotopic nuclear spin degeneracies (pure Python data).
     """
-    data_path = _resolve_data_path("src", "isotopic_data.jl")
-    text = data_path.read_text()
-
-    start = text.find("const isotopic_nuclear_spin_degeneracies")
-    if start == -1:
-        return {}
-
-    # Trim to block to avoid matching unrelated Dicts.
-    block = text[start:]
-    next_const = block.find("const ", len("const isotopic_nuclear_spin_degeneracies"))
-    if next_const != -1:
-        block = block[:next_const]
-
-    pattern = re.compile(r"(\\d+)\\s*=>\\s*Dict\\((.*?)\\)", re.S)
-    degeneracies: Dict[int, Dict[int, int]] = {}
-    for match in pattern.finditer(block):
-        Z = int(match.group(1))
-        inner = match.group(2)
-        pairs = re.findall(r"(\\d+)\\s*=>\\s*(\\d+)", inner)
-        if not pairs:
-            continue
-        degeneracies[Z] = {int(k): int(v) for k, v in pairs}
-    return degeneracies
+    return ISOTOPIC_NUCLEAR_SPIN_DEGENERACIES
 
 
 def _get_most_abundant_isotope(atomic_number: int) -> int:
