@@ -159,7 +159,9 @@ def _resolve_marcs_grid_path(grid_data_dir: Optional[Union[str, Path]], filename
 
     raise FileNotFoundError(
         f"MARCS grid file not found: {filename}. "
-        "Set JORG_MARCS_GRID_DIR or JORG_DATA_DIR to your MARCS bundle."
+        "Set JORG_MARCS_GRID_DIR or JORG_DATA_DIR to your MARCS bundle. "
+        "If you don't have the MARCS grids, download them from: "
+        "https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/Q8AYIA"
     )
 
 
