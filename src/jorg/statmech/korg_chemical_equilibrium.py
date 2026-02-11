@@ -16,10 +16,15 @@ Source: Korg.jl/src/statmech.jl:120-343
 import numpy as np
 from scipy.optimize import root
 from typing import Dict, Tuple, Callable
+from collections import OrderedDict
 import warnings
 
 from .species import Species, MAX_ATOMIC_NUMBER
 from ..constants import kboltz_eV, kboltz_cgs, me_cgs, hplanck_cgs
+
+
+_SAHA_WEIGHT_CACHE = OrderedDict()
+_SAHA_WEIGHT_CACHE_MAX = 256
 
 
 def _sign_no_zero(x):
@@ -51,6 +56,88 @@ def translational_U(mass_cgs: float, temperature: float) -> float:
         Translational partition function factor
     """
     return (2 * np.pi * mass_cgs * kboltz_cgs * temperature / hplanck_cgs**2)**1.5
+
+
+def _compute_saha_weight_arrays(
+    temperature: float,
+    ionization_energies: Dict[int, Tuple[float, float, float]],
+    partition_funcs: Dict[Species, Callable],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Precompute wII*ne and wIII*ne^2 arrays (ne-independent)."""
+    wII_ne = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+    wIII_ne2 = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+
+    log_T = float(np.log(temperature))
+    log_trans_U = float(np.log(translational_U(me_cgs, temperature)))
+    inv_kT = 1.0 / (kboltz_eV * temperature)
+
+    pf_cache = {}
+
+    def _get_U(species: Species) -> float:
+        if species in pf_cache:
+            return pf_cache[species]
+        val = float(partition_funcs[species](log_T))
+        pf_cache[species] = val
+        return val
+
+    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+        if Z not in ionization_energies:
+            continue
+        chi_I, chi_II, _ = ionization_energies[Z]
+
+        species_I = Species.from_atomic_number(Z, 0)
+        species_II = Species.from_atomic_number(Z, 1)
+
+        U_I = _get_U(species_I)
+        U_II = _get_U(species_II)
+        log_U_I = np.log(max(U_I, 1e-300))
+        log_U_II = np.log(max(U_II, 1e-300))
+
+        log_wII_ne = (
+            np.log(2.0)
+            + log_U_II
+            - log_U_I
+            + log_trans_U
+            - chi_I * inv_kT
+        )
+        wII_ne_val = float(np.exp(log_wII_ne))
+        wII_ne[Z - 1] = wII_ne_val
+
+        if Z == 1:
+            continue
+        species_III = Species.from_atomic_number(Z, 2)
+        if species_III in partition_funcs:
+            U_III = _get_U(species_III)
+            log_U_III = np.log(max(U_III, 1e-300))
+            log_wIII_ne2 = (
+                log_wII_ne
+                + np.log(2.0)
+                + log_U_III
+                - log_U_II
+                + log_trans_U
+                - chi_II * inv_kT
+            )
+            wIII_ne2[Z - 1] = float(np.exp(log_wIII_ne2))
+
+    return wII_ne, wIII_ne2
+
+
+def _get_cached_saha_weight_arrays(
+    temperature: float,
+    ionization_energies: Dict[int, Tuple[float, float, float]],
+    partition_funcs: Dict[Species, Callable],
+) -> Tuple[np.ndarray, np.ndarray]:
+    key = (float(temperature), id(ionization_energies), id(partition_funcs))
+    cached = _SAHA_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        _SAHA_WEIGHT_CACHE.move_to_end(key)
+        return cached
+
+    wII_ne, wIII_ne2 = _compute_saha_weight_arrays(temperature, ionization_energies, partition_funcs)
+    _SAHA_WEIGHT_CACHE[key] = (wII_ne, wIII_ne2)
+    if len(_SAHA_WEIGHT_CACHE) > _SAHA_WEIGHT_CACHE_MAX:
+        _SAHA_WEIGHT_CACHE.popitem(last=False)
+    return wII_ne, wIII_ne2
 
 
 def saha_ion_weights(temperature: float, ne: float, atomic_number: int,
@@ -185,6 +272,8 @@ def setup_chemical_equilibrium_residuals(
 
     # Preprocess molecules for faster evaluation (and Jacobian assembly)
     molecules = None
+    molecules_neutral = None
+    molecules_charged = None
     if log_equilibrium_constants is not None:
         molecules = []
         for mol_species, log_K_func in log_equilibrium_constants.items():
@@ -227,6 +316,10 @@ def setup_chemical_equilibrium_residuals(
                 continue
         molecules = molecules_with_constants or None
 
+    if molecules:
+        molecules_charged = [mol for mol in molecules if mol["charge"] == 1]
+        molecules_neutral = [mol for mol in molecules if mol["charge"] != 1]
+
     cache = {"x_f": None, "F": None, "common": None, "x_j": None, "J": None}
 
     def _compute_common(x):
@@ -259,34 +352,38 @@ def setup_chemical_equilibrium_residuals(
             if abs(n_tot_minus_ne) < 1e-300:
                 n_tot_minus_ne = 1e-300 if n_tot_minus_ne >= 0 else -1e-300
 
-            for mol in molecules:
+            for mol in (molecules_charged or []):
                 try:
                     log_nK = mol["log_nK"]
-                    if mol["charge"] == 1:
-                        idx1 = mol["idx1"]
-                        idx2 = mol["idx2"]
-                        if idx1 is None or idx2 is None:
-                            continue
-                        wII_1 = wII[idx1]
-                        if wII_1 <= 0.0:
-                            continue
-                        log_n_mol = log_neutral[idx1] + np.log10(wII_1) + log_neutral[idx2] - log_nK
-                        n_mol = float(10.0 ** log_n_mol)
-                        if not np.isfinite(n_mol) or n_mol == 0.0:
-                            continue
-                        R_elem[idx1] -= n_mol
-                        R_elem[idx2] -= n_mol
-                        R_charge += n_mol
-                    else:
-                        idx = mol["uniq"]
-                        stoich = mol["counts"]
-                        if idx.size == 0:
-                            continue
-                        log_n_mol = float(np.dot(stoich, log_neutral[idx]) - log_nK)
-                        n_mol = float(10.0 ** log_n_mol)
-                        if not np.isfinite(n_mol) or n_mol == 0.0:
-                            continue
-                        R_elem[idx] -= stoich * n_mol
+                    idx1 = mol["idx1"]
+                    idx2 = mol["idx2"]
+                    if idx1 is None or idx2 is None:
+                        continue
+                    wII_1 = wII[idx1]
+                    if wII_1 <= 0.0:
+                        continue
+                    log_n_mol = log_neutral[idx1] + np.log10(wII_1) + log_neutral[idx2] - log_nK
+                    n_mol = float(10.0 ** log_n_mol)
+                    if not np.isfinite(n_mol) or n_mol == 0.0:
+                        continue
+                    R_elem[idx1] -= n_mol
+                    R_elem[idx2] -= n_mol
+                    R_charge += n_mol
+                except Exception:
+                    continue
+
+            for mol in (molecules_neutral or []):
+                try:
+                    log_nK = mol["log_nK"]
+                    idx = mol["uniq"]
+                    stoich = mol["counts"]
+                    if idx.size == 0:
+                        continue
+                    log_n_mol = float(np.dot(stoich, log_neutral[idx]) - log_nK)
+                    n_mol = float(10.0 ** log_n_mol)
+                    if not np.isfinite(n_mol) or n_mol == 0.0:
+                        continue
+                    R_elem[idx] -= stoich * n_mol
                 except Exception:
                     continue
 
@@ -362,61 +459,65 @@ def setup_chemical_equilibrium_residuals(
             active = common["active"]
             n_tot_minus_ne = common["n_tot_minus_ne"]
 
-            for mol in molecules:
+            for mol in (molecules_charged or []):
                 try:
                     log_nK = mol["log_nK"]
-                    if mol["charge"] == 1:
-                        idx1 = mol["idx1"]
-                        idx2 = mol["idx2"]
-                        if idx1 is None or idx2 is None:
-                            continue
-                        wII_1 = wII[idx1]
-                        if wII_1 <= 0.0:
-                            continue
-                        log_n_mol = log_neutral[idx1] + np.log10(wII_1) + log_neutral[idx2] - log_nK
-                        n_mol = float(10.0 ** log_n_mol)
-                        if not np.isfinite(n_mol) or n_mol == 0.0:
-                            continue
+                    idx1 = mol["idx1"]
+                    idx2 = mol["idx2"]
+                    if idx1 is None or idx2 is None:
+                        continue
+                    wII_1 = wII[idx1]
+                    if wII_1 <= 0.0:
+                        continue
+                    log_n_mol = log_neutral[idx1] + np.log10(wII_1) + log_neutral[idx2] - log_nK
+                    n_mol = float(10.0 ** log_n_mol)
+                    if not np.isfinite(n_mol) or n_mol == 0.0:
+                        continue
 
-                        f1 = max(float(neutral_fractions[idx1]), 1e-300)
-                        f2 = max(float(neutral_fractions[idx2]), 1e-300)
-                        dnmol_df1 = (n_mol / f1) if active[idx1] else 0.0
-                        dnmol_df2 = (n_mol / f2) if active[idx2] else 0.0
+                    f1 = max(float(neutral_fractions[idx1]), 1e-300)
+                    f2 = max(float(neutral_fractions[idx2]), 1e-300)
+                    dnmol_df1 = (n_mol / f1) if active[idx1] else 0.0
+                    dnmol_df2 = (n_mol / f2) if active[idx2] else 0.0
 
-                        dR_df[idx1, idx1] -= dnmol_df1
-                        dR_df[idx1, idx2] -= dnmol_df2
-                        dR_df[idx2, idx1] -= dnmol_df1
-                        dR_df[idx2, idx2] -= dnmol_df2
+                    dR_df[idx1, idx1] -= dnmol_df1
+                    dR_df[idx1, idx2] -= dnmol_df2
+                    dR_df[idx2, idx1] -= dnmol_df1
+                    dR_df[idx2, idx2] -= dnmol_df2
 
-                        dR_charge_df[idx1] += dnmol_df1
-                        dR_charge_df[idx2] += dnmol_df2
+                    dR_charge_df[idx1] += dnmol_df1
+                    dR_charge_df[idx2] += dnmol_df2
 
-                        active_count = float(active[idx1]) + float(active[idx2])
-                        dnmol_dne = n_mol * (-inv_ne - active_count / n_tot_minus_ne)
-                        dR_dne[idx1] -= dnmol_dne
-                        dR_dne[idx2] -= dnmol_dne
-                        dR_charge_dne += dnmol_dne
-                    else:
-                        idx = mol["uniq"]
-                        stoich = mol["counts"]
-                        if idx.size == 0:
-                            continue
-                        log_n_mol = float(np.dot(stoich, log_neutral[idx]) - log_nK)
-                        n_mol = float(10.0 ** log_n_mol)
-                        if not np.isfinite(n_mol) or n_mol == 0.0:
-                            continue
+                    active_count = float(active[idx1]) + float(active[idx2])
+                    dnmol_dne = n_mol * (-inv_ne - active_count / n_tot_minus_ne)
+                    dR_dne[idx1] -= dnmol_dne
+                    dR_dne[idx2] -= dnmol_dne
+                    dR_charge_dne += dnmol_dne
+                except Exception:
+                    continue
 
-                        active_idx = active[idx]
-                        if np.any(active_idx):
-                            f_u = np.maximum(neutral_fractions[idx], 1e-300)
-                            dnmol_df = np.zeros_like(stoich)
-                            dnmol_df[active_idx] = stoich[active_idx] * n_mol / f_u[active_idx]
-                            dR_df[np.ix_(idx, idx)] -= stoich[:, None] * dnmol_df[None, :]
+            for mol in (molecules_neutral or []):
+                try:
+                    log_nK = mol["log_nK"]
+                    idx = mol["uniq"]
+                    stoich = mol["counts"]
+                    if idx.size == 0:
+                        continue
+                    log_n_mol = float(np.dot(stoich, log_neutral[idx]) - log_nK)
+                    n_mol = float(10.0 ** log_n_mol)
+                    if not np.isfinite(n_mol) or n_mol == 0.0:
+                        continue
 
-                        n_active = float(np.sum(stoich[active_idx])) if np.any(active_idx) else 0.0
-                        if n_active != 0.0:
-                            dnmol_dne = -n_active * n_mol / n_tot_minus_ne
-                            dR_dne[idx] -= stoich * dnmol_dne
+                    active_idx = active[idx]
+                    if np.any(active_idx):
+                        f_u = np.maximum(neutral_fractions[idx], 1e-300)
+                        dnmol_df = np.zeros_like(stoich)
+                        dnmol_df[active_idx] = stoich[active_idx] * n_mol / f_u[active_idx]
+                        dR_df[np.ix_(idx, idx)] -= stoich[:, None] * dnmol_df[None, :]
+
+                    n_active = float(np.sum(stoich[active_idx])) if np.any(active_idx) else 0.0
+                    if n_active != 0.0:
+                        dnmol_dne = -n_active * n_mol / n_tot_minus_ne
+                        dR_dne[idx] -= stoich * dnmol_dne
                 except Exception:
                     continue
 
@@ -477,8 +578,8 @@ def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
         Total number density in cm^-3
     model_atm_ne : float
         Model atmosphere electron density (initial guess) in cm^-3
-    absolute_abundances : Dict[int, float]
-        Element abundances N_X/N_total
+    absolute_abundances : Dict[int, float] or array-like
+        Element abundances N_X/N_total (92-element array or dict)
     ionization_energies : Dict
         Ionization energies in eV
     partition_funcs : Dict[Species, Callable]
@@ -487,6 +588,13 @@ def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
         Molecular equilibrium constants
     electron_number_density_warn_threshold : float
         Warning threshold for ne discrepancy
+    stats_out : dict, optional (kwarg)
+        If provided, populated with solver diagnostics (attempts, nfev, njev).
+    initial_ne : float, optional (kwarg)
+        Optional initial electron density guess for the solver (cm^-3). The
+        model_atm_ne is still used for warning comparisons.
+    warn_on_ne_discrepancy : bool, optional (kwarg)
+        If False, suppress warnings about ne discrepancy.
 
     Returns
     -------
@@ -494,34 +602,68 @@ def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
         (electron_density, species_densities)
     """
 
+    stats_out = kwargs.pop("stats_out", None)
+    initial_ne = kwargs.pop("initial_ne", None)
+    warn_on_ne_discrepancy = kwargs.pop("warn_on_ne_discrepancy", True)
+    record_stats = isinstance(stats_out, dict)
+    attempts = [] if record_stats else None
+    fallback_used = False
+
+    def _record_attempt(sol, attempt_idx, method_name):
+        if not record_stats:
+            return
+        try:
+            attempts.append(
+                {
+                    "attempt": int(attempt_idx),
+                    "method": str(method_name),
+                    "success": bool(getattr(sol, "success", False)),
+                    "status": int(getattr(sol, "status", -1)) if hasattr(sol, "status") else None,
+                    "message": str(getattr(sol, "message", "")),
+                    "nfev": int(getattr(sol, "nfev", -1)) if hasattr(sol, "nfev") else None,
+                    "njev": int(getattr(sol, "njev", -1)) if hasattr(sol, "njev") else None,
+                }
+            )
+        except Exception:
+            pass
+
     # Rename parameters to match internal variable names
     temperature = temp
     n_total = nt
 
-    # Convert abundances dict to array
-    abs_abund_array = np.zeros(MAX_ATOMIC_NUMBER)
-    for Z, abund in absolute_abundances.items():
-        if 1 <= Z <= MAX_ATOMIC_NUMBER:
-            abs_abund_array[Z-1] = abund
+    # Convert abundances to array (accept dict or array-like)
+    if isinstance(absolute_abundances, dict):
+        abs_abund_array = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+        for Z, abund in absolute_abundances.items():
+            if 1 <= Z <= MAX_ATOMIC_NUMBER:
+                abs_abund_array[Z-1] = abund
+    else:
+        abs_abund_array = np.asarray(absolute_abundances, dtype=np.float64)
+        if abs_abund_array.shape[0] != MAX_ATOMIC_NUMBER:
+            raise ValueError(
+                f"absolute_abundances must have length {MAX_ATOMIC_NUMBER} (got {abs_abund_array.shape[0]})."
+            )
 
     # Compute initial guess by neglecting molecules
     # Source: Korg.jl/src/statmech.jl:124-128
     neutral_fraction_guess = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
-    wII_ne = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
-    wIII_ne2 = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+    wII_ne, wIII_ne2 = _get_cached_saha_weight_arrays(
+        temperature, ionization_energies, partition_funcs
+    )
 
     ne_guess = max(float(model_atm_ne), 1e-300)
-    ne_guess2 = ne_guess * ne_guess
+    ne_initial = ne_guess if initial_ne is None else max(float(initial_ne), 1e-300)
+    inv_ne_initial = 1.0 / ne_initial
+    inv_ne_initial2 = inv_ne_initial * inv_ne_initial
 
     for Z in range(1, MAX_ATOMIC_NUMBER + 1):
         if Z in ionization_energies:
-            wII, wIII = saha_ion_weights(temperature, ne_guess, Z, ionization_energies, partition_funcs)
+            wII = wII_ne[Z - 1] * inv_ne_initial
+            wIII = wIII_ne2[Z - 1] * inv_ne_initial2
             neutral_fraction_guess[Z - 1] = 1.0 / (1.0 + wII + wIII)
-            wII_ne[Z - 1] = wII * ne_guess
-            wIII_ne2[Z - 1] = wIII * ne_guess2
 
     # Initial guess: [neutral_fractions, ne/n_total*1e5]
-    x0 = np.concatenate([neutral_fraction_guess, [model_atm_ne / n_total * 1e5]])
+    x0 = np.concatenate([neutral_fraction_guess, [ne_initial / n_total * 1e5]])
 
     # Setup residual function
     residuals_func = setup_chemical_equilibrium_residuals(
@@ -536,38 +678,100 @@ def chemical_equilibrium(temp: float, nt: float, model_atm_ne: float,
     )
 
     # Solve nonlinear system
-    # Source: Korg.jl/src/statmech.jl:192-205
+    # Source baseline: Korg.jl uses Newton with autodiff. Here we use SciPy root and
+    # add robust fallbacks for cool-star outer layers where HYBRD can stagnate.
     try:
-        sol = root(
-            residuals_func,
-            x0,
-            method='hybr',
-            jac=getattr(residuals_func, "jacobian", None),
-            options={'xtol': 1e-8, 'maxfev': 1000},
-        )
+        jacobian_func = getattr(residuals_func, "jacobian", None)
+        attempt_plan = [
+            {
+                "method": "hybr",
+                "x0": x0.copy(),
+                "jac": jacobian_func,
+                "options": {"xtol": 1e-8, "maxfev": 1000},
+            },
+            {
+                "method": "hybr",
+                "x0": np.concatenate([neutral_fraction_guess, [1e-5]]),
+                "jac": jacobian_func,
+                "options": {"xtol": 1e-8, "maxfev": 1000},
+            },
+            {
+                "method": "lm",
+                "x0": x0.copy(),
+                "jac": None,
+                "options": {"xtol": 1e-10, "ftol": 1e-10, "maxiter": 5000},
+            },
+        ]
 
-        if not sol.success:
-            # Try again with very small ne guess (Korg.jl fallback)
-            x0[-1] = 1e-5
+        sol = None
+        for attempt_idx, attempt in enumerate(attempt_plan, start=1):
+            method_name = attempt["method"]
+            use_fallback = attempt_idx > 1
+            if use_fallback:
+                fallback_used = True
+
             sol = root(
                 residuals_func,
-                x0,
-                method='hybr',
-                jac=getattr(residuals_func, "jacobian", None),
-                options={'xtol': 1e-8, 'maxfev': 1000},
+                attempt["x0"],
+                method=method_name,
+                jac=attempt["jac"],
+                options=attempt["options"],
             )
+            _record_attempt(sol, attempt_idx, method_name)
+            if sol.success:
+                break
 
-            if not sol.success:
-                raise RuntimeError(f"Chemical equilibrium solver failed: {sol.message}")
+        if sol is None or not sol.success:
+            if record_stats:
+                stats_out.clear()
+                stats_out.update(
+                    {
+                        "method": "hybr",
+                        "xtol": 1e-8,
+                        "maxfev": 1000,
+                        "fallback_used": fallback_used,
+                        "attempt_count": len(attempts),
+                        "attempts": attempts,
+                    }
+                )
+            msg = "unknown failure" if sol is None else str(getattr(sol, "message", "unknown failure"))
+            raise RuntimeError(f"Chemical equilibrium solver failed: {msg}")
     except Exception as e:
+        if record_stats and not stats_out:
+            stats_out.clear()
+            stats_out.update(
+                {
+                    "method": "hybr",
+                    "xtol": 1e-8,
+                    "maxfev": 1000,
+                    "fallback_used": fallback_used,
+                    "attempt_count": len(attempts),
+                    "attempts": attempts,
+                }
+            )
         raise RuntimeError(f"Chemical equilibrium solver failed: {e}")
+
+    if record_stats:
+        stats_out.clear()
+        stats_out.update(
+            {
+                "method": "hybr",
+                "xtol": 1e-8,
+                "maxfev": 1000,
+                "fallback_used": fallback_used,
+                "attempt_count": len(attempts),
+                "attempts": attempts,
+                "final_success": bool(getattr(sol, "success", False)),
+                "final_status": int(getattr(sol, "status", -1)) if hasattr(sol, "status") else None,
+            }
+        )
 
     # Extract solution
     neutral_fractions = np.abs(sol.x[:-1])
     ne = abs(sol.x[-1]) * n_total * 1e-5
 
     # Check convergence warning
-    if ((ne / n_total > 1e-4) and
+    if (warn_on_ne_discrepancy and (ne / n_total > 1e-4) and
         (abs((ne - model_atm_ne) / model_atm_ne) > electron_number_density_warn_threshold)):
         warnings.warn(
             f"Electron number density differs from model atmosphere by "

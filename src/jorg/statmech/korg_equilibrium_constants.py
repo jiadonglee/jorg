@@ -15,14 +15,59 @@ from typing import Callable, Dict, Iterable, Tuple
 
 import h5py
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline as _SciPyCubicSpline
 
-from ..constants import kboltz_cgs, kboltz_eV, hplanck_cgs
+from ..constants import amu_cgs, kboltz_cgs, kboltz_eV, hplanck_cgs
 from ..data import get_data_path
 from ..data.isotopic_nuclear_spin_degeneracies import ISOTOPIC_NUCLEAR_SPIN_DEGENERACIES
 from .species import Species, Formula, ATOMIC_MASSES
 from .korg_exact_partition_functions import get_korg_exact_partition_functions
 from ..lines.atomic_data import ISOTOPIC_ABUNDANCES
+
+
+class _KorgSpline1D:
+    """Natural cubic spline with Korg-style extrapolation behavior."""
+
+    def __init__(self, x: np.ndarray, y: np.ndarray, *, extrapolate: bool = False):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
+            raise ValueError("x and y must be 1D arrays of equal length")
+        if x.size < 2:
+            raise ValueError("At least two knots are required for spline interpolation")
+        self._x = x
+        self._y = y
+        self._extrapolate = bool(extrapolate)
+        self._spline = _SciPyCubicSpline(x, y, bc_type="natural", extrapolate=False)
+
+    def __call__(self, xq):
+        x_arr = np.asarray(xq, dtype=float)
+        scalar_input = np.isscalar(xq) or x_arr.ndim == 0
+        x_min = float(self._x[0])
+        x_max = float(self._x[-1])
+
+        if scalar_input:
+            x_val = float(x_arr)
+            if x_val < x_min:
+                if self._extrapolate:
+                    return float(self._y[0])
+                raise ValueError(f"Out-of-bounds spline input {x_val} < {x_min}")
+            if x_val > x_max:
+                if self._extrapolate:
+                    return float(self._y[-1])
+                raise ValueError(f"Out-of-bounds spline input {x_val} > {x_max}")
+            return float(self._spline(x_val))
+
+        if not self._extrapolate:
+            if np.any(x_arr < x_min) or np.any(x_arr > x_max):
+                raise ValueError("Out-of-bounds spline input")
+            return self._spline(x_arr)
+
+        x_eval = np.clip(x_arr, x_min, x_max)
+        y_eval = np.asarray(self._spline(x_eval), dtype=float)
+        y_eval = np.where(x_arr < x_min, self._y[0], y_eval)
+        y_eval = np.where(x_arr > x_max, self._y[-1], y_eval)
+        return y_eval
 
 
 def _resolve_data_path(*parts: str) -> Path:
@@ -42,6 +87,13 @@ def _load_isotopic_nuclear_spin_degeneracies() -> Dict[int, Dict[int, int]]:
 def _get_most_abundant_isotope(atomic_number: int) -> int:
     isotopes = ISOTOPIC_ABUNDANCES.get(atomic_number, {})
     if not isotopes:
+        # Some elements are absent from line-list isotope tables; infer a
+        # representative isotope from the mass table to preserve Korg-style
+        # nuclear-spin normalization for ExoMol species.
+        degeneracies = _load_isotopic_nuclear_spin_degeneracies().get(atomic_number, {})
+        if degeneracies:
+            target_A = int(round(float(ATOMIC_MASSES[atomic_number - 1])))
+            return min(degeneracies.keys(), key=lambda A: (abs(A - target_A), A))
         return atomic_number
     return max(isotopes, key=isotopes.get)
 
@@ -102,7 +154,7 @@ def load_barklem_collet_molecular_partition_functions() -> Dict[Species, Callabl
         vals_array = vals_array[temps_mask]
         if len(vals_array) == 0:
             continue
-        partition_funcs[species] = CubicSpline(log_temps, vals_array, extrapolate=True)
+        partition_funcs[species] = _KorgSpline1D(log_temps, vals_array, extrapolate=True)
 
     return partition_funcs
 
@@ -129,7 +181,11 @@ def load_exomol_partition_functions() -> Dict[Species, Callable]:
             mask = np.isfinite(temps) & (temps > 0) & np.isfinite(values)
             if np.count_nonzero(mask) < 2:
                 continue
-            partition_funcs[species] = CubicSpline(np.log(temps[mask]), values[mask], extrapolate=True)
+            partition_funcs[species] = _KorgSpline1D(
+                np.log(temps[mask]),
+                values[mask],
+                extrapolate=True,
+            )
     return partition_funcs
 
 
@@ -194,7 +250,7 @@ def load_barklem_collet_logKs() -> Dict[Species, Callable]:
         mask = np.isfinite(lnT_col) & np.isfinite(logK_col)
         if not np.any(mask):
             continue
-        logKs_dict[species] = CubicSpline(lnT_col[mask], logK_col[mask], extrapolate=True)
+        logKs_dict[species] = _KorgSpline1D(lnT_col[mask], logK_col[mask], extrapolate=False)
 
     return logKs_dict
 
@@ -235,9 +291,11 @@ def create_polyatomic_log_equilibrium_constants(
                 ]
                 u_mol = max(float(partition_funcs[spec](logT)), 1e-300)
                 log_us_ratio = np.log10(np.prod(u_atoms) / u_mol)
+                # Korg's atomic masses are in grams; convert our AMU table to cgs.
+                log_mass_scale = np.log10(amu_cgs)
                 log_masses_ratio = (
-                    sum(np.log10(ATOMIC_MASSES[Z - 1]) for Z in Zs)
-                    - np.log10(spec.formula.mass)
+                    sum(np.log10(ATOMIC_MASSES[Z - 1]) + log_mass_scale for Z in Zs)
+                    - (np.log10(spec.formula.mass) + log_mass_scale)
                 )
                 T = np.exp(logT)
                 log_trans_u = 1.5 * np.log10(2 * np.pi * kboltz_cgs * T / hplanck_cgs**2)

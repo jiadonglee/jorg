@@ -141,6 +141,7 @@ import numpy as np
 import time
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
+from collections import OrderedDict
 
 # GPU/device utilities
 try:
@@ -286,10 +287,10 @@ def create_korg_compatible_abundance_array(
     alpha_elements=None,
 ):
     """Create abundance array matching Korg.jl format_A_X() exactly."""
-    from .abundances import ASPLUND_2020_SOLAR_ABUNDANCES, format_abundances
+    from .abundances import KORG_DEFAULT_SOLAR_ABUNDANCES, format_abundances
 
     if solar_abundances is None:
-        solar_abundances = ASPLUND_2020_SOLAR_ABUNDANCES
+        solar_abundances = KORG_DEFAULT_SOLAR_ABUNDANCES
 
     A_X = format_abundances(
         default_metals_H=m_H,
@@ -597,7 +598,7 @@ def synthesize_korg_compatible(
 
     alpha_continuum, all_number_densities, all_electron_densities = layer_processor.process_all_layers(
         atm=atm,
-        abs_abundances={Z: abs_abundances[Z-1] for Z in range(1, MAX_ATOMIC_NUMBER+1)},
+        abs_abundances=abs_abundances,
         wl_array=wl_array,
         linelist=None,  # NO lines yet - continuum only
         line_buffer=line_buffer,
@@ -735,6 +736,35 @@ def _normalize_rectified_flux(flux: np.ndarray, percentile: float = 99.5, min_sc
     return flux / scale, scale
 
 
+_LINE_WINDOW_CACHE = OrderedDict()
+_LINE_WINDOW_CACHE_MAX = 64
+_KORG_LINE_PROCESSOR = None
+
+
+def _get_relevant_lines_cached(linelist, wl_min_cm: float, wl_max_cm: float):
+    if linelist is None:
+        return []
+    key = (id(linelist), float(wl_min_cm), float(wl_max_cm))
+    cached = _LINE_WINDOW_CACHE.get(key)
+    if cached is not None:
+        _LINE_WINDOW_CACHE.move_to_end(key)
+        return cached
+    relevant = [line for line in linelist if wl_min_cm <= line.wavelength <= wl_max_cm]
+    _LINE_WINDOW_CACHE[key] = relevant
+    if len(_LINE_WINDOW_CACHE) > _LINE_WINDOW_CACHE_MAX:
+        _LINE_WINDOW_CACHE.popitem(last=False)
+    return relevant
+
+
+def _get_cached_line_processor(verbose: bool = False) -> KorgLineProcessor:
+    global _KORG_LINE_PROCESSOR
+    if _KORG_LINE_PROCESSOR is None:
+        _KORG_LINE_PROCESSOR = KorgLineProcessor(verbose=verbose)
+    else:
+        _KORG_LINE_PROCESSOR.verbose = verbose
+    return _KORG_LINE_PROCESSOR
+
+
 def _setup_mu_grid(mu_values):
     """Setup μ grid for radiative transfer using exact Korg.jl method"""
     # Import the function locally to avoid cluttering the main namespace
@@ -764,7 +794,7 @@ def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, numb
 
     wl_min_cm = (wl_array[0] - line_buffer) * 1e-8
     wl_max_cm = (wl_array[-1] + line_buffer) * 1e-8
-    relevant_lines = [line for line in linelist if wl_min_cm <= line.wavelength <= wl_max_cm]
+    relevant_lines = _get_relevant_lines_cached(linelist, wl_min_cm, wl_max_cm)
 
     if not relevant_lines:
         return np.zeros((n_layers, n_wavelengths))
@@ -772,7 +802,7 @@ def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, numb
     if continuum_opacity is not None:
         continuum_opacity = np.asarray(continuum_opacity)
 
-    processor = KorgLineProcessor(verbose=verbose)
+    processor = _get_cached_line_processor(verbose=verbose)
     result = processor.process_lines(
         wl_array_cm=wl_array_cm,
         temps=temps,
@@ -836,15 +866,15 @@ def _calculate_radiative_transfer(alpha_matrix, atm, wavelengths, mu_grid, I_sch
         print(f"   Example: B_λ({wl_mid*1e8:.0f}Å, {T_surface:.0f}K) = {B_mid:.3e} erg/s/cm²/cm/sr")
     
     # α5 reference for anchored τ integration:
-    # Korg.jl anchors optical depth to τ_5000 from the atmosphere, which corresponds to the
-    # continuum opacity at 5000 Å (not total opacity including lines). Using total opacity
-    # here breaks the τ scaling and can distort both line depths and the returned continuum.
+    # Korg.jl initializes α_ref from continuum and then adds line contributions at the
+    # reference wavelength (see synthesize.jl around line_absorption! on α_ref).
+    # Use total opacity at 5000 Å when it is available in the synthesis grid.
     alpha5_reference = None
-    if alpha_continuum is not None:
+    if alpha_matrix is not None:
         wl_array = np.asarray(wavelengths)
         idx_matches = np.where(np.isclose(wl_array, 5000.0, atol=1e-6))[0]
-        if idx_matches.size and alpha_continuum.shape == alpha_matrix.shape:
-            alpha5_reference = alpha_continuum[:, idx_matches[0]]
+        if idx_matches.size and alpha_matrix.shape[0] == n_layers:
+            alpha5_reference = alpha_matrix[:, idx_matches[0]]
 
     if alpha5_reference is None:
         ce_source = None

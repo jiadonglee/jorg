@@ -38,7 +38,9 @@ class LayerProcessor:
     """
     
     def __init__(self, ionization_energies, partition_funcs, log_equilibrium_constants,
-                 electron_density_warn_threshold=float('inf'), line_cutoff_threshold=3e-4, verbose=False):
+                 electron_density_warn_threshold=float('inf'), line_cutoff_threshold=3e-4, verbose=False,
+                 warn_on_ne_discrepancy=False, print_ne_comparison=False,
+                 collect_ce_stats=False, use_prev_ne_initial=False):
         """
         Initialize layer processor with atomic physics data
 
@@ -63,6 +65,10 @@ class LayerProcessor:
         self.electron_density_warn_threshold = electron_density_warn_threshold
         self.line_cutoff_threshold = line_cutoff_threshold
         self.verbose = verbose
+        self.warn_on_ne_discrepancy = warn_on_ne_discrepancy
+        self.print_ne_comparison = print_ne_comparison
+        self.collect_ce_stats = collect_ce_stats
+        self.use_prev_ne_initial = use_prev_ne_initial
         
         # Statistics tracking
         self.stats = {
@@ -72,6 +78,17 @@ class LayerProcessor:
             'line_failures': 0,
             'total_processing_time': 0.0
         }
+        if self.collect_ce_stats:
+            self.stats.update(
+                {
+                    "ce_calls": 0,
+                    "ce_successes": 0,
+                    "ce_nfev_total": 0,
+                    "ce_njev_total": 0,
+                    "ce_attempts_total": 0,
+                }
+            )
+
     
     def process_all_layers(self, atm, abs_abundances, wl_array, linelist,
                           line_buffer, hydrogen_lines, vmic,
@@ -87,8 +104,8 @@ class LayerProcessor:
         ----------
         atm : Dict
             Atmospheric model with temperature, pressure arrays
-        abs_abundances : Dict
-            Normalized absolute abundances {Z: abundance}
+        abs_abundances : Dict or array-like
+            Normalized absolute abundances {Z: abundance} or 92-element array.
         wl_array : np.ndarray
             Wavelength array in Å
         linelist : List
@@ -114,16 +131,29 @@ class LayerProcessor:
         
         n_layers = len(atm['temperature'])
         n_wavelengths = len(wl_array)
+
         
         if self.verbose:
             print(f"🔄 Processing {n_layers} atmospheric layers...")
             print(f"   Wavelengths: {n_wavelengths} points ({wl_array[0]:.1f}-{wl_array[-1]:.1f} Å)")
         
+        # Normalize abundances input (dict or array-like)
+        if isinstance(abs_abundances, dict):
+            abs_abundances_norm = abs_abundances
+        else:
+            abs_abundances_norm = np.asarray(abs_abundances, dtype=np.float64)
+            if abs_abundances_norm.shape[0] != MAX_ATOMIC_NUMBER:
+                raise ValueError(
+                    f"abs_abundances must have length {MAX_ATOMIC_NUMBER} (got {abs_abundances_norm.shape[0]})."
+                )
+
         # Initialize output arrays
         alpha_matrix = np.zeros((n_layers, n_wavelengths))
         all_number_densities = {}
         all_electron_densities = np.zeros(n_layers)
         
+        prev_ne_initial = None
+
         # Process each layer
         for layer_idx in range(n_layers):
             if self.verbose and (layer_idx % 10 == 0 or layer_idx < 5):
@@ -133,9 +163,9 @@ class LayerProcessor:
             try:
                 # Process single layer
                 layer_opacity, layer_number_densities, layer_ne = self._process_single_layer(
-                    layer_idx, atm, abs_abundances, wl_array, linelist,
+                    layer_idx, atm, abs_abundances_norm, wl_array, linelist,
                     line_buffer, hydrogen_lines, vmic, use_chemical_equilibrium_from,
-                    log_g, cntm_step
+                    log_g, cntm_step, initial_ne=prev_ne_initial
                 )
                 
                 # Store results
@@ -149,6 +179,8 @@ class LayerProcessor:
                     all_number_densities[species][layer_idx] = float(density)
                 
                 self.stats['layers_processed'] += 1
+                if self.use_prev_ne_initial and np.isfinite(layer_ne) and layer_ne > 0.0:
+                    prev_ne_initial = float(layer_ne)
                 
             except Exception as e:
                 if self.verbose:
@@ -167,7 +199,8 @@ class LayerProcessor:
 
     def _process_single_layer(self, layer_idx, atm, abs_abundances, wl_array,
                             linelist, line_buffer, hydrogen_lines, vmic,
-                            use_chemical_equilibrium_from, log_g, cntm_step):
+                            use_chemical_equilibrium_from, log_g, cntm_step,
+                            initial_ne=None):
         """
         Process a single atmospheric layer systematically
         
@@ -197,7 +230,7 @@ class LayerProcessor:
             # Estimate from temperature and pressure  
             print("⚠️ No electron density in atmosphere, using simple estimate.")
             ne_guess = nt * 1e-4  # Simple estimate
-        
+
         # 2. Chemical equilibrium calculation
         # Check if we should use atmospheric electron density directly (RECOMMENDED for Korg.jl compatibility)
         if hasattr(self, 'use_atmospheric_ne') and self.use_atmospheric_ne and 'electron_density' in atm:
@@ -208,7 +241,8 @@ class LayerProcessor:
             # Still need number densities, so do a light chemical equilibrium calculation
             try:
                 _, layer_number_densities = self._calculate_chemical_equilibrium(
-                    T, nt, ne_guess, abs_abundances, use_chemical_equilibrium_from, layer_idx
+                    T, nt, ne_guess, abs_abundances, use_chemical_equilibrium_from, layer_idx,
+                    initial_ne=initial_ne
                 )
             except:
                 # Fallback to simple estimates
@@ -216,7 +250,8 @@ class LayerProcessor:
         else:
             # Full chemical equilibrium recalculation (original approach)
             ne_solution, layer_number_densities = self._calculate_chemical_equilibrium(
-                T, nt, ne_guess, abs_abundances, use_chemical_equilibrium_from, layer_idx
+                T, nt, ne_guess, abs_abundances, use_chemical_equilibrium_from, layer_idx,
+                initial_ne=initial_ne
             )
         
         # 3. Calculate opacity components
@@ -229,7 +264,8 @@ class LayerProcessor:
         return layer_opacity, layer_number_densities, ne_solution
     
     def _calculate_chemical_equilibrium(self, T, nt, ne_guess, abs_abundances,
-                                      use_chemical_equilibrium_from, layer_idx):
+                                      use_chemical_equilibrium_from, layer_idx,
+                                      initial_ne=None):
         """
         Calculate chemical equilibrium for this layer
         
@@ -247,26 +283,49 @@ class LayerProcessor:
                 return ne_solution, layer_number_densities
             
             # Calculate fresh chemical equilibrium (matches Korg.jl)
+            ce_stats = {} if self.collect_ce_stats else None
+            ce_kwargs = {}
+            if initial_ne is not None and np.isfinite(initial_ne) and initial_ne > 0.0:
+                ce_kwargs["initial_ne"] = float(initial_ne)
+
             ne_solution, number_densities = chemical_equilibrium(
                 temp=T, nt=nt, model_atm_ne=ne_guess,
                 absolute_abundances=abs_abundances,
                 ionization_energies=self.ionization_energies,
                 partition_funcs=self.partition_funcs,
-                log_equilibrium_constants=self.log_equilibrium_constants
+                log_equilibrium_constants=self.log_equilibrium_constants,
+                warn_on_ne_discrepancy=self.warn_on_ne_discrepancy,
+                stats_out=ce_stats,
+                **ce_kwargs,
             )
+
+            if self.collect_ce_stats and isinstance(ce_stats, dict) and ce_stats:
+                attempts = ce_stats.get("attempts") or []
+                if attempts:
+                    last = attempts[-1]
+                    self.stats["ce_calls"] += 1
+                    self.stats["ce_attempts_total"] += int(ce_stats.get("attempt_count", 0) or 0)
+                    nfev = last.get("nfev")
+                    njev = last.get("njev")
+                    if nfev is not None:
+                        self.stats["ce_nfev_total"] += int(nfev)
+                    if njev is not None:
+                        self.stats["ce_njev_total"] += int(njev)
+                    if ce_stats.get("final_success", False):
+                        self.stats["ce_successes"] += 1
             
             # Check convergence (following Korg.jl's warning system)
             convergence_error = abs(ne_solution - ne_guess) / ne_guess
 
             # DIAGNOSTIC: Print electron density for first layer (surface)
-            if self.verbose and layer_idx == 0:
+            if self.verbose and self.print_ne_comparison and layer_idx == 0:
                 print(f"   📊 ELECTRON DENSITY (Surface Layer):")
                 print(f"      Atmospheric ne:  {ne_guess:.3e} cm⁻³")
                 print(f"      Calculated ne:   {ne_solution:.3e} cm⁻³")
                 print(f"      Ratio (calc/atm): {ne_solution / ne_guess:.3f}")
                 print(f"      Convergence err: {convergence_error:.1%}")
 
-            if convergence_error > self.electron_density_warn_threshold:
+            if self.warn_on_ne_discrepancy and convergence_error > self.electron_density_warn_threshold:
                 if ne_solution / nt > 1e-4:  # Only warn if significant
                     warnings.warn(
                         f"Electron density differs from atmosphere by "
@@ -297,7 +356,7 @@ class LayerProcessor:
         
         # Calculate major species using Saha equation
         for Z in range(1, min(29, MAX_ATOMIC_NUMBER+1)):  # H through Ni
-            abundance = abs_abundances.get(Z, 0.0)
+            abundance = abs_abundances.get(Z, 0.0) if isinstance(abs_abundances, dict) else float(abs_abundances[Z - 1])
             if abundance > 1e-12:
                 try:
                     # Calculate ionization fractions
@@ -339,7 +398,7 @@ class LayerProcessor:
         
         # Calculate ionization for all elements using Saha equation
         for Z in range(1, min(93, MAX_ATOMIC_NUMBER+1)):  # All elements up to U
-            abundance = abs_abundances.get(Z, 0.0)
+            abundance = abs_abundances.get(Z, 0.0) if isinstance(abs_abundances, dict) else float(abs_abundances[Z - 1])
             if abundance > 1e-12:
                 try:
                     # Calculate ionization fractions using Saha equation

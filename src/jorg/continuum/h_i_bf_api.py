@@ -24,7 +24,7 @@ Usage:
 import jax
 import jax.numpy as jnp
 from typing import Union, Optional
-from .nahar_h_i_bf import nahar_h_i_bf_absorption_single_level, CHI_H_EV
+from .nahar_h_i_bf import nahar_h_i_bf_absorption_single_level, CHI_H_EV, _load_nahar_h_i_data
 from .utils import stimulated_emission_factor
 from ..constants import kboltz_eV, hplanck_eV, RydbergH_eV
 from ..statmech.hummer_mihalas import hummer_mihalas_w
@@ -189,6 +189,8 @@ def H_I_bf_fast(
     
     Parameters and returns are identical to H_I_bf.
     """
+    # Ensure Nahar data are loaded outside JIT to avoid tracer leaks
+    _load_nahar_h_i_data()
     return H_I_bf_compiled(
         frequencies, temperature, n_h_i, n_he_i, electron_density, inv_u_h,
         n_max_MHD, use_hubeny_generalization, taper, use_MHD_for_Lyman

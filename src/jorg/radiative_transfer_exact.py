@@ -431,6 +431,168 @@ def exponential_integral_2(x: Union[float, jnp.ndarray]) -> jnp.ndarray:
     )
 
 
+# Numpy variants for fast CPU batch evaluation (avoid JAX dispatch overhead)
+def _expint_small_np(x):
+    """Small x expansion for E₂(x) (numpy)"""
+    euler_mascheroni = 0.57721566490153286060651209008240243104215933593992
+    return (1 +
+            ((np.log(x) + euler_mascheroni - 1) +
+             (-0.5 + (0.08333333333333333 +
+                      (-0.013888888888888888 + 0.0020833333333333333 * x) * x) * x) * x) * x)
+
+
+def _expint_large_np(x):
+    """Large x expansion for E₂(x) (numpy)"""
+    invx = 1.0 / x
+    return np.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
+
+
+def _expint_2_np(x):
+    """E₂(x) around x=2 (numpy)"""
+    x = x - 2
+    return (0.037534261820486914 +
+            (-0.04890051070806112 +
+             (0.033833820809153176 +
+              (-0.016916910404576574 +
+               (0.007048712668573576 - 0.0026785108140579598 * x) * x) * x) * x) * x)
+
+
+def _expint_3_np(x):
+    """E₂(x) around x=3 (numpy)"""
+    x = x - 3
+    return (0.010641925085272673 +
+            (-0.013048381094197039 +
+             (0.008297844727977323 +
+              (-0.003687930990212144 +
+               (0.0013061422257001345 - 0.0003995258572729822 * x) * x) * x) * x) * x)
+
+
+def _expint_4_np(x):
+    """E₂(x) around x=4 (numpy)"""
+    x = x - 4
+    return (0.0031982292493385146 +
+            (-0.0037793524098489054 +
+             (0.0022894548610917728 +
+              (-0.0009539395254549051 +
+               (0.00031003034577284415 - 8.466213288412284e-5 * x) * x) * x) * x) * x)
+
+
+def _expint_5_np(x):
+    """E₂(x) around x=5 (numpy)"""
+    x = x - 5
+    return (0.000996469042708825 +
+            (-0.0011482955912753257 +
+             (0.0006737946999085467 +
+              (-0.00026951787996341863 +
+               (8.310134632205409e-5 - 2.1202073223788938e-5 * x) * x) * x) * x) * x)
+
+
+def _expint_6_np(x):
+    """E₂(x) around x=6 (numpy)"""
+    x = x - 6
+    return (0.0003182574636904001 +
+            (-0.0003600824521626587 +
+             (0.00020656268138886323 +
+              (-8.032993165122457e-5 +
+               (2.390771775334065e-5 - 5.8334831318151185e-6 * x) * x) * x) * x) * x)
+
+
+def _expint_7_np(x):
+    """E₂(x) around x=7 (numpy)"""
+    x = x - 7
+    return (0.00010350984428214624 +
+            (-0.00011548173161033826 +
+             (6.513442611103688e-5 +
+              (-2.4813114708966427e-5 +
+               (7.200234178941151e-6 - 1.7027366981408086e-6 * x) * x) * x) * x) * x)
+
+
+def _expint_8_np(x):
+    """E₂(x) around x=8 (numpy)"""
+    x = x - 8
+    return (3.413764515111217e-5 +
+            (-3.76656228439249e-5 +
+             (2.096641424390699e-5 +
+              (-7.862405341465122e-6 +
+               (2.2386015208338193e-6 - 5.173353514609864e-7 * x) * x) * x) * x) * x)
+
+
+def exponential_integral_2_np(x: Union[float, np.ndarray]) -> np.ndarray:
+    """
+    Second-order exponential integral E₂(x) (numpy batch version).
+    Mirrors exponential_integral_2() but avoids JAX dispatch overhead.
+    """
+    x = np.asarray(x)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(
+            x == 0.0,
+            1.0,
+            np.where(
+                x < 1.1,
+                _expint_small_np(x),
+                np.where(
+                    x < 2.5,
+                    _expint_2_np(x),
+                    np.where(
+                        x < 3.5,
+                        _expint_3_np(x),
+                        np.where(
+                            x < 4.5,
+                            _expint_4_np(x),
+                            np.where(
+                                x < 5.5,
+                                _expint_5_np(x),
+                                np.where(
+                                    x < 6.5,
+                                    _expint_6_np(x),
+                                    np.where(
+                                        x < 7.5,
+                                        _expint_7_np(x),
+                                        np.where(
+                                            x < 9.0,
+                                            _expint_8_np(x),
+                                            _expint_large_np(x)
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+
+
+def expint_transfer_integral_core_np(tau: np.ndarray, m: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Vectorized expint transfer integral (numpy)."""
+    return (1.0/6.0 * (tau * exponential_integral_2_np(tau) * (3*b + 2*m*tau) -
+                       np.exp(-tau) * (3*b + 2*m*(tau + 1.0))))
+
+
+def compute_tau_anchored_batch_np(alpha: np.ndarray,
+                                  integrand_factor: np.ndarray,
+                                  log_tau_ref: np.ndarray) -> np.ndarray:
+    """Vectorized anchored τ integration for all wavelengths (numpy)."""
+    integrand = alpha * integrand_factor[:, None]
+    delta = log_tau_ref[1:] - log_tau_ref[:-1]
+    trapezoid = 0.5 * (integrand[1:] + integrand[:-1]) * delta[:, None]
+    tau = np.concatenate([np.zeros((1, alpha.shape[1])), np.cumsum(trapezoid, axis=0)], axis=0)
+    return tau
+
+
+def compute_F_flux_only_expint_batch_np(tau: np.ndarray, source: np.ndarray) -> np.ndarray:
+    """Compute expint flux for all wavelengths (numpy batch)."""
+    tau_next = tau[1:]
+    tau_prev = tau[:-1]
+    tau_diff = tau_next - tau_prev
+    valid = tau_diff > 1e-15
+    safe_diff = np.where(tau_diff == 0.0, 1.0, tau_diff)
+    m = (source[1:] - source[:-1]) / safe_diff
+    b = source[:-1] - m * tau_prev
+    contrib = expint_transfer_integral_core_np(tau_next, m, b) - expint_transfer_integral_core_np(tau_prev, m, b)
+    return np.sum(np.where(valid, contrib, 0.0), axis=0)
+
+
 def expint_transfer_integral_core(tau: jnp.ndarray, m: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     """
     Exact solution to ∫ (m*τ + b) * E₂(τ) dτ (EXACT Korg.jl port)
@@ -726,6 +888,8 @@ def radiative_transfer(alpha: np.ndarray, source: np.ndarray, spatial_coord: np.
     -----
     Exact port of Korg.jl algorithm with all optimizations and edge cases
     """
+    alpha = np.asarray(alpha)
+    source = np.asarray(source)
     n_layers, n_wavelengths = alpha.shape
     
     # Special case for exponential integral optimization (Korg.jl lines 81-86)
@@ -766,8 +930,19 @@ def radiative_transfer(alpha: np.ndarray, source: np.ndarray, spatial_coord: np.
         tau_ref = np.logspace(-4, 2, n_layers)  # Default tau grid
     if alpha_ref is None:
         alpha_ref = np.ones(n_layers)  # Default reference
-    
+
+    tau_ref = np.asarray(tau_ref)
+    alpha_ref = np.asarray(alpha_ref)
     log_tau_ref = np.log(np.maximum(tau_ref, 1e-10))
+
+    # Fast path: plane-parallel expint flux without per-wavelength Python loops
+    if I_scheme == "linear_flux_only_expint" and not spherical and not include_inward_rays:
+        integrand_factor = tau_ref / alpha_ref
+        tau_matrix = compute_tau_anchored_batch_np(alpha, integrand_factor, log_tau_ref)
+        surface_intensity = compute_F_flux_only_expint_batch_np(tau_matrix, source)
+        intensity = surface_intensity[None, :]
+        flux = 2 * np.pi * surface_intensity  # mu=1, weight=1
+        return flux, intensity, mu_surface_grid, mu_weights
     
     # Process inward rays (Korg.jl lines 116-123)
     for mu_idx in range(n_inward_rays):

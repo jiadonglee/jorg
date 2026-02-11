@@ -243,6 +243,25 @@ ASPLUND_2020_SOLAR_ABUNDANCES = jnp.array([
     -0.54   # 92 U
 ])
 
+
+# Bergemann, Lodders, and Palme 2025 solar abundances - Korg.jl default_solar_abundances
+# Source: Korg.jl/src/atomic_data.jl bergemann_2025_solar_abundances
+BERGEMANN_2025_SOLAR_ABUNDANCES = jnp.array([
+    12.00, 10.922, 1.04, 1.21, 2.70, 8.51, 7.94, 8.76, 4.40, 8.15,
+    6.29, 7.58, 6.43, 7.56, 5.44, 7.16, 5.43, 6.50, 5.09, 6.35,
+    3.13, 4.97, 3.89, 5.74, 5.52, 7.51, 4.95, 6.24, 4.24, 4.55,
+    3.02, 3.62, 2.34, 3.41, 2.65, 3.31, 2.35, 2.93, 2.30, 2.68,
+    1.47, 1.88, -5.00, 1.75, 0.78, 1.57, 0.96, 1.77, 0.80, 2.02,
+    1.08, 2.23, 1.76, 2.30, 1.12, 2.27, 1.10, 1.58, 0.75, 1.42,
+    -5.00, 0.95, 0.57, 1.08, 0.31, 1.10, 0.48, 0.93, 0.11, 0.85,
+    0.10, 0.86, -0.11, 0.79, 0.30, 1.36, 1.42, 1.64, 0.91, 1.14,
+    0.95, 1.95, 0.70, -5.00, -5.00, -5.00, -5.00, -5.00, -5.00, 0.09,
+    -5.00, -0.50
+])
+
+# Keep this alias explicit where Korg-compatible defaults are expected.
+KORG_DEFAULT_SOLAR_ABUNDANCES = BERGEMANN_2025_SOLAR_ABUNDANCES
+
 # Grevesse et al. 2007 solar abundances - matches Korg.jl grevesse_2007_solar_abundances
 # Source: Korg.jl/src/atomic_data.jl lines 55-66
 GREVESSE_2007_SOLAR_ABUNDANCES = jnp.array([
@@ -278,7 +297,8 @@ def format_abundances(default_metals_H=0.0, default_alpha_H=None, abundances=Non
     solar_relative : bool, default True
         If True, interpret abundances as [X/H] format. If False, as A(X) format
     solar_abundances : array_like, optional
-        Solar abundance reference. Defaults to Asplund 2020
+        Solar abundance reference. Defaults to Korg's default
+        (Bergemann, Lodders, and Palme 2025).
     alpha_elements : array_like, optional  
         List of atomic numbers of alpha elements. Defaults to O, Ne, Mg, Si, S, Ar, Ca, Ti
         
@@ -313,7 +333,7 @@ def format_abundances(default_metals_H=0.0, default_alpha_H=None, abundances=Non
     if abundances is None:
         abundances = {}
     if solar_abundances is None:
-        solar_abundances = ASPLUND_2020_SOLAR_ABUNDANCES  
+        solar_abundances = KORG_DEFAULT_SOLAR_ABUNDANCES
     if alpha_elements is None:
         alpha_elements = DEFAULT_ALPHA_ELEMENTS
         

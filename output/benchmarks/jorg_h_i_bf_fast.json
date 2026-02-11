@@ -1,0 +1,37 @@
+{
+  "repo_root": "/Users/jdli/Project/jorg/jorg",
+  "backend": "cpu",
+  "wl_range": [
+    5000.0,
+    5020.0
+  ],
+  "n_pix": 1000,
+  "n_spec": 1,
+  "steps": {
+    "n_pix": 1000,
+    "n_spec": 1,
+    "pixels_total": 1000,
+    "atmosphere": 0.4280093749985099,
+    "chem_eq_continuum": 1.0351659170119092,
+    "line_opacity": 0.35524133301805705,
+    "radiative_transfer": 0.016551624983549118,
+    "total": 1.8349682500120252,
+    "pixels_per_sec": 544.9685573543012,
+    "per_spec_timings": [
+      {
+        "atmosphere": 0.4280093749985099,
+        "chem_eq_continuum": 1.0351659170119092,
+        "line_opacity": 0.35524133301805705,
+        "radiative_transfer": 0.016551624983549118
+      }
+    ]
+  },
+  "profile": {
+    "params": {
+      "Teff": 5771.0,
+      "logg": 4.44,
+      "m_H": 0.0
+    },
+    "top_30_cumtime": "         5507186 function calls (5248859 primitive calls) in 2.459 seconds\n\n   Ordered by: cumulative time\n   List reduced from 886 to 30 due to restriction <30>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n        1    0.008    0.008    2.489    2.489 jorg_speed_bench_5_5.py:83(run_jorg_pipeline)\n        1    0.017    0.017    1.894    1.894 layer_processor.py:76(process_all_layers)\n       56    0.000    0.000    1.828    0.033 layer_processor.py:168(_process_single_layer)\n       56    0.004    0.000    1.296    0.023 layer_processor.py:231(_calculate_chemical_equilibrium)\n       56    0.036    0.001    1.292    0.023 korg_chemical_equilibrium.py:454(chemical_equilibrium)\n       56    0.000    0.000    0.618    0.011 _root.py:25(root)\n       56    0.000    0.000    0.618    0.011 _minpack_py.py:193(_root_hybr)\n       56    0.000    0.000    0.532    0.009 layer_processor.py:405(_calculate_layer_opacity)\n       56    0.001    0.000    0.531    0.009 layer_processor.py:434(_calculate_continuum_opacity)\n       56    0.004    0.000    0.529    0.009 exact_physics_continuum.py:115(total_continuum_absorption_exact_physics_only)\n      112    0.001    0.000    0.407    0.004 _minpack_py.py:21(_check_func)\n       56    0.061    0.001    0.379    0.007 korg_chemical_equilibrium.py:125(setup_chemical_equilibrium_residuals)\n      112    0.174    0.002    0.366    0.003 korg_chemical_equilibrium.py:330(jacobian)\n    70448    0.127    0.000    0.284    0.000 _interpolate.py:744(__call__)\n        1    0.000    0.000    0.270    0.270 synthesis.py:749(_calculate_line_opacity_multilayer)\n        1    0.000    0.000    0.267    0.267 korg_line_processor.py:161(process_lines)\n        1    0.000    0.000    0.262    0.262 atmosphere.py:367(interpolate_marcs)\n       56    0.012    0.000    0.256    0.005 metals_bf.py:206(metal_bf_absorption)\n 1120/560    0.001    0.000    0.235    0.000 traceback_util.py:175(reraise_with_filtered_traceback)\n      560    0.003    0.000    0.234    0.000 api.py:1201(vmap_f)\n      425    0.000    0.000    0.218    0.001 _root.py:209(_wrapped_fun)\n        1    0.003    0.003    0.218    0.218 korg_line_processor.py:330(_compute_n_div_U)\n      425    0.001    0.000    0.218    0.001 korg_chemical_equilibrium.py:320(residuals)\n    36176    0.007    0.000    0.217    0.000 korg_exact_partition_functions.py:168(<lambda>)\n      313    0.205    0.001    0.216    0.001 korg_chemical_equilibrium.py:232(_compute_common)\n      560    0.005    0.000    0.213    0.000 linear_util.py:178(call_wrapped)\n      581    0.016    0.000    0.212    0.000 korg_line_processor.py:342(<listcomp>)\n       56    0.032    0.001    0.211    0.004 {built-in method scipy.optimize._minpack._hybrj}\n    36176    0.024    0.000    0.210    0.000 korg_exact_partition_functions.py:134(get_partition_function)\n     5152    0.044    0.000    0.206    0.000 korg_chemical_equilibrium.py:56(saha_ion_weights)\n\n\n"
+  }
+}

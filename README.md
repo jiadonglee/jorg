@@ -52,3 +52,8 @@ if `JORG_DATA_DIR` is not set.
 
 ## Status
 - v0.3.0 (alpha)
+
+## Chemical Equilibrium (JAX)
+- `jorg.statmech.chem_eq_jax.chemical_equilibrium_jax` provides a fully JAX-native solver with implicit differentiation.
+- Partition functions and logK tables are linearly interpolated on a precomputed logT grid (no SciPy in the JIT path).
+- Molecule support is limited to neutral species and +1 diatomics; polyatomic logK is approximated via grid interpolation.

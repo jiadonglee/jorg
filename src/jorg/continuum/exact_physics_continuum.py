@@ -29,7 +29,7 @@ from functools import partial
 # Import all exact physics implementations
 from .mclaughlin_hminus import mclaughlin_hminus_bf_absorption
 from .metals_bf import metal_bf_absorption
-from .h_i_bf_api import H_I_bf
+from .h_i_bf_api import H_I_bf, H_I_bf_fast
 from .hydrogen import h_minus_ff_absorption, h2_plus_bf_ff_absorption
 from .helium import he_minus_ff_absorption
 from .positive_ion_ff import positive_ion_ff_absorption
@@ -185,11 +185,13 @@ def total_continuum_absorption_exact_physics_only(
     h_ii_species = Species.from_atomic_number(1, 1)  # H II
     he_i_species = Species.from_atomic_number(2, 0)  # He I
     he_ii_species = Species.from_atomic_number(2, 1)  # He II
+    h2_species = Species.from_string("H2")  # H2
     
     n_h_i = number_densities.get(h_i_species, 0.0)
     n_h_ii = number_densities.get(h_ii_species, 0.0)
     n_he_i = number_densities.get(he_i_species, 0.0)
     n_he_ii = number_densities.get(he_ii_species, 0.0)
+    n_h2 = number_densities.get(h2_species, 0.0)
     
     # Exact H I partition function
     if partition_funcs is None:
@@ -214,7 +216,10 @@ def total_continuum_absorption_exact_physics_only(
     n_he_i_div_u = n_he_i / U_He_I
     
     if verbose:
-        print(f"Species densities: H I={n_h_i:.2e}, H II={n_h_ii:.2e}, He I={n_he_i:.2e}")
+        print(
+            f"Species densities: H I={n_h_i:.2e}, H II={n_h_ii:.2e}, "
+            f"He I={n_he_i:.2e}, H2={n_h2:.2e}"
+        )
         print(f"H I partition function: {float(U_H_I):.6f}")
     
     # === EXACT PHYSICS COMPONENTS (NO FALLBACKS) ===
@@ -318,7 +323,7 @@ def total_continuum_absorption_exact_physics_only(
         if verbose:
             print(f"7. Adding Nahar 2021 H I bound-free (n=1-{n_levels_max})...")
 
-        alpha_h_i_bf_total = H_I_bf(
+        alpha_h_i_bf_total = H_I_bf_fast(
             frequencies=frequencies,
             temperature=temperature,
             n_h_i=n_h_i,
@@ -363,7 +368,7 @@ def total_continuum_absorption_exact_physics_only(
     if verbose:
         print("10. Adding exact Rayleigh scattering...")
     
-    alpha_rayleigh = rayleigh_scattering(frequencies, n_h_i, n_he_i, 0.0)  # No H2 for now
+    alpha_rayleigh = rayleigh_scattering(frequencies, n_h_i, n_he_i, n_h2)
     alpha_total += alpha_rayleigh
     
     if verbose:

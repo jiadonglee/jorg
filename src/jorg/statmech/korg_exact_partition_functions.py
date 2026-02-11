@@ -13,6 +13,7 @@ import numpy as np
 import h5py
 from scipy.interpolate import CubicSpline
 from typing import Dict, Callable
+from functools import lru_cache
 import warnings
 import os
 
@@ -52,6 +53,15 @@ class KorgExactPartitionFunctions:
         self.data_file = data_file
         self.partition_funcs = {}
         self._load_partition_functions()
+        self._cached_partition_function = lru_cache(maxsize=4096)(self._get_partition_function_uncached)
+
+    def _get_partition_function_uncached(self, species: Species, log_temperature: float) -> float:
+        if species in self.partition_funcs:
+            return float(self.partition_funcs[species](log_temperature))
+        warnings.warn(f"Species {species} not found in Korg partition functions")
+        if species.charge == 0:
+            return 2.0  # Crude fallback
+        return 1.0
 
     def _load_partition_functions(self):
         """
@@ -147,17 +157,11 @@ class KorgExactPartitionFunctions:
         float
             Partition function U(T)
         """
-        if species in self.partition_funcs:
-            # Interpolate and return U directly
-            return float(self.partition_funcs[species](log_temperature))
-        else:
-            warnings.warn(f"Species {species} not found in Korg partition functions")
-            # Fallback for missing species
-            temperature = np.exp(log_temperature)
-            if species.charge == 0:
-                return 2.0  # Crude fallback
-            else:
-                return 1.0
+        try:
+            log_T = float(log_temperature)
+        except Exception:
+            return self._get_partition_function_uncached(species, log_temperature)
+        return self._cached_partition_function(species, log_T)
 
     def __contains__(self, species: Species) -> bool:
         """Check if species has a partition function"""

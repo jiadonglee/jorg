@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, NamedTuple
 from dataclasses import dataclass
 import warnings
+from functools import lru_cache
 # PHASE 1.3 OPTIMIZATION: Replace SciPy with JAX interpolation
 try:
     from scipy.interpolate import CubicSpline
@@ -43,6 +44,10 @@ from .interpolation_jax import cubic_spline_nd
 # Import Jorg constants
 from .constants import kboltz_cgs, G_cgs, solar_mass_cgs
 from .data import get_data_root
+
+
+_INTERPOLATOR_CACHE = {}
+_CUBIC_INTERPOLATOR_CACHE = {}
 
 
 @dataclass
@@ -110,6 +115,14 @@ def load_marcs_grid(grid_path: str):
     return grid, nodes, param_names
 
 
+@lru_cache(maxsize=4)
+def _load_marcs_grid_cached(grid_path: str):
+    """
+    Cached MARCS grid loader to avoid repeated HDF5 reads.
+    """
+    return load_marcs_grid(str(grid_path))
+
+
 def _artifact_roots() -> List[Path]:
     roots: List[Path] = []
     depot_path = os.environ.get("JULIA_DEPOT_PATH")
@@ -163,6 +176,14 @@ def _resolve_marcs_grid_path(grid_data_dir: Optional[Union[str, Path]], filename
         "If you don't have the MARCS grids, download them from: "
         "https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/Q8AYIA"
     )
+
+
+@lru_cache(maxsize=16)
+def _resolve_marcs_grid_path_cached(grid_data_dir: Optional[Union[str, Path]], filename: str) -> str:
+    """
+    Cached path resolution for MARCS grids.
+    """
+    return _resolve_marcs_grid_path(grid_data_dir, filename)
 
 
 def multilinear_interpolation(params: jnp.ndarray, 
@@ -241,11 +262,53 @@ def multilinear_interpolation(params: jnp.ndarray,
     return result
 
 
+def _get_multilinear_interpolator(grid_path: str, nodes: List[jnp.ndarray],
+                                  grid: jnp.ndarray, n_params: int):
+    """
+    Return a cached JIT-compiled multilinear interpolator for a grid.
+    """
+    key = (str(grid_path), int(n_params))
+    cached = _INTERPOLATOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def _interp(params):
+        params = jnp.asarray(params, dtype=grid.dtype)
+        return multilinear_interpolation(params, nodes, grid)
+
+    compiled = jax.jit(_interp)
+    _INTERPOLATOR_CACHE[key] = compiled
+    return compiled
+
+
+def _get_cool_dwarf_interpolator(grid_path: str, axis_nodes: List[np.ndarray], grid: jnp.ndarray):
+    """
+    Return a cached JIT-compiled cool dwarf cubic interpolator for a grid.
+    """
+    key = (str(grid_path), "cool_dwarf")
+    cached = _CUBIC_INTERPOLATOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    axis_nodes_jax = [jnp.asarray(node, dtype=jnp.float64) for node in axis_nodes]
+
+    def _interp(axis_params):
+        data = jnp.asarray(grid, dtype=jnp.float64)
+        for node, value in zip(axis_nodes_jax, axis_params):
+            data = cubic_spline_nd(node, data, axis=0, x_query=value)
+        return data.T
+
+    compiled = jax.jit(_interp)
+    _CUBIC_INTERPOLATOR_CACHE[key] = compiled
+    return compiled
+
+
 def _cubic_interpolation_cool_dwarf(params: np.ndarray,
                                     nodes: List[jnp.ndarray],
                                     grid: jnp.ndarray,
                                     param_names: List[str],
-                                    use_jax: bool = True) -> np.ndarray:
+                                    use_jax: bool = True,
+                                    grid_path: Optional[str] = None) -> np.ndarray:
     """
     Cubic interpolation for cool dwarf grid (matches Korg's cubic spline behavior).
 
@@ -288,15 +351,11 @@ def _cubic_interpolation_cool_dwarf(params: np.ndarray,
     axis_params = [params_np[4], params_np[3], params_np[2], params_np[1], params_np[0]]
 
     if use_jax:
-        # JAX version - JIT-compilable and GPU-accelerated
-        data = jnp.asarray(grid, dtype=jnp.float64)
-        for node, value in zip(axis_nodes, axis_params):
-            # Convert node to JAX array
-            node_jax = jnp.asarray(node, dtype=jnp.float64)
-            # Interpolate along axis 0 using JAX cubic spline
-            data = cubic_spline_nd(node_jax, data, axis=0, x_query=value)
-
-        return np.asarray(data.T)  # [layers, quantities]
+        # JAX version - JIT-compilable and cached for reuse
+        cache_key = grid_path or "cool_dwarf_grid"
+        interp = _get_cool_dwarf_interpolator(cache_key, axis_nodes, grid)
+        data = interp(jnp.asarray(axis_params, dtype=jnp.float64))
+        return np.asarray(data)  # [layers, quantities]
     else:
         # Original SciPy version - fallback for validation
         if not SCIPY_AVAILABLE:
@@ -425,35 +484,38 @@ def interpolate_marcs(Teff: float,
                 "For low metallicities ([M/H] < -2.5), alpha_M must be 0.4 and C_M must be 0"
             )
         
-        grid_path = _resolve_marcs_grid_path(grid_data_dir, "MARCS_metal_poor_atmospheres.h5")
-        grid, nodes, param_names = load_marcs_grid(grid_path)
+        grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "MARCS_metal_poor_atmospheres.h5")
+        grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
         
         # Use only Teff, logg, m_H for low-Z grid
         params_low_z = params[:3]
-        atm_quants = multilinear_interpolation(params_low_z, nodes, grid)
+        interp = _get_multilinear_interpolator(grid_path, nodes, grid, n_params=3)
+        atm_quants = interp(params_low_z)
         
     elif (Teff <= 4000 and logg >= 3.5 and m_H >= -2.5):
         # Cool dwarf grid (uses cubic spline interpolation in Korg, multilinear here)
         try:
-            grid_path = _resolve_marcs_grid_path(grid_data_dir, "resampled_cool_dwarf_atmospheres.h5")
-            grid, nodes, param_names = load_marcs_grid(grid_path)
+            grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "resampled_cool_dwarf_atmospheres.h5")
+            grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
 
             atm_quants = _cubic_interpolation_cool_dwarf(
-                np.array(params, dtype=float), nodes, grid, param_names
+                np.array(params, dtype=float), nodes, grid, param_names, grid_path=grid_path
             )
             
         except FileNotFoundError:
             # Fallback to standard grid if cool dwarf grid not available
             warnings.warn("Cool dwarf grid not found, using standard grid")
-            grid_path = _resolve_marcs_grid_path(grid_data_dir, "SDSS_MARCS_atmospheres.h5")
-            grid, nodes, param_names = load_marcs_grid(grid_path)
-            atm_quants = multilinear_interpolation(params, nodes, grid)
+            grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "SDSS_MARCS_atmospheres.h5")
+            grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
+            interp = _get_multilinear_interpolator(grid_path, nodes, grid, n_params=5)
+            atm_quants = interp(params)
     
     else:
         # Standard SDSS grid
-        grid_path = _resolve_marcs_grid_path(grid_data_dir, "SDSS_MARCS_atmospheres.h5")
-        grid, nodes, param_names = load_marcs_grid(grid_path)
-        atm_quants = multilinear_interpolation(params, nodes, grid)
+        grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "SDSS_MARCS_atmospheres.h5")
+        grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
+        interp = _get_multilinear_interpolator(grid_path, nodes, grid, n_params=5)
+        atm_quants = interp(params)
     
     # Create atmosphere from interpolated quantities
     atmosphere = create_atmosphere_from_quantities(atm_quants, spherical, logg)
