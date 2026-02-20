@@ -33,7 +33,8 @@ from .utils import (
 from .linelist import (
     read_linelist,
     save_linelist,
-    LineList
+    LineList,
+    load_exomol_linelist
 )
 from .linelist_data import (
     get_VALD_solar_linelist,
@@ -133,6 +134,7 @@ __all__ = [
     "read_linelist",
     "save_linelist", 
     "LineList",
+    "load_exomol_linelist",
     
     # Built-in linelist functions (Korg.jl compatibility)
     "get_VALD_solar_linelist",

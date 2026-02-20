@@ -15,6 +15,7 @@ Key Features:
 
 Main Functions:
 - fit_spectrum: Full spectral fitting with BFGS optimization
+- fit_stellar_parameters: Korg-inspired Teff/logg/[M/H]/[alpha/Fe] pipeline
 - calculate_equivalent_width: Equivalent width calculation for single line
 - calculate_equivalent_widths: Batch equivalent width computation
 - LineFittingSession: Interactive log(gf) fitting to observed EWs
@@ -56,6 +57,15 @@ except Exception as exc:  # pragma: no cover - optional core dependency
     FitResult = None
     FitParameters = None
 
+# Stellar parameter fitting pipeline (Teff/logg/[M/H]/[alpha/Fe])
+from .stellar_parameters import (
+    DEFAULT_STELLAR_BOUNDS,
+    PARAMETER_ORDER,
+    StellarParameters,
+    StellarFitResult,
+    fit_stellar_parameters,
+)
+
 # Equivalent width calculation (NEW: native Python implementation)
 from .equivalent_width import (
     calculate_equivalent_width,
@@ -88,6 +98,13 @@ __all__ = [
     'FitResult',
     'FitParameters',
     'validate_fit_parameters',
+
+    # Stellar parameter fitting
+    'DEFAULT_STELLAR_BOUNDS',
+    'PARAMETER_ORDER',
+    'StellarParameters',
+    'StellarFitResult',
+    'fit_stellar_parameters',
 
     # Equivalent width calculation (NEW)
     'calculate_equivalent_width',

@@ -27,6 +27,36 @@ wl, flux, cntm = synth(
 )
 ```
 
+## Stellar Parameter Fitting (Experimental)
+Jorg includes a direct-fitting pipeline for:
+- `Teff`
+- `logg`
+- `[M/H]`
+- `[alpha/Fe]`
+
+```python
+from jorg.fit import fit_stellar_parameters
+from jorg.lines import get_VALD_solar_linelist
+
+result = fit_stellar_parameters(
+    obs_wavelengths=obs_wave,
+    obs_flux=obs_flux,
+    obs_error=obs_err,              # optional; auto-estimated if omitted
+    linelist=get_VALD_solar_linelist(),
+    initial_guess={"Teff": 5600, "logg": 4.3, "m_h": -0.2, "alpha_fe": 0.1},
+    windows=[(5166.0, 5190.0), (5205.0, 5240.0)],
+    R=50_000,
+    optimizer="jax_surrogate",      # JAX-accelerated local surrogate optimizer
+    compute_uncertainties=False,    # set True only when covariance is needed
+)
+
+print(result.summary())
+```
+
+Notes:
+- Internally, `[alpha/Fe]` is converted to `alpha_H = [M/H] + [alpha/Fe]`.
+- The fitter uses Korg-style parameter scaling, weak regularization, and window-level continuum adjustment.
+
 ## Data files
 Jorg relies on external data (linelists, partition functions, opacity tables, MARCS grids).
 Small tables live under `data/` in the repo; large MARCS grids are not checked in.

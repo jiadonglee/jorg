@@ -16,8 +16,8 @@ import warnings
 from .datatypes import LineData, create_line_data, Line, create_line, species_from_integer
 from .species import parse_species, Species
 from .atomic_data import (get_atomic_symbol, get_atomic_mass, get_isotopic_abundance,
-                         get_abundances_dict, get_atomic_masses_dict, get_atomic_numbers_dict)
-from .broadening import get_korg_broadening_parameters, approximate_line_strength
+                         get_abundances_dict, get_atomic_masses_dict, get_atomic_numbers_dict,
+                         ISOTOPIC_ABUNDANCES)
 from ..utils.wavelength_utils import air_to_vacuum, vacuum_to_air, detect_wavelength_unit
 
 
@@ -1122,141 +1122,381 @@ def approximate_vdw_gamma(species_id: int) -> float:
 
 # ExoMol Linelist Parsing
 
+# Constants used in Korg.jl ExoMol conversion logic (CGS/eV units)
+_ELECTRON_MASS_CGS = 9.1093837015e-28
+_C_CGS = 2.99792458e10
+_ELECTRON_CHARGE_CGS = 4.803204712570263e-10
+_HPLANCK_EV_S = 4.135667696e-15
+_KBOLTZ_EV = 8.617333262145e-5
+_LOG10_E = np.log10(np.e)
+
+
+def _strip_exomol_isotopes(species_name: str) -> str:
+    """
+    Convert ExoMol isotopologue labels to plain molecular formulae.
+
+    Examples
+    --------
+    40Ca-1H -> CaH
+    1H2-16O -> H2O
+    """
+    name = species_name.strip()
+    if "-" not in name:
+        return name
+
+    formula_parts = []
+    for token in name.split("-"):
+        token = token.strip()
+        match = re.fullmatch(r"(\d+)([A-Z][a-z]?)(\d*)", token)
+        if not match:
+            # Fall back to a conservative normalization:
+            # remove isotope numbers and separators.
+            return re.sub(r"[^A-Za-z0-9]", "", re.sub(r"\d", "", name))
+        symbol = match.group(2)
+        count = match.group(3)
+        formula_parts.append(f"{symbol}{count}" if count else symbol)
+    return "".join(formula_parts)
+
+
+def _resolve_exomol_species(species_name: str):
+    """Parse species as the same Species class used in line opacity/statmech."""
+    from ..statmech.species import Species as ChemSpecies
+
+    normalized = _strip_exomol_isotopes(species_name)
+    try:
+        return ChemSpecies.from_string(normalized)
+    except Exception:
+        # Fall back to linelist species parser for compatibility with existing codes.
+        species_id = parse_species(normalized)
+        return species_from_integer(species_id)
+
+
+def _default_exomol_isotopes(species_obj, isotopic_abundances: Dict[int, Dict[int, float]]):
+    """Pick the most abundant isotope for each atom in species."""
+    isotopes = []
+    for z in species_obj.get_atoms():
+        z_int = int(z)
+        abundances = isotopic_abundances.get(z_int)
+        if not abundances:
+            continue
+        isotope = max(abundances, key=abundances.get)
+        isotopes.append((z_int, int(isotope)))
+    return isotopes
+
+
+def _compute_exomol_isotopic_correction(
+    isotopes: List[Tuple[int, int]],
+    isotopic_abundances: Dict[int, Dict[int, float]],
+    isotopic_nuclear_spin_degeneracies: Optional[Dict[int, Dict[int, float]]] = None,
+) -> float:
+    """
+    Compute log10 correction applied to log_gf from isotopic abundances.
+
+    Korg.jl also subtracts a nuclear-spin degeneracy factor; this is optional here.
+    """
+    if not isotopes:
+        return 0.0
+
+    correction = 0.0
+    for z, iso in isotopes:
+        abundance = isotopic_abundances.get(z, {}).get(iso)
+        if abundance is None or abundance <= 0:
+            raise KeyError(
+                f"Missing isotopic abundance for Z={z}, isotope={iso}. "
+                "Pass isotopic_abundances to override defaults."
+            )
+        correction += np.log10(abundance)
+
+        if isotopic_nuclear_spin_degeneracies is not None:
+            degeneracy = isotopic_nuclear_spin_degeneracies.get(z, {}).get(iso, 1.0)
+            if degeneracy is not None and degeneracy > 0:
+                correction -= np.log10(degeneracy)
+    return correction
+
+
+def _resolve_exomol_wavelength_bounds(
+    lower_wavelength: Optional[float],
+    upper_wavelength: Optional[float],
+    lower_level: Optional[float],
+    upper_level: Optional[float],
+    wavelength_range: Optional[Tuple[float, float]],
+) -> Tuple[float, float]:
+    """
+    Resolve wavelength bounds in Angstrom.
+
+    lower_level/upper_level are legacy names from an incomplete earlier draft;
+    keep them for compatibility and treat as wavelength bounds.
+    """
+    if wavelength_range is not None:
+        if len(wavelength_range) != 2:
+            raise ValueError("wavelength_range must be a 2-tuple (lower, upper) in Angstrom.")
+        if (
+            lower_wavelength is not None
+            or upper_wavelength is not None
+            or lower_level is not None
+            or upper_level is not None
+        ):
+            warnings.warn(
+                "wavelength_range provided; ignoring lower_wavelength/upper_wavelength/"
+                "lower_level/upper_level.",
+                RuntimeWarning,
+            )
+        ll, ul = float(wavelength_range[0]), float(wavelength_range[1])
+    elif lower_wavelength is not None and upper_wavelength is not None:
+        ll, ul = float(lower_wavelength), float(upper_wavelength)
+    elif lower_level is not None and upper_level is not None:
+        warnings.warn(
+            "lower_level/upper_level are deprecated for ExoMol loading; use "
+            "lower_wavelength/upper_wavelength. Treating them as Angstrom bounds.",
+            DeprecationWarning,
+        )
+        ll, ul = float(lower_level), float(upper_level)
+    else:
+        raise ValueError(
+            "Provide either (lower_wavelength, upper_wavelength) or wavelength_range."
+        )
+
+    if ll >= ul:
+        raise ValueError("lower wavelength bound must be smaller than upper bound.")
+    return ll, ul
+
+
 def load_exomol_linelist(
     species_name: str,
     states_file: Union[str, Path],
-    transitions_file: Union[str, Path], 
-    lower_level: int,
-    upper_level: int,
+    transitions_file: Union[str, Path],
+    lower_wavelength: Optional[float] = None,
+    upper_wavelength: Optional[float] = None,
+    isotopes: Optional[List[Tuple[int, int]]] = None,
+    isotopic_abundances: Optional[Dict[int, Dict[int, float]]] = None,
+    isotopic_nuclear_spin_degeneracies: Optional[Dict[int, Dict[int, float]]] = None,
     line_strength_cutoff: float = -15.0,
     temperature_line_strength: float = 3500.0,
-    wavelength_range: Optional[Tuple[float, float]] = None
+    verbose: bool = True,
+    lower_level: Optional[float] = None,
+    upper_level: Optional[float] = None,
+    wavelength_range: Optional[Tuple[float, float]] = None,
 ) -> LineList:
     """
-    Load ExoMol format molecular linelist.
-    
-    This function matches Korg.jl's load_ExoMol_linelist functionality,
-    parsing ExoMol states and transitions files to create a molecular linelist.
-    
+    Load ExoMol molecular linelist, analogous to Korg.load_ExoMol_linelist.
+
     Parameters
     ----------
     species_name : str
-        Molecular species name (e.g., 'H2O', 'TiO', 'CaH')
-    states_file : Path
-        Path to ExoMol .states file
-    transitions_file : Path
-        Path to ExoMol .trans file
-    lower_level : int
-        Lower electronic state
-    upper_level : int
-        Upper electronic state  
+        Molecular species (e.g. "CaH", "40Ca-1H", "H2O").
+    states_file : str or Path
+        ExoMol .states (or .states.bz2/.gz) file.
+    transitions_file : str or Path
+        ExoMol .trans (or .trans.bz2/.gz) file.
+    lower_wavelength, upper_wavelength : float, optional
+        Wavelength bounds in Angstrom.
+    isotopes : list[(int, int)], optional
+        Explicit isotopes as (atomic_number, mass_number).
+    isotopic_abundances : dict, optional
+        Isotopic abundance table, defaults to atomic_data.ISOTOPIC_ABUNDANCES.
+    isotopic_nuclear_spin_degeneracies : dict, optional
+        Optional nuclear-spin degeneracy table for Korg-like correction.
     line_strength_cutoff : float
-        Minimum log10(line strength) threshold (default: -15)
+        Threshold on approximate line strength, default -15.
     temperature_line_strength : float
-        Temperature for line strength evaluation in K (default: 3500K)
-    wavelength_range : Tuple[float, float], optional
-        Wavelength range in Angstroms (min, max)
-        
+        Temperature for line-strength approximation in K, default 3500.
+    verbose : bool
+        Print progress messages.
+    lower_level, upper_level : float, optional
+        Deprecated legacy aliases; interpreted as wavelength bounds in Angstrom.
+    wavelength_range : tuple(float, float), optional
+        Alternate wavelength bounds in Angstrom.
+
     Returns
     -------
     LineList
-        Parsed molecular linelist
+        ExoMol transitions converted into Jorg LineData entries.
     """
-    print(f"🔬 Loading ExoMol linelist for {species_name}")
-    print(f"   States file: {states_file}")
-    print(f"   Transitions file: {transitions_file}")
-    
-    # Load states data
-    print("   Loading states...")
-    states_df = pd.read_csv(
-        states_file,
-        delim_whitespace=True,
-        names=['state_id', 'energy', 'degeneracy', 'J', 'uncertainty', 'lifetime'],
-        comment='#'
+    states_path = Path(states_file)
+    transitions_path = Path(transitions_file)
+    ll_angstrom, ul_angstrom = _resolve_exomol_wavelength_bounds(
+        lower_wavelength,
+        upper_wavelength,
+        lower_level,
+        upper_level,
+        wavelength_range,
     )
-    
-    # Load transitions data
-    print("   Loading transitions...")
-    transitions_df = pd.read_csv(
-        transitions_file,
-        delim_whitespace=True,
-        names=['upper_state', 'lower_state', 'A_ul', 'uncertainty'],
-        comment='#'
+
+    if isotopic_abundances is None:
+        isotopic_abundances = ISOTOPIC_ABUNDANCES
+
+    species_obj = _resolve_exomol_species(species_name)
+
+    if verbose:
+        print(
+            f"🔬 Loading ExoMol linelist from {states_path} and {transitions_path}. "
+            "This functionality is experimental."
+        )
+    if "states" not in states_path.name or "trans" not in transitions_path.name:
+        warnings.warn(
+            f"Input file names ({states_path.name}, {transitions_path.name}) do not "
+            "look like states/trans files; verify they are not swapped.",
+            RuntimeWarning,
+        )
+
+    # Read only required columns to keep memory use manageable.
+    raw_transitions = pd.read_csv(
+        transitions_path,
+        sep=r"\s+",
+        header=None,
+        comment="#",
+        usecols=[0, 1, 2],
+        names=["id_upper", "id_lower", "A"],
+        compression="infer",
     )
-    
-    print(f"   Found {len(states_df)} states and {len(transitions_df)} transitions")
-    
-    # Join transitions with state information
-    print("   Joining transitions with states...")
-    
-    # Get upper state info
-    transitions_df = transitions_df.merge(
-        states_df[['state_id', 'energy', 'degeneracy', 'J']],
-        left_on='upper_state',
-        right_on='state_id',
-        suffixes=('', '_upper')
+    states = pd.read_csv(
+        states_path,
+        sep=r"\s+",
+        header=None,
+        comment="#",
+        usecols=[0, 1, 2],
+        names=["id", "E_wavenumber", "g"],
+        compression="infer",
     )
-    
-    # Get lower state info
-    transitions_df = transitions_df.merge(
-        states_df[['state_id', 'energy', 'degeneracy', 'J']],
-        left_on='lower_state', 
-        right_on='state_id',
-        suffixes=('_upper', '_lower')
+
+    upper_states = states.rename(
+        columns={"id": "id_upper", "E_wavenumber": "wavenumber_upper", "g": "g_upper"}
     )
-    
-    # Calculate transition properties
-    print("   Calculating transition properties...")
-    
-    # Energy difference in cm^-1
-    wavenumber = transitions_df['energy_upper'] - transitions_df['energy_lower']
-    
-    # Convert to wavelengths in Angstroms (vacuum)
-    wavelength_angstrom = 1e8 / wavenumber  # cm^-1 to Å
-    wavelength_cm = wavelength_angstrom * 1e-8
-    
-    # Calculate oscillator strength using Gray equation 11.12
-    # f_ul = (8π²me c) / (3h e² λ) * (g_l/g_u) * A_ul
-    import scipy.constants as const
-    
-    # Physical constants in CGS
-    me_cgs = const.m_e * 1000  # g
-    c_cgs = const.c * 100      # cm/s
-    h_cgs = const.h * 1e7      # erg⋅s
-    e_cgs = const.e * const.c * 10  # statcoulomb
-    
-    # Calculate f-values
-    wavelength_m = wavelength_angstrom * 1e-10
-    prefactor = (8 * np.pi**2 * me_cgs * c_cgs) / (3 * h_cgs * e_cgs**2)
-    
-    g_ratio = transitions_df['degeneracy_lower'] / transitions_df['degeneracy_upper']
-    f_values = prefactor * wavelength_m * g_ratio * transitions_df['A_ul']
-    log_gf = np.log10(transitions_df['degeneracy_lower'] * f_values)
-    
-    # Apply isotopic correction for most abundant isotopologue
-    # (This is simplified - would need actual isotopic data)
-    isotopic_correction = 1.0
-    log_gf += np.log10(isotopic_correction)
-    
-    # Calculate lower level energy in eV
-    hc_eV_cm = const.h * const.c / const.eV * 100  # eV⋅cm
-    E_lower_eV = transitions_df['energy_lower'] * hc_eV_cm
-    
-    # Approximate line strength for filtering
-    # S(T) ≈ gf * exp(-E_lower/kT) for simple estimate
-    kT_eV = const.k * temperature_line_strength / const.eV
-    line_strength_approx = f_values * np.exp(-E_lower_eV / kT_eV)
-    log_line_strength = np.log10(line_strength_approx)
-    
-    # Apply filters
-    print("   Applying filters...")
-    mask = np.ones(len(transitions_df), dtype=bool)
-    
-    # Line strength cutoff
-    mask &= (log_line_strength >= line_strength_cutoff)
-    
-    # Wavelength range filter
-    if wavelength_range is not None:
-        wl_min, wl_max = wavelength_range
-        mask &= (wavelength_angstrom >= wl_min) & (wavelength_angstrom <= wl_max)
+    lower_states = states.rename(
+        columns={"id": "id_lower", "E_wavenumber": "wavenumber_lower", "g": "g_lower"}
+    )
+
+    transitions = (
+        raw_transitions.merge(upper_states, on="id_upper", how="left")
+        .merge(lower_states, on="id_lower", how="left")
+    )
+
+    if transitions["g_lower"].isna().any() or transitions["g_upper"].isna().any():
+        raise ValueError(
+            f"Some transitions in {transitions_path} could not be mapped to "
+            f"states in {states_path}."
+        )
+
+    wavenumber = transitions["wavenumber_upper"].to_numpy() - transitions[
+        "wavenumber_lower"
+    ].to_numpy()
+    A_values = transitions["A"].to_numpy()
+    g_lower = transitions["g_lower"].to_numpy()
+    g_upper = transitions["g_upper"].to_numpy()
+    wavenumber_lower = transitions["wavenumber_lower"].to_numpy()
+
+    valid_mask = (
+        np.isfinite(wavenumber)
+        & np.isfinite(A_values)
+        & np.isfinite(g_lower)
+        & np.isfinite(g_upper)
+        & (wavenumber > 0)
+        & (g_lower > 0)
+        & (g_upper > 0)
+        & (A_values > 0)
+    )
+
+    if verbose:
+        n_invalid = int((~valid_mask).sum())
+        if n_invalid > 0:
+            print(f"   Dropping {n_invalid} invalid/non-physical transitions before filtering.")
+
+    wavenumber = wavenumber[valid_mask]
+    A_values = A_values[valid_mask]
+    g_lower = g_lower[valid_mask]
+    g_upper = g_upper[valid_mask]
+    wavenumber_lower = wavenumber_lower[valid_mask]
+
+    prefactor = (_ELECTRON_MASS_CGS * _C_CGS) / (
+        8.0 * np.pi * np.pi * _ELECTRON_CHARGE_CGS * _ELECTRON_CHARGE_CGS
+    )
+    f_values = A_values * prefactor * g_upper / (g_lower * (wavenumber * wavenumber))
+    log_gf = np.log10(g_lower * f_values)
+
+    if isotopes is None:
+        isotopes = _default_exomol_isotopes(species_obj, isotopic_abundances)
+        if verbose and isotopes:
+            print("   Assuming most abundant isotopes:", isotopes)
+
+    isotopic_correction = _compute_exomol_isotopic_correction(
+        isotopes,
+        isotopic_abundances,
+        isotopic_nuclear_spin_degeneracies,
+    )
+    log_gf = log_gf + isotopic_correction
+
+    E_lower = _HPLANCK_EV_S * wavenumber_lower * _C_CGS
+    wavelength_cm = 1.0 / wavenumber
+    wavelength_angstrom = wavelength_cm * 1e8
+
+    region_mask = (wavelength_angstrom > ll_angstrom) & (wavelength_angstrom < ul_angstrom)
+    wavelength_cm = wavelength_cm[region_mask]
+    wavelength_angstrom = wavelength_angstrom[region_mask]
+    log_gf = log_gf[region_mask]
+    E_lower = E_lower[region_mask]
+
+    if wavelength_cm.size == 0:
+        metadata = {
+            "format": "exomol",
+            "species": species_name,
+            "n_lines": 0,
+            "n_parsed": 0,
+            "states_file": str(states_path),
+            "transitions_file": str(transitions_path),
+            "wavelength_bounds_angstrom": (ll_angstrom, ul_angstrom),
+        }
+        return LineList([], metadata)
+
+    # Korg-like strength estimate:
+    # line.log_gf + log10(line.wl) - log10(e) * E_lower / (k_B * T)
+    approx_strength = (
+        log_gf
+        + np.log10(wavelength_cm)
+        - _LOG10_E * E_lower / (_KBOLTZ_EV * temperature_line_strength)
+    )
+    strength_mask = approx_strength > line_strength_cutoff
+
+    if verbose:
+        removed = int((~strength_mask).sum())
+        total = int(strength_mask.size)
+        percent = int(round(100 * removed / total)) if total > 0 else 0
+        print(
+            f"   Removed {removed} lines with strength below {line_strength_cutoff} "
+            f"at T={temperature_line_strength} K out of {total} total ({percent}%)."
+        )
+
+    wavelength_cm = wavelength_cm[strength_mask]
+    wavelength_angstrom = wavelength_angstrom[strength_mask]
+    log_gf = log_gf[strength_mask]
+    E_lower = E_lower[strength_mask]
+
+    lines = [
+        create_line_data(
+            wavelength=float(wl_cm),
+            species=species_obj,
+            log_gf=float(lgf),
+            E_lower=float(elow),
+            wavelength_unit="cm",
+        )
+        for wl_cm, lgf, elow in zip(wavelength_cm, log_gf, E_lower)
+    ]
+    lines.sort(key=lambda line: line.wavelength)
+
+    metadata = {
+        "format": "exomol",
+        "species": species_name,
+        "n_lines": len(lines),
+        "n_parsed": len(lines),
+        "states_file": str(states_path),
+        "transitions_file": str(transitions_path),
+        "wavelength_bounds_angstrom": (ll_angstrom, ul_angstrom),
+        "line_strength_cutoff": line_strength_cutoff,
+        "temperature_line_strength": temperature_line_strength,
+    }
+    if verbose:
+        print(
+            f"   Loaded {len(lines)} ExoMol lines for {species_name} in "
+            f"{ll_angstrom:.2f}-{ul_angstrom:.2f} A."
+        )
+    return LineList(lines, metadata)
    
