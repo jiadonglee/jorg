@@ -628,11 +628,8 @@ def h2_plus_bf_ff_absorption(
     jnp.ndarray
         H2^+ bound-free and free-free absorption coefficient in cm^-1
     """
-    # Import Stancil1994 functions
-    from .stancil1994 import (
-        get_h2plus_bf_cross_section, get_h2plus_ff_cross_section,
-        get_h2plus_equilibrium_constant
-    )
+    # Import Stancil1994 batch helpers
+    from .stancil1994 import h2plus_bf_ff_batch, get_h2plus_equilibrium_constant
     
     # Convert frequencies to wavelengths in Angstroms
     wavelengths = c_cgs * 1e8 / frequencies
@@ -640,16 +637,8 @@ def h2_plus_bf_ff_absorption(
     # Equilibrium constant K = n(H I) * n(H II) / n(H2+)
     K_h2plus = get_h2plus_equilibrium_constant(temperature)
 
-    # Get cross-sections from Stancil 1994 data
-    # Use regular loop instead of vmap to avoid JAX tracer issues
-    bf_cross_sections = []
-    ff_cross_sections = []
-    for wl in wavelengths:
-        bf_cross_sections.append(get_h2plus_bf_cross_section(float(wl), temperature))
-        ff_cross_sections.append(get_h2plus_ff_cross_section(float(wl), temperature))
-
-    bf_cross_sections = jnp.array(bf_cross_sections)
-    ff_cross_sections = jnp.array(ff_cross_sections)
+    # Get cross-sections from Stancil 1994 data (vectorized, JAX interpolation)
+    bf_cross_sections, ff_cross_sections = h2plus_bf_ff_batch(wavelengths, temperature)
 
     # Calculate absorption coefficient following Korg.jl:
     # (σbf / K + σff) * n(H I) * n(H II)

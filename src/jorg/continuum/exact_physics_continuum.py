@@ -23,16 +23,19 @@ This implementation is PRODUCTION READY for stellar spectral synthesis.
 import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import Dict, Optional
-from functools import partial
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Any, Tuple
 
 # Import all exact physics implementations
 from .mclaughlin_hminus import mclaughlin_hminus_bf_absorption
-from .metals_bf import metal_bf_absorption
-from .h_i_bf_api import H_I_bf, H_I_bf_fast
+from .metals_bf import metal_bf_absorption, metal_bf_absorption_dense_batch
+from .h_i_bf_api import H_I_bf, H_I_bf_fast, H_I_bf_fast_batch
 from .hydrogen import h_minus_ff_absorption, h2_plus_bf_ff_absorption
-from .helium import he_minus_ff_absorption
-from .positive_ion_ff import positive_ion_ff_absorption
+from .helium import he_minus_ff_absorption, _helium_free_free_john1994
+from .positive_ion_ff import (
+    positive_ion_ff_absorption,
+    positive_ion_ff_absorption_dense_batch,
+)
 from .scattering import thomson_scattering, rayleigh_scattering
 
 # Physical constants (exactly matching Korg.jl)
@@ -40,10 +43,68 @@ from ..constants import (
     kboltz_cgs, hplanck_cgs, c_cgs, electron_mass_cgs, 
     electron_charge_cgs, eV_to_cgs, kboltz_eV, hplanck_eV
 )
+from ..statmech.species import Species
 
 # Exact ionization energies
 CHI_H_EV = 13.598434005136  # eV, H I ionization energy (exact Korg.jl value)
 CHI_HE_I_EV = 24.587386     # eV, He I ionization energy (exact)
+
+# Frequently used species constants (avoid per-call object construction).
+_H_I_SPECIES = Species.from_atomic_number(1, 0)
+_H_II_SPECIES = Species.from_atomic_number(1, 1)
+_HE_I_SPECIES = Species.from_atomic_number(2, 0)
+_HE_II_SPECIES = Species.from_atomic_number(2, 1)
+_H2_SPECIES = Species.from_string("H2")
+
+
+@dataclass(frozen=True)
+class ContinuumSpeciesLayout:
+    """
+    Stable species-to-index layout for dense continuum arrays.
+
+    This lets the fast path operate on dense layer matrices while preserving
+    the existing dict-based continuum kernel API.
+    """
+
+    species: Tuple[Any, ...]
+    index: Dict[Any, int]
+
+    @classmethod
+    def from_number_densities(cls, number_densities: Dict[Any, Any]) -> "ContinuumSpeciesLayout":
+        species = tuple(sorted(number_densities.keys(), key=str))
+        index = {sp: i for i, sp in enumerate(species)}
+        return cls(species=species, index=index)
+
+    def to_dense_layer(self, number_densities: Dict[Any, float]) -> np.ndarray:
+        dense = np.zeros(len(self.species), dtype=np.float64)
+        for sp, val in number_densities.items():
+            idx = self.index.get(sp)
+            if idx is not None:
+                dense[idx] = float(val)
+        return dense
+
+    def to_dict_layer(self, dense_layer: np.ndarray) -> Dict[Any, float]:
+        dense_layer = np.asarray(dense_layer, dtype=np.float64)
+        return {
+            sp: float(dense_layer[i])
+            for i, sp in enumerate(self.species)
+            if dense_layer[i] > 0.0
+        }
+
+
+@dataclass
+class ContinuumTableCache:
+    """
+    Continuum fast-path cache container.
+
+    Fields are intentionally minimal and backend-agnostic so `LayerProcessor`
+    can hold/cache this object without changing external synthesis APIs.
+    """
+
+    partition_funcs: Optional[Dict[Any, Any]] = None
+    species_layout: Optional[ContinuumSpeciesLayout] = None
+    jit_cache: Dict[Tuple[int, str], Any] = field(default_factory=dict)
+    coarse_grid_cache: Dict[Tuple[float, float, float, float], Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
 
 
 @jax.jit
@@ -171,7 +232,6 @@ def total_continuum_absorption_exact_physics_only(
     ValueError
         If exact physics components fail (no fallbacks provided)
     """
-    from ..statmech.species import Species
     from ..statmech import create_default_partition_functions
     
     if verbose:
@@ -181,11 +241,11 @@ def total_continuum_absorption_exact_physics_only(
     alpha_total = jnp.zeros_like(frequencies, dtype=jnp.float64)
     
     # Extract key species densities
-    h_i_species = Species.from_atomic_number(1, 0)  # H I
-    h_ii_species = Species.from_atomic_number(1, 1)  # H II
-    he_i_species = Species.from_atomic_number(2, 0)  # He I
-    he_ii_species = Species.from_atomic_number(2, 1)  # He II
-    h2_species = Species.from_string("H2")  # H2
+    h_i_species = _H_I_SPECIES
+    h_ii_species = _H_II_SPECIES
+    he_i_species = _HE_I_SPECIES
+    he_ii_species = _HE_II_SPECIES
+    h2_species = _H2_SPECIES
     
     n_h_i = number_densities.get(h_i_species, 0.0)
     n_h_ii = number_densities.get(h_ii_species, 0.0)
@@ -346,9 +406,8 @@ def total_continuum_absorption_exact_physics_only(
     if verbose:
         print("8. Adding exact He I bound-free...")
     
-    alpha_he_i_bf = jax.vmap(
-        partial(he_i_bf_exact, temperature=temperature, n_he_i=n_he_i)
-    )(frequencies)
+    # Korg.jl omits He I bound-free entirely; skip per-frequency JAX dispatch.
+    alpha_he_i_bf = jnp.zeros_like(frequencies, dtype=jnp.float64)
     alpha_total += alpha_he_i_bf
     
     if verbose:
@@ -384,15 +443,362 @@ def total_continuum_absorption_exact_physics_only(
     return alpha_total
 
 
-# ==================== PHASE 1.1 OPTIMIZATION ====================
-# Vectorized batch version for GPU acceleration
+# ==================== FAST CONTINUUM ENTRYPOINTS ====================
 
-def _make_layer_number_densities_pytree(number_densities_stacked: Dict, layer_idx: int) -> Dict:
-    """Helper to extract a single layer's densities from stacked dict"""
-    return {
-        species: densities[layer_idx]
-        for species, densities in number_densities_stacked.items()
-    }
+def _build_dense_number_densities(
+    number_densities_stacked: Dict[Any, Any],
+    layout: ContinuumSpeciesLayout,
+) -> np.ndarray:
+    """Convert stacked species dict -> dense (n_layers, n_species)."""
+    n_layers = len(next(iter(number_densities_stacked.values())))
+    dense = np.zeros((n_layers, len(layout.species)), dtype=np.float64)
+    for sp, vals in number_densities_stacked.items():
+        idx = layout.index.get(sp)
+        if idx is None:
+            continue
+        dense[:, idx] = np.asarray(vals, dtype=np.float64)
+    return dense
+
+
+def _evaluate_partition_fn_over_temps(partition_fn: Any, log_temps: np.ndarray) -> np.ndarray:
+    """Evaluate partition function over a temperature vector with safe fallback."""
+    try:
+        values = np.asarray(partition_fn(log_temps), dtype=np.float64)
+        if values.shape == log_temps.shape:
+            return values
+    except Exception:
+        pass
+    return np.asarray(
+        [float(partition_fn(float(log_t))) for log_t in log_temps],
+        dtype=np.float64,
+    )
+
+
+def _total_continuum_absorption_dense_batch_fast(
+    frequencies: jnp.ndarray,
+    temps: jnp.ndarray,
+    electron_densities: jnp.ndarray,
+    number_densities_dense: jnp.ndarray,
+    partition_funcs: Optional[Dict],
+    include_nahar_h_i: bool,
+    include_mhd: bool,
+    n_levels_max: int,
+    species_layout: ContinuumSpeciesLayout,
+) -> jnp.ndarray:
+    """Dense batch continuum kernel with no per-layer Python loop."""
+    from ..statmech import create_default_partition_functions
+
+    freqs = jnp.asarray(frequencies, dtype=jnp.float64)
+    temps_j = jnp.asarray(temps, dtype=jnp.float64)
+    ne_j = jnp.asarray(electron_densities, dtype=jnp.float64)
+    dense_j = jnp.asarray(number_densities_dense, dtype=jnp.float64)
+
+    n_layers = dense_j.shape[0]
+    n_freq = freqs.shape[0]
+
+    if partition_funcs is None:
+        try:
+            partition_funcs = create_default_partition_functions()
+        except Exception:
+            from ..statmech.korg_exact_partition_functions import get_korg_exact_partition_functions
+
+            partition_funcs = get_korg_exact_partition_functions().partition_funcs
+    if hasattr(partition_funcs, "partition_funcs"):
+        partition_funcs = partition_funcs.partition_funcs
+
+    def _dense_col(species: Species) -> jnp.ndarray:
+        idx = species_layout.index.get(species)
+        if idx is None:
+            return jnp.zeros((n_layers,), dtype=jnp.float64)
+        return dense_j[:, idx]
+
+    n_h_i = _dense_col(_H_I_SPECIES)
+    n_h_ii = _dense_col(_H_II_SPECIES)
+    n_he_i = _dense_col(_HE_I_SPECIES)
+    n_h2 = _dense_col(_H2_SPECIES)
+
+    temps_np = np.asarray(temps_j, dtype=np.float64)
+    log_temps = np.log(np.maximum(temps_np, 1e-300))
+    u_h = _evaluate_partition_fn_over_temps(partition_funcs[_H_I_SPECIES], log_temps)
+    u_he = _evaluate_partition_fn_over_temps(partition_funcs[_HE_I_SPECIES], log_temps)
+    u_h_j = jnp.asarray(u_h, dtype=jnp.float64)
+    u_he_j = jnp.asarray(u_he, dtype=jnp.float64)
+    inv_u_h = 1.0 / jnp.maximum(u_h_j, 1e-300)
+    n_h_i_div_u = n_h_i / jnp.maximum(u_h_j, 1e-300)
+    n_he_i_div_u = n_he_i / jnp.maximum(u_he_j, 1e-300)
+
+    alpha_total = jnp.zeros((n_layers, n_freq), dtype=jnp.float64)
+
+    alpha_total = alpha_total + jax.vmap(
+        lambda T, n_div_u, ne: mclaughlin_hminus_bf_absorption(
+            frequencies=freqs,
+            temperature=T,
+            n_h_i_div_u=n_div_u,
+            electron_density=ne,
+            include_stimulated_emission=True,
+        )
+    )(temps_j, n_h_i_div_u, ne_j)
+
+    alpha_total = alpha_total + jax.vmap(
+        lambda T, n_div_u, ne: h_minus_ff_absorption(
+            frequencies=freqs,
+            temperature=T,
+            n_h_i_div_u=n_div_u,
+            electron_density=ne,
+        )
+    )(temps_j, n_h_i_div_u, ne_j)
+
+    alpha_total = alpha_total + jax.vmap(
+        lambda T, n_hi, n_hii: h2_plus_bf_ff_absorption(
+            frequencies=freqs,
+            temperature=T,
+            n_h_i=n_hi,
+            n_h_ii=n_hii,
+        )
+    )(temps_j, n_h_i, n_h_ii)
+
+    wavelengths_angstrom = c_cgs * 1e8 / np.asarray(freqs, dtype=np.float64)
+    theta = 5040.0 / np.maximum(temps_np, 1e-300)
+    he_ff_k = _helium_free_free_john1994(
+        wavelengths_angstrom[None, :],
+        theta[:, None],
+    )
+    he_ff_k_j = jnp.asarray(he_ff_k, dtype=jnp.float64)
+    p_e = ne_j * kboltz_cgs * jnp.asarray(temps_np, dtype=jnp.float64)
+    alpha_he_minus_ff = he_ff_k_j * p_e[:, None] * n_he_i_div_u[:, None]
+    alpha_total = alpha_total + alpha_he_minus_ff
+
+    alpha_total = alpha_total + positive_ion_ff_absorption_dense_batch(
+        frequencies=freqs,
+        temperatures=temps_j,
+        number_densities_dense=dense_j,
+        electron_densities=ne_j,
+        species_layout=species_layout,
+    )
+
+    alpha_total = alpha_total + metal_bf_absorption_dense_batch(
+        frequencies=freqs,
+        temperatures=temps_j,
+        number_densities_dense=dense_j,
+        species_layout=species_layout,
+    )
+
+    if include_nahar_h_i:
+        alpha_total = alpha_total + H_I_bf_fast_batch(
+            frequencies=freqs,
+            temperatures=temps_j,
+            n_h_i=n_h_i,
+            n_he_i=n_he_i,
+            electron_densities=ne_j,
+            inv_u_h=inv_u_h,
+            n_max_MHD=n_levels_max,
+            use_hubeny_generalization=False,
+            taper=False,
+            use_MHD_for_Lyman=include_mhd,
+        )
+
+    alpha_total = alpha_total + jnp.asarray(thomson_scattering(ne_j), dtype=jnp.float64)[:, None]
+    alpha_total = alpha_total + jax.vmap(
+        lambda n_hi, n_hei, n_h2_i: rayleigh_scattering(freqs, n_hi, n_hei, n_h2_i)
+    )(n_h_i, n_he_i, n_h2)
+
+    return alpha_total
+
+
+def total_continuum_absorption_fast(
+    frequencies: jnp.ndarray,
+    temperature: float,
+    electron_density: float,
+    number_densities: Any,
+    partition_funcs: Optional[Dict] = None,
+    include_nahar_h_i: bool = True,
+    include_mhd: bool = False,
+    n_levels_max: int = 6,
+    continuum_cache: Optional[ContinuumTableCache] = None,
+    species_layout: Optional[ContinuumSpeciesLayout] = None,
+) -> jnp.ndarray:
+    """
+    Fast single-layer continuum wrapper.
+
+    Accepts either dict-based `number_densities` or a dense layer vector paired
+    with `species_layout`.
+    """
+    if partition_funcs is None and continuum_cache is not None and continuum_cache.partition_funcs is not None:
+        partition_funcs = continuum_cache.partition_funcs
+
+    if isinstance(number_densities, dict):
+        layer_number_densities = number_densities
+    else:
+        if species_layout is None and continuum_cache is not None:
+            species_layout = continuum_cache.species_layout
+        if species_layout is None:
+            raise ValueError("species_layout is required for dense number_densities input.")
+        layer_number_densities = species_layout.to_dict_layer(np.asarray(number_densities, dtype=np.float64))
+
+    return total_continuum_absorption_exact_physics_only(
+        frequencies=frequencies,
+        temperature=float(temperature),
+        electron_density=float(electron_density),
+        number_densities=layer_number_densities,
+        partition_funcs=partition_funcs,
+        include_nahar_h_i=include_nahar_h_i,
+        include_mhd=include_mhd,
+        n_levels_max=n_levels_max,
+        verbose=False,
+    )
+
+
+def total_continuum_absorption_batch_fast(
+    frequencies: jnp.ndarray,
+    temps: jnp.ndarray,
+    electron_densities: jnp.ndarray,
+    number_densities_stacked: Any,
+    partition_funcs: Optional[Dict] = None,
+    include_nahar_h_i: bool = True,
+    include_mhd: bool = False,
+    n_levels_max: int = 6,
+    continuum_cache: Optional[ContinuumTableCache] = None,
+    species_layout: Optional[ContinuumSpeciesLayout] = None,
+) -> jnp.ndarray:
+    """
+    Fast batch continuum wrapper with species-layout support.
+
+    Dense input uses a vectorized batch kernel; dict input remains as a
+    compatibility fallback path.
+    """
+    freqs = jnp.asarray(frequencies, dtype=jnp.float64)
+    if partition_funcs is None and continuum_cache is not None and continuum_cache.partition_funcs is not None:
+        partition_funcs = continuum_cache.partition_funcs
+
+    if not isinstance(number_densities_stacked, dict):
+        temps_j = jnp.asarray(temps, dtype=jnp.float64)
+        ne_j = jnp.asarray(electron_densities, dtype=jnp.float64)
+        dense_layers = jnp.asarray(number_densities_stacked, dtype=jnp.float64)
+        if dense_layers.ndim != 2:
+            raise ValueError("Dense number_densities_stacked must be rank-2 [n_layers, n_species].")
+        n_layers = int(temps_j.shape[0])
+        if int(dense_layers.shape[0]) != n_layers:
+            raise ValueError(
+                "Dense number_densities_stacked layer count does not match temperatures."
+            )
+        if int(ne_j.shape[0]) != n_layers:
+            raise ValueError("electron_densities layer count does not match temperatures.")
+        if species_layout is None and continuum_cache is not None:
+            species_layout = continuum_cache.species_layout
+        if species_layout is None:
+            raise ValueError("species_layout is required when number_densities_stacked is dense array.")
+        if continuum_cache is not None and continuum_cache.species_layout is None:
+            continuum_cache.species_layout = species_layout
+        return _total_continuum_absorption_dense_batch_fast(
+            frequencies=freqs,
+            temps=temps_j,
+            electron_densities=ne_j,
+            number_densities_dense=dense_layers,
+            partition_funcs=partition_funcs,
+            include_nahar_h_i=include_nahar_h_i,
+            include_mhd=include_mhd,
+            n_levels_max=n_levels_max,
+            species_layout=species_layout,
+        )
+
+    temps_np = np.asarray(temps, dtype=np.float64)
+    ne_np = np.asarray(electron_densities, dtype=np.float64)
+    n_layers = len(temps_np)
+
+    if species_layout is None and continuum_cache is not None:
+        species_layout = continuum_cache.species_layout
+    if species_layout is None:
+        species_layout = ContinuumSpeciesLayout.from_number_densities(number_densities_stacked)
+    if continuum_cache is not None and continuum_cache.species_layout is None:
+        continuum_cache.species_layout = species_layout
+
+    layer_dicts = None
+    n_h_i_arr = np.zeros(n_layers, dtype=np.float64)
+    n_he_i_arr = np.zeros(n_layers, dtype=np.float64)
+    if not number_densities_stacked:
+        layer_dicts = [{} for _ in range(n_layers)]
+    else:
+        stacked_arrays = {
+            sp: np.asarray(vals, dtype=np.float64)
+            for sp, vals in number_densities_stacked.items()
+        }
+        for sp, arr in stacked_arrays.items():
+            if arr.shape[0] != n_layers:
+                raise ValueError(
+                    f"number_densities_stacked[{sp!s}] length {arr.shape[0]} "
+                    f"does not match temps length {n_layers}."
+                )
+        layer_dicts = [
+            {
+                sp: float(arr[i])
+                for sp, arr in stacked_arrays.items()
+                if arr[i] > 0.0
+            }
+            for i in range(n_layers)
+        ]
+        n_h_i_arr = np.asarray(stacked_arrays.get(_H_I_SPECIES, n_h_i_arr), dtype=np.float64)
+        n_he_i_arr = np.asarray(stacked_arrays.get(_HE_I_SPECIES, n_he_i_arr), dtype=np.float64)
+
+    alpha_h_i_bf_batch = None
+    include_nahar_in_layer = include_nahar_h_i
+    if include_nahar_h_i:
+        from ..statmech import create_default_partition_functions
+
+        if partition_funcs is None:
+            try:
+                partition_funcs = create_default_partition_functions()
+            except Exception:
+                from ..statmech.korg_exact_partition_functions import get_korg_exact_partition_functions
+
+                partition_funcs = get_korg_exact_partition_functions().partition_funcs
+        if hasattr(partition_funcs, "partition_funcs"):
+            partition_funcs = partition_funcs.partition_funcs
+
+        log_temps = np.log(np.maximum(temps_np, 1e-300))
+        u_h = np.asarray(
+            [float(partition_funcs[_H_I_SPECIES](log_t)) for log_t in log_temps],
+            dtype=np.float64,
+        )
+        inv_u_h = 1.0 / np.maximum(u_h, 1e-300)
+
+        alpha_h_i_bf_batch = np.asarray(
+            H_I_bf_fast_batch(
+                frequencies=freqs,
+                temperatures=jnp.asarray(temps_np, dtype=jnp.float64),
+                n_h_i=jnp.asarray(n_h_i_arr, dtype=jnp.float64),
+                n_he_i=jnp.asarray(n_he_i_arr, dtype=jnp.float64),
+                electron_densities=jnp.asarray(ne_np, dtype=jnp.float64),
+                inv_u_h=jnp.asarray(inv_u_h, dtype=jnp.float64),
+                n_max_MHD=n_levels_max,
+                use_hubeny_generalization=False,
+                taper=False,
+                use_MHD_for_Lyman=include_mhd,
+            ),
+            dtype=np.float64,
+        )
+        include_nahar_in_layer = False
+
+    alpha_out = np.zeros((n_layers, int(freqs.shape[0])), dtype=np.float64)
+    for i in range(n_layers):
+        number_densities_i = layer_dicts[i]
+        alpha_i = total_continuum_absorption_fast(
+            frequencies=freqs,
+            temperature=temps_np[i],
+            electron_density=ne_np[i],
+            number_densities=number_densities_i,
+            partition_funcs=partition_funcs,
+            include_nahar_h_i=include_nahar_in_layer,
+            include_mhd=include_mhd,
+            n_levels_max=n_levels_max,
+            continuum_cache=continuum_cache,
+            species_layout=species_layout,
+        )
+        alpha_i_np = np.asarray(alpha_i, dtype=np.float64)
+        if alpha_h_i_bf_batch is not None:
+            alpha_i_np = alpha_i_np + alpha_h_i_bf_batch[i]
+        alpha_out[i, :] = alpha_i_np
+
+    return jnp.asarray(alpha_out, dtype=jnp.float64)
 
 
 def total_continuum_absorption_batch(
@@ -405,78 +811,19 @@ def total_continuum_absorption_batch(
     include_mhd: bool = False,
     n_levels_max: int = 6,
 ) -> jnp.ndarray:
-    """
-    VECTORIZED CONTINUUM OPACITY - BATCH PROCESSING ACROSS LAYERS
-
-    This function vectorizes the continuum opacity calculation across all
-    atmospheric layers for massive GPU acceleration.
-
-    OPTIMIZATION STRATEGY:
-    - Process all layers simultaneously (no Python loops)
-    - Expected speedup: 3-5x for continuum calculation
-    - Target: 2s → 0.4s on A100 GPU
-
-    IMPLEMENTATION NOTE:
-    Since JAX's vmap doesn't handle Dict pytrees with varying keys well,
-    we use a simple loop with JIT-compiled function calls. Each call is
-    fast due to JIT compilation, and JAX can still batch operations internally.
-    A future enhancement could convert to pure array-based representation.
-
-    Parameters:
-    -----------
-    frequencies : jnp.ndarray
-        Frequencies in Hz, shape (n_frequencies,)
-    temps : jnp.ndarray
-        Temperature at each layer in K, shape (n_layers,)
-    electron_densities : jnp.ndarray
-        Electron density at each layer in cm⁻³, shape (n_layers,)
-    number_densities_stacked : Dict
-        Dictionary mapping Species to stacked number densities
-        Each value has shape (n_layers,) for densities across all layers
-    partition_funcs : Dict, optional
-        Partition function callables keyed by Species
-    include_nahar_h_i : bool, optional
-        Use exact Nahar 2021 H I cross-sections (default: True)
-    include_mhd : bool, optional
-        Apply MHD to the Lyman series (default: False)
-    n_levels_max : int, optional
-        Maximum n level for H I calculations (default: 6)
-
-    Returns:
-    --------
-    jnp.ndarray
-        Total continuum absorption coefficient in cm⁻¹
-        Shape: (n_layers, n_frequencies)
-
-    """
-    n_layers = len(temps)
-    n_freqs = len(frequencies)
-
-    # Pre-allocate output array
-    alpha_all_layers = jnp.zeros((n_layers, n_freqs), dtype=jnp.float64)
-
-    # Process each layer with JIT-compiled function
-    # TODO: Full vmap implementation with array-based species representation
-    for i in range(n_layers):
-        # Extract number densities for this layer
-        layer_densities = _make_layer_number_densities_pytree(number_densities_stacked, i)
-
-        # Call JIT-compiled single-layer function
-        alpha_layer = total_continuum_absorption_exact_physics_only(
-            frequencies=frequencies,
-            temperature=float(temps[i]),
-            electron_density=float(electron_densities[i]),
-            number_densities=layer_densities,
-            partition_funcs=partition_funcs,
-            include_nahar_h_i=include_nahar_h_i,
-            include_mhd=include_mhd,
-            n_levels_max=n_levels_max,
-            verbose=False
-        )
-
-        alpha_all_layers = alpha_all_layers.at[i].set(alpha_layer)
-
-    return alpha_all_layers
+    """Backward-compatible batch API routed to fast implementation."""
+    return total_continuum_absorption_batch_fast(
+        frequencies=frequencies,
+        temps=temps,
+        electron_densities=electron_densities,
+        number_densities_stacked=number_densities_stacked,
+        partition_funcs=partition_funcs,
+        include_nahar_h_i=include_nahar_h_i,
+        include_mhd=include_mhd,
+        n_levels_max=n_levels_max,
+        continuum_cache=None,
+        species_layout=None,
+    )
 
 
 def validate_exact_physics_only():

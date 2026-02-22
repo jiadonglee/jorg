@@ -29,6 +29,8 @@ from .utils import stimulated_emission_factor
 from ..constants import kboltz_eV, hplanck_eV, RydbergH_eV
 from ..statmech.hummer_mihalas import hummer_mihalas_w
 
+_NAHAR_DATA_READY = False
+
 
 def simple_hydrogen_bf_cross_section(n_level: int, frequencies: jnp.ndarray) -> jnp.ndarray:
     """
@@ -169,6 +171,49 @@ def H_I_bf(
 H_I_bf_compiled = jax.jit(H_I_bf, static_argnames=['n_max_MHD', 'use_hubeny_generalization', 'taper', 'use_MHD_for_Lyman'])
 
 
+def H_I_bf_batch(
+    frequencies: jnp.ndarray,
+    temperatures: jnp.ndarray,
+    n_h_i: jnp.ndarray,
+    n_he_i: jnp.ndarray,
+    electron_densities: jnp.ndarray,
+    inv_u_h: jnp.ndarray,
+    n_max_MHD: int = 6,
+    use_hubeny_generalization: bool = False,
+    taper: bool = False,
+    use_MHD_for_Lyman: bool = False,
+) -> jnp.ndarray:
+    """
+    Batched H I bound-free absorption across atmospheric layers.
+
+    Returns an array with shape (n_layers, n_frequencies).
+    """
+
+    def _single_layer(temp, n_hi, n_hei, n_e, inv_u):
+        return H_I_bf(
+            frequencies=frequencies,
+            temperature=temp,
+            n_h_i=n_hi,
+            n_he_i=n_hei,
+            electron_density=n_e,
+            inv_u_h=inv_u,
+            n_max_MHD=n_max_MHD,
+            use_hubeny_generalization=use_hubeny_generalization,
+            taper=taper,
+            use_MHD_for_Lyman=use_MHD_for_Lyman,
+        )
+
+    return jax.vmap(_single_layer, in_axes=(0, 0, 0, 0, 0))(
+        temperatures, n_h_i, n_he_i, electron_densities, inv_u_h
+    )
+
+
+H_I_bf_batch_compiled = jax.jit(
+    H_I_bf_batch,
+    static_argnames=["n_max_MHD", "use_hubeny_generalization", "taper", "use_MHD_for_Lyman"],
+)
+
+
 def H_I_bf_fast(
     frequencies: jnp.ndarray,
     temperature: float,
@@ -189,11 +234,48 @@ def H_I_bf_fast(
     
     Parameters and returns are identical to H_I_bf.
     """
-    # Ensure Nahar data are loaded outside JIT to avoid tracer leaks
-    _load_nahar_h_i_data()
+    global _NAHAR_DATA_READY
+    # Ensure Nahar data are loaded outside JIT to avoid tracer leaks.
+    if not _NAHAR_DATA_READY:
+        _load_nahar_h_i_data()
+        _NAHAR_DATA_READY = True
     return H_I_bf_compiled(
         frequencies, temperature, n_h_i, n_he_i, electron_density, inv_u_h,
         n_max_MHD, use_hubeny_generalization, taper, use_MHD_for_Lyman
+    )
+
+
+def H_I_bf_fast_batch(
+    frequencies: jnp.ndarray,
+    temperatures: jnp.ndarray,
+    n_h_i: jnp.ndarray,
+    n_he_i: jnp.ndarray,
+    electron_densities: jnp.ndarray,
+    inv_u_h: jnp.ndarray,
+    n_max_MHD: int = 6,
+    use_hubeny_generalization: bool = False,
+    taper: bool = False,
+    use_MHD_for_Lyman: bool = False,
+) -> jnp.ndarray:
+    """
+    JAX-compiled batched H I bound-free absorption across layers.
+    """
+    global _NAHAR_DATA_READY
+    if not _NAHAR_DATA_READY:
+        _load_nahar_h_i_data()
+        _NAHAR_DATA_READY = True
+
+    return H_I_bf_batch_compiled(
+        frequencies=frequencies,
+        temperatures=temperatures,
+        n_h_i=n_h_i,
+        n_he_i=n_he_i,
+        electron_densities=electron_densities,
+        inv_u_h=inv_u_h,
+        n_max_MHD=n_max_MHD,
+        use_hubeny_generalization=use_hubeny_generalization,
+        taper=taper,
+        use_MHD_for_Lyman=use_MHD_for_Lyman,
     )
 
 

@@ -8,11 +8,11 @@ and bf absorption coefficients for H₂⁺ and He₂⁺.
 It also contains pre-constructed interpolation objects.
 """
 
-import jax.numpy as jnp
-from jax import jit
-from scipy.interpolate import RegularGridInterpolator
 import numpy as np
 from typing import Tuple
+import jax.numpy as jnp
+
+from .interp_jax import interp1_linear_clamped, interp2_linear_extrap_line
 
 
 class Stancil1994Data:
@@ -239,57 +239,41 @@ class Stancil1994Data:
         self._create_interpolators()
     
     def _create_interpolators(self):
-        """Create 2D interpolators for cross-sections."""
-        # He₂⁺ interpolators
-        self.σ_He2plus_ff_interpolator = RegularGridInterpolator(
-            (self.λs_He2plus_ff, self.Ts_He2plus), 
-            self.σ_He2plus_ff_table,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
+        """
+        Prepare JAX interpolation tables.
+
+        Korg uses linear extrapolation (`Line`) for Stancil tables and
+        equilibrium constants; we match that behavior via `interp_jax`.
+        """
+        self._λs_He2plus_ff_jnp = jnp.asarray(self.λs_He2plus_ff, dtype=jnp.float64)
+        self._λs_H2plus_ff_jnp = jnp.asarray(self.λs_H2plus_ff, dtype=jnp.float64)
+        self._λs_bf_jnp = jnp.asarray(self.λs_bf, dtype=jnp.float64)
+        self._Ts_He2plus_jnp = jnp.asarray(self.Ts_He2plus, dtype=jnp.float64)
+        self._Ts_H2plus_jnp = jnp.asarray(self.Ts_H2plus, dtype=jnp.float64)
+
+        self._σ_He2plus_ff_table_jnp = jnp.asarray(self.σ_He2plus_ff_table, dtype=jnp.float64)
+        self._σ_He2plus_bf_table_jnp = jnp.asarray(self.σ_He2plus_bf_table, dtype=jnp.float64)
+        self._σ_H2plus_ff_table_jnp = jnp.asarray(self.σ_H2plus_ff_table, dtype=jnp.float64)
+        self._σ_H2plus_bf_table_jnp = jnp.asarray(self.σ_H2plus_bf_table, dtype=jnp.float64)
+        self._K_He2plus_vals_jnp = jnp.asarray(self.K_He2plus_vals, dtype=jnp.float64)
+        self._K_H2plus_vals_jnp = jnp.asarray(self.K_H2plus_vals, dtype=jnp.float64)
+
+    def _interp_cross_section_line(
+        self,
+        wavelength: jnp.ndarray,
+        temperature: jnp.ndarray,
+        wl_grid: jnp.ndarray,
+        temp_grid: jnp.ndarray,
+        table: jnp.ndarray,
+    ) -> jnp.ndarray:
+        out = interp2_linear_extrap_line(
+            wavelength,
+            temperature,
+            wl_grid,
+            temp_grid,
+            table,
         )
-        
-        self.σ_He2plus_bf_interpolator = RegularGridInterpolator(
-            (self.λs_bf, self.Ts_He2plus), 
-            self.σ_He2plus_bf_table,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
-        )
-        
-        # H₂⁺ interpolators
-        self.σ_H2plus_ff_interpolator = RegularGridInterpolator(
-            (self.λs_H2plus_ff, self.Ts_H2plus), 
-            self.σ_H2plus_ff_table,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
-        )
-        
-        self.σ_H2plus_bf_interpolator = RegularGridInterpolator(
-            (self.λs_bf, self.Ts_H2plus), 
-            self.σ_H2plus_bf_table,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
-        )
-        
-        # Equilibrium constant interpolators
-        self.K_He2plus_interpolator = RegularGridInterpolator(
-            (self.Ts_He2plus,), 
-            self.K_He2plus_vals,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
-        )
-        
-        self.K_H2plus_interpolator = RegularGridInterpolator(
-            (self.Ts_H2plus,), 
-            self.K_H2plus_vals,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
-        )
+        return jnp.maximum(out, 0.0)
     
     def he2plus_ff_cross_section(self, wavelength: float, temperature: float) -> float:
         """
@@ -302,8 +286,14 @@ class Stancil1994Data:
         Returns:
             Cross-section in cm⁻⁵
         """
-        result = self.σ_He2plus_ff_interpolator(np.array([wavelength, temperature]))[0]
-        return max(0.0, result)  # Ensure non-negative
+        result = self._interp_cross_section_line(
+            jnp.asarray(wavelength, dtype=jnp.float64),
+            jnp.asarray(temperature, dtype=jnp.float64),
+            self._λs_He2plus_ff_jnp,
+            self._Ts_He2plus_jnp,
+            self._σ_He2plus_ff_table_jnp,
+        )
+        return float(result) if np.ndim(result) == 0 else np.asarray(result)
     
     def he2plus_bf_cross_section(self, wavelength: float, temperature: float) -> float:
         """
@@ -316,8 +306,14 @@ class Stancil1994Data:
         Returns:
             Cross-section in cm⁻⁵
         """
-        result = self.σ_He2plus_bf_interpolator(np.array([wavelength, temperature]))[0]
-        return max(0.0, result)  # Ensure non-negative
+        result = self._interp_cross_section_line(
+            jnp.asarray(wavelength, dtype=jnp.float64),
+            jnp.asarray(temperature, dtype=jnp.float64),
+            self._λs_bf_jnp,
+            self._Ts_He2plus_jnp,
+            self._σ_He2plus_bf_table_jnp,
+        )
+        return float(result) if np.ndim(result) == 0 else np.asarray(result)
     
     def h2plus_ff_cross_section(self, wavelength: float, temperature: float) -> float:
         """
@@ -330,8 +326,14 @@ class Stancil1994Data:
         Returns:
             Cross-section in cm⁻⁵
         """
-        result = self.σ_H2plus_ff_interpolator(np.array([wavelength, temperature]))[0]
-        return max(0.0, result)  # Ensure non-negative
+        result = self._interp_cross_section_line(
+            jnp.asarray(wavelength, dtype=jnp.float64),
+            jnp.asarray(temperature, dtype=jnp.float64),
+            self._λs_H2plus_ff_jnp,
+            self._Ts_H2plus_jnp,
+            self._σ_H2plus_ff_table_jnp,
+        )
+        return float(result) if np.ndim(result) == 0 else np.asarray(result)
     
     def h2plus_bf_cross_section(self, wavelength: float, temperature: float) -> float:
         """
@@ -344,8 +346,31 @@ class Stancil1994Data:
         Returns:
             Cross-section in cm⁻⁵
         """
-        result = self.σ_H2plus_bf_interpolator(np.array([wavelength, temperature]))[0]
-        return max(0.0, result)  # Ensure non-negative
+        result = self._interp_cross_section_line(
+            jnp.asarray(wavelength, dtype=jnp.float64),
+            jnp.asarray(temperature, dtype=jnp.float64),
+            self._λs_bf_jnp,
+            self._Ts_H2plus_jnp,
+            self._σ_H2plus_bf_table_jnp,
+        )
+        return float(result) if np.ndim(result) == 0 else np.asarray(result)
+
+    def h2plus_bf_ff_batch(self, wavelengths: jnp.ndarray, temperature: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Batch H₂⁺ bf/ff cross-sections at one temperature.
+
+        Returns:
+            (σ_bf, σ_ff) arrays in cm⁻⁵
+        """
+        wl = jnp.asarray(wavelengths, dtype=jnp.float64)
+        t = jnp.asarray(temperature, dtype=jnp.float64)
+        sigma_bf = self._interp_cross_section_line(
+            wl, t, self._λs_bf_jnp, self._Ts_H2plus_jnp, self._σ_H2plus_bf_table_jnp
+        )
+        sigma_ff = self._interp_cross_section_line(
+            wl, t, self._λs_H2plus_ff_jnp, self._Ts_H2plus_jnp, self._σ_H2plus_ff_table_jnp
+        )
+        return sigma_bf, sigma_ff
     
     def he2plus_equilibrium_constant(self, temperature: float) -> float:
         """
@@ -357,7 +382,15 @@ class Stancil1994Data:
         Returns:
             Equilibrium constant in cm⁻³
         """
-        return self.K_He2plus_interpolator(np.array([temperature]))[0]
+        result = interp1_linear_clamped(
+            jnp.asarray(temperature, dtype=jnp.float64),
+            self._Ts_He2plus_jnp,
+            self._K_He2plus_vals_jnp,
+            mode="line",
+        )
+        if np.isscalar(temperature):
+            return float(np.asarray(result))
+        return jnp.asarray(result, dtype=jnp.float64)
     
     def h2plus_equilibrium_constant(self, temperature: float) -> float:
         """
@@ -369,7 +402,15 @@ class Stancil1994Data:
         Returns:
             Equilibrium constant in cm⁻³
         """
-        return self.K_H2plus_interpolator(np.array([temperature]))[0]
+        result = interp1_linear_clamped(
+            jnp.asarray(temperature, dtype=jnp.float64),
+            self._Ts_H2plus_jnp,
+            self._K_H2plus_vals_jnp,
+            mode="line",
+        )
+        if np.isscalar(temperature):
+            return float(np.asarray(result))
+        return jnp.asarray(result, dtype=jnp.float64)
 
 
 # Global instance
@@ -394,6 +435,11 @@ def get_h2plus_ff_cross_section(wavelength: float, temperature: float) -> float:
 def get_h2plus_bf_cross_section(wavelength: float, temperature: float) -> float:
     """Get H₂⁺ bound-free cross-section."""
     return _STANCIL_DATA.h2plus_bf_cross_section(wavelength, temperature)
+
+
+def h2plus_bf_ff_batch(wavelengths: jnp.ndarray, temperature: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Batch H₂⁺ (bf, ff) cross-sections."""
+    return _STANCIL_DATA.h2plus_bf_ff_batch(wavelengths, temperature)
 
 
 def get_he2plus_equilibrium_constant(temperature: float) -> float:

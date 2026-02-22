@@ -20,10 +20,12 @@ Outside the regime in which Peach 1970 provides data, the interpolators return 0
 the hydrogenic approximation.
 """
 
-from scipy.interpolate import RegularGridInterpolator
 import numpy as np
+import jax.numpy as jnp
 from typing import Dict, Optional
 # Species import not needed for this module
+
+from .interp_jax import interp2_linear_clamped
 
 
 class Peach1970Interpolator:
@@ -38,14 +40,13 @@ class Peach1970Interpolator:
             sigma_vals: Photon energy values in units of RydbergH*Zeff²
             table_vals: Departure coefficient values (unitless)
         """
-        self.T_vals = T_vals
-        self.sigma_vals = sigma_vals
-        self.interpolator = RegularGridInterpolator(
-            (T_vals, sigma_vals), 
-            table_vals, 
-            bounds_error=False, 
-            fill_value=0.0
-        )
+        self.T_vals = np.asarray(T_vals, dtype=np.float64)
+        self.sigma_vals = np.asarray(sigma_vals, dtype=np.float64)
+        self.table_vals = np.asarray(table_vals, dtype=np.float64)
+
+        self._T_vals_jnp = jnp.asarray(self.T_vals, dtype=jnp.float64)
+        self._sigma_vals_jnp = jnp.asarray(self.sigma_vals, dtype=jnp.float64)
+        self._table_vals_jnp = jnp.asarray(self.table_vals, dtype=jnp.float64)
     
     def __call__(self, T: float, sigma: float) -> float:
         """
@@ -58,20 +59,24 @@ class Peach1970Interpolator:
         Returns:
             Departure coefficient (unitless)
         """
-        T_arr = np.asarray(T, dtype=float)
-        sigma_arr = np.asarray(sigma, dtype=float)
-
+        T_arr = np.asarray(T, dtype=np.float64)
+        sigma_arr = np.asarray(sigma, dtype=np.float64)
         T_arr, sigma_arr = np.broadcast_arrays(T_arr, sigma_arr)
-        T_arr = np.clip(T_arr, self.T_vals.min(), self.T_vals.max())
-        sigma_arr = np.clip(sigma_arr, self.sigma_vals.min(), self.sigma_vals.max())
 
-        points = np.column_stack([T_arr.ravel(), sigma_arr.ravel()])
-        values = self.interpolator(points)
-        values = values.reshape(T_arr.shape)
+        values = interp2_linear_clamped(
+            T_arr,
+            sigma_arr,
+            self._T_vals_jnp,
+            self._sigma_vals_jnp,
+            self._table_vals_jnp,
+            x_mode="zero",
+            y_mode="zero",
+        )
+        values = np.asarray(values, dtype=np.float64)
 
         if values.size == 1:
-            return float(values.ravel()[0])
-        return values
+            return float(values.reshape(-1)[0])
+        return values.reshape(T_arr.shape)
 
 
 def _create_he_ii_interpolator() -> Peach1970Interpolator:

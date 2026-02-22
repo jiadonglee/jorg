@@ -138,10 +138,13 @@ PRODUCTION STATUS (December 2025): ✅ FULLY OPERATIONAL - COMPLETE KORG.JL PARI
 import jax
 import jax.numpy as jnp
 import numpy as np
+import os
 import time
+import warnings
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
 from collections import OrderedDict
+from pathlib import Path
 
 # GPU/device utilities
 try:
@@ -168,8 +171,10 @@ from .statmech import (
     create_default_ionization_energies, 
     create_default_partition_functions,
     create_default_log_equilibrium_constants,
-    Species, Formula
+    Species, Formula,
+    chemical_equilibrium_jax_layers,
 )
+from .core.state_jax import SynthesisStateJax
 # Optional helpers removed during trimming.
 # Korg.jl-equivalent chemical equilibrium solver (Newton + molecular equilibrium)
 from .statmech.korg_chemical_equilibrium import chemical_equilibrium
@@ -178,7 +183,11 @@ from .statmech.korg_chemical_equilibrium import chemical_equilibrium
 # This fixes 72-100% partition function errors that were causing 6.7% electron density error
 from .statmech.korg_exact_partition_functions import get_korg_exact_partition_functions
 from .statmech.proper_ionization_energies import get_proper_ionization_energies
-from .continuum.exact_physics_continuum import total_continuum_absorption_exact_physics_only
+from .continuum.exact_physics_continuum import (
+    total_continuum_absorption_exact_physics_only,
+    total_continuum_absorption_batch_fast,
+    ContinuumSpeciesLayout,
+)
 from .lines.linelist import read_linelist
 # Import NEW Kurucz format support
 try:
@@ -189,7 +198,7 @@ from .lines.linelist_data import get_VALD_solar_linelist
 # Import newly validated Voigt profile functions (30/30 exact matches with Korg.jl)
 from .lines.profiles import line_profile, voigt_hjerting, harris_series
 from .lines.voigt import voigt_profile, voigt_profile_wavelength
-from .radiative_transfer_exact import radiative_transfer
+from .radiative_transfer_exact import radiative_transfer, radiative_transfer_jax
 # Import NEW radiative transfer schemes
 try:
     from .radiative_transfer.feautrier_scheme import (
@@ -209,6 +218,11 @@ from .opacity.korg_line_processor import KorgLineProcessor
 
 # Constants matching Korg.jl exactly
 MAX_ATOMIC_NUMBER = 92
+
+_DEFAULT_IONIZATION_ENERGIES = None
+_DEFAULT_PARTITION_FUNCS = None
+_DEFAULT_LOG_EQUILIBRIUM_CONSTANTS = None
+_JAX_CHEM_DATA_CACHE = {}
 
 
 @dataclass
@@ -276,6 +290,233 @@ def _normalize_ce_source(use_chemical_equilibrium_from):
                 'number_densities': use_chemical_equilibrium_from['number_densities']
             }
     return use_chemical_equilibrium_from
+
+
+def _get_default_statmech_data():
+    global _DEFAULT_IONIZATION_ENERGIES
+    global _DEFAULT_PARTITION_FUNCS
+    global _DEFAULT_LOG_EQUILIBRIUM_CONSTANTS
+
+    if _DEFAULT_IONIZATION_ENERGIES is None:
+        _DEFAULT_IONIZATION_ENERGIES = create_default_ionization_energies()
+    if _DEFAULT_PARTITION_FUNCS is None:
+        _DEFAULT_PARTITION_FUNCS = create_default_partition_functions()
+    if _DEFAULT_LOG_EQUILIBRIUM_CONSTANTS is None:
+        _DEFAULT_LOG_EQUILIBRIUM_CONSTANTS = create_default_log_equilibrium_constants()
+
+    return (
+        _DEFAULT_IONIZATION_ENERGIES,
+        _DEFAULT_PARTITION_FUNCS,
+        _DEFAULT_LOG_EQUILIBRIUM_CONSTANTS,
+    )
+
+
+def _get_cached_jax_chem_data(ionization_energies, partition_funcs, log_equilibrium_constants):
+    from .statmech.chem_eq_jax import prepare_chem_eq_data
+
+    key = (id(ionization_energies), id(partition_funcs), id(log_equilibrium_constants))
+    cached = _JAX_CHEM_DATA_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    chem_data = prepare_chem_eq_data(
+        ionization_energies=ionization_energies,
+        partition_funcs=partition_funcs,
+        log_equilibrium_constants=log_equilibrium_constants,
+    )
+    _JAX_CHEM_DATA_CACHE[key] = chem_data
+    return chem_data
+
+
+def _coerce_atmosphere_dict(atm: Any) -> Dict[str, np.ndarray]:
+    """
+    Normalize ModelAtmosphere/dict inputs into a dense dict representation.
+    """
+    if hasattr(atm, 'layers'):
+        atm_dict = {
+            'temperature': np.array([layer.temp for layer in atm.layers], dtype=np.float64),
+            'electron_density': np.array([layer.electron_number_density for layer in atm.layers], dtype=np.float64),
+            'number_density': np.array([layer.number_density for layer in atm.layers], dtype=np.float64),
+            'tau_5000': np.array([layer.tau_5000 for layer in atm.layers], dtype=np.float64),
+            'height': np.array([layer.z for layer in atm.layers], dtype=np.float64),
+        }
+        atm_dict['pressure'] = atm_dict['number_density'] * kboltz_cgs * atm_dict['temperature']
+        return atm_dict
+
+    if not isinstance(atm, dict):
+        raise TypeError("atm must be a dict or a ModelAtmosphere-like object with .layers")
+
+    out = {k: np.asarray(v, dtype=np.float64) for k, v in atm.items()}
+    if 'pressure' not in out:
+        if 'number_density' in out and 'temperature' in out:
+            out['pressure'] = out['number_density'] * kboltz_cgs * out['temperature']
+        else:
+            raise ValueError("atm dict must include either pressure or (number_density and temperature).")
+    return out
+
+
+def _build_wavelength_grid(wavelengths: Union[Tuple[float, float], np.ndarray]) -> np.ndarray:
+    if isinstance(wavelengths, tuple) and len(wavelengths) == 2:
+        wl_start, wl_stop = wavelengths
+        spacing = 0.01  # Match legacy Korg-compatible default
+        n_points = int((wl_stop - wl_start) / spacing) + 1
+        return np.linspace(wl_start, wl_stop, n_points, dtype=np.float64)
+    return np.asarray(wavelengths, dtype=np.float64)
+
+
+def _resolve_pinn_checkpoint(
+    ce_pinn_checkpoint: Optional[Union[str, Path]] = None,
+) -> Optional[Path]:
+    """
+    Resolve PINN checkpoint using priority:
+    1) explicit argument
+    2) JORG_PINN_CKPT env var
+    3) fixed candidate paths
+    """
+    candidates: List[Path] = []
+
+    if ce_pinn_checkpoint:
+        candidates.append(Path(str(ce_pinn_checkpoint)).expanduser())
+
+    env_ckpt = os.environ.get("JORG_PINN_CKPT", "").strip()
+    if env_ckpt:
+        candidates.append(Path(env_ckpt).expanduser())
+
+    candidates.append(Path("/Users/jdli/Project/jorg/jorg/data/models/chem_eq_pinn_model.npz"))
+    candidates.append(Path(__file__).resolve().parents[2] / "data" / "models" / "chem_eq_pinn_model.npz")
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.is_file():
+            return resolved
+
+    return None
+
+
+def _build_pinn_ce_source_for_atmosphere(
+    atm: Any,
+    A_X: np.ndarray,
+    *,
+    ionization_energies: Optional[Dict] = None,
+    partition_funcs: Optional[Dict] = None,
+    log_equilibrium_constants: Optional[Dict] = None,
+    ce_pinn_checkpoint: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """
+    Build CE source dict for synthesis from a trained PINN checkpoint.
+    """
+    if A_X is None:
+        raise ValueError("A_X is required to build PINN chemical-equilibrium source.")
+
+    checkpoint = _resolve_pinn_checkpoint(ce_pinn_checkpoint=ce_pinn_checkpoint)
+    if checkpoint is None:
+        raise FileNotFoundError(
+            "PINN checkpoint not found. Checked explicit path, JORG_PINN_CKPT, and default candidates."
+        )
+
+    atm_dict = _coerce_atmosphere_dict(atm)
+    temps = np.asarray(atm_dict["temperature"], dtype=np.float64)
+    if "number_density" in atm_dict:
+        n_totals = np.asarray(atm_dict["number_density"], dtype=np.float64)
+    else:
+        n_totals = np.asarray(atm_dict["pressure"] / (kboltz_cgs * atm_dict["temperature"]), dtype=np.float64)
+
+    A_X_arr = np.asarray(A_X, dtype=np.float64)
+    if A_X_arr.ndim != 1 or A_X_arr.shape[0] != MAX_ATOMIC_NUMBER:
+        raise ValueError(f"A_X must be a length-{MAX_ATOMIC_NUMBER} array.")
+    if float(A_X_arr[0]) != 12.0:
+        raise ValueError(f"A_X must satisfy A_X[0] == 12 (got {float(A_X_arr[0])}).")
+
+    abs_abundances = np.power(10.0, A_X_arr - 12.0)
+    abs_abundances = abs_abundances / np.maximum(np.sum(abs_abundances), 1e-300)
+
+    if ionization_energies is None or partition_funcs is None or log_equilibrium_constants is None:
+        default_ion, default_pf, default_logk = _get_default_statmech_data()
+        if ionization_energies is None:
+            ionization_energies = default_ion
+        if partition_funcs is None:
+            partition_funcs = default_pf
+        if log_equilibrium_constants is None:
+            log_equilibrium_constants = default_logk
+
+    chem_data = _get_cached_jax_chem_data(
+        ionization_energies=ionization_energies,
+        partition_funcs=partition_funcs,
+        log_equilibrium_constants=log_equilibrium_constants,
+    )
+    from .statmech.chem_eq_pinn_inference import (
+        build_atomic_ce_source_from_solver,
+        load_pinn_solver_from_checkpoint,
+    )
+
+    solver = load_pinn_solver_from_checkpoint(model_path=checkpoint, chem_data=chem_data)
+    return build_atomic_ce_source_from_solver(
+        solver=solver,
+        temperatures=temps,
+        n_totals=n_totals,
+        abundances=abs_abundances,
+        chem_data=chem_data,
+    )
+
+
+def _build_source_function_jax(temperatures: jnp.ndarray, wavelengths: jnp.ndarray) -> jnp.ndarray:
+    """
+    Planck source matrix B_lambda(T) with shape [layers, wavelengths].
+    """
+    wl_cm = wavelengths * 1e-8
+    wl_cm_2d = wl_cm[None, :]
+    temp_2d = temperatures[:, None]
+    x = hplanck_cgs * c_cgs / jnp.maximum(wl_cm_2d * kboltz_cgs * temp_2d, 1e-300)
+    numerator = 2.0 * hplanck_cgs * c_cgs**2
+    denominator = wl_cm_2d**5 * jnp.expm1(x)
+    return numerator / jnp.maximum(denominator, 1e-300)
+
+
+def _synthesis_result_from_jax_state(
+    state: SynthesisStateJax,
+    *,
+    mu_values: Union[int, List[float]] = 20,
+    return_cntm: bool = True,
+) -> SynthesisResult:
+    """
+    Compatibility boundary: convert JAX state -> legacy SynthesisResult.
+    """
+    flux_np = np.asarray(jax.device_get(state.flux), dtype=np.float64)
+    cntm_np = np.asarray(jax.device_get(state.continuum), dtype=np.float64) if return_cntm else None
+    alpha_total_np = np.asarray(jax.device_get(state.alpha_total), dtype=np.float64)
+    alpha_cntm_np = np.asarray(jax.device_get(state.alpha_continuum), dtype=np.float64)
+    source_np = np.asarray(jax.device_get(state.source_function), dtype=np.float64)
+    ne_np = np.asarray(jax.device_get(state.electron_density), dtype=np.float64)
+    dense_np = np.asarray(jax.device_get(state.number_density_dense), dtype=np.float64)
+    wl_np = np.asarray(jax.device_get(state.wavelengths), dtype=np.float64)
+
+    number_densities = state.species_layout.stacked_dict_from_dense(dense_np)
+    mu_grid = _setup_mu_grid(mu_values)
+    intensity = np.zeros((len(mu_grid), wl_np.size), dtype=np.float64)
+
+    return SynthesisResult(
+        flux=flux_np,
+        cntm=cntm_np,
+        intensity=intensity,
+        alpha=alpha_total_np,
+        mu_grid=mu_grid,
+        number_densities=number_densities,
+        electron_number_density=ne_np,
+        wavelengths=wl_np,
+        subspectra=[slice(0, wl_np.size)],
+        alpha_continuum=alpha_cntm_np,
+        source_function=source_np,
+        debug_data=None,
+        intermediate_results=None,
+    )
 
 
 def create_korg_compatible_abundance_array(
@@ -723,6 +964,186 @@ def synthesize_korg_compatible(
     return result
 
 
+def synthesize_jax(
+    atm: Dict,
+    linelist: Optional[List] = None,
+    A_X: Optional[np.ndarray] = None,
+    wavelengths: Union[Tuple[float, float], np.ndarray] = (4000.0, 7000.0),
+    *,
+    vmic: float = 1.0,
+    line_buffer: float = 10.0,
+    cntm_step: float = 1.0,
+    mu_values: Union[int, List[float]] = 20,
+    line_cutoff_threshold: float = 3e-4,
+    ionization_energies: Optional[Dict] = None,
+    partition_funcs: Optional[Dict] = None,
+    log_equilibrium_constants: Optional[Dict] = None,
+    logg: float = 4.44,
+    rectify: bool = False,
+    rectify_mode: str = "continuum",
+    rectify_percentile: float = 99.5,
+    verbose: bool = False,
+    **_: Any,
+) -> SynthesisStateJax:
+    """
+    Pure-JAX synthesis entrypoint returning the full differentiable state.
+    """
+    if rectify_mode not in ("continuum", "pseudo"):
+        raise ValueError(f"rectify_mode must be 'continuum' or 'pseudo', got {rectify_mode!r}")
+    if A_X is None:
+        raise ValueError("A_X must be provided for synthesize_jax().")
+    A_X_arr = jnp.asarray(A_X, dtype=jnp.float64)
+    if A_X_arr.ndim != 1 or A_X_arr.shape[0] != MAX_ATOMIC_NUMBER:
+        raise ValueError(f"A_X must be a length-{MAX_ATOMIC_NUMBER} vector.")
+    if not isinstance(A_X_arr, jax.core.Tracer):
+        if float(np.asarray(A_X_arr[0])) != 12.0:
+            raise ValueError(f"A_X must satisfy A_X[0] == 12 (got {float(np.asarray(A_X_arr[0]))}).")
+
+    if isinstance(linelist, str):
+        linelist = read_linelist(linelist, format="auto")
+
+    wl_array = _build_wavelength_grid(wavelengths)
+    atm_dict = _coerce_atmosphere_dict(atm)
+    n_layers = len(atm_dict["temperature"])
+
+    abs_abundances = jnp.power(10.0, A_X_arr - 12.0)
+    abs_abundances = abs_abundances / jnp.maximum(jnp.sum(abs_abundances), 1e-300)
+
+    if ionization_energies is None or partition_funcs is None or log_equilibrium_constants is None:
+        default_ion, default_pf, default_logk = _get_default_statmech_data()
+        if ionization_energies is None:
+            ionization_energies = default_ion
+        if partition_funcs is None:
+            partition_funcs = default_pf
+        if log_equilibrium_constants is None:
+            log_equilibrium_constants = default_logk
+
+    temps = np.asarray(atm_dict["temperature"], dtype=np.float64)
+    nts = np.asarray(atm_dict["number_density"], dtype=np.float64)
+    model_atm_nes = np.asarray(atm_dict.get("electron_density", nts * 1e-4), dtype=np.float64)
+
+    # Phase-2 CE path: layer batch + warm-start (lax.scan), no SciPy root in this branch.
+    chem_data = _get_cached_jax_chem_data(
+        ionization_energies=ionization_energies,
+        partition_funcs=partition_funcs,
+        log_equilibrium_constants=log_equilibrium_constants,
+    )
+    ne_layers, number_density_dense, _, species_layout = chemical_equilibrium_jax_layers(
+        temps=temps,
+        nts=nts,
+        model_atm_nes=model_atm_nes,
+        absolute_abundances=abs_abundances,
+        ionization_energies=ionization_energies,
+        partition_funcs=partition_funcs,
+        log_equilibrium_constants=log_equilibrium_constants,
+        chem_data=chem_data,
+        warm_start=True,
+        jit=True,
+    )
+
+    # Continuum path consumes dense layout directly.
+    continuum_layout = ContinuumSpeciesLayout(
+        species=species_layout.species,
+        index=species_layout.index,
+    )
+    frequencies = c_cgs / (jnp.asarray(wl_array, dtype=jnp.float64) * 1e-8)
+    alpha_continuum = total_continuum_absorption_batch_fast(
+        frequencies=frequencies,
+        temps=jnp.asarray(temps, dtype=jnp.float64),
+        electron_densities=jnp.asarray(ne_layers, dtype=jnp.float64),
+        number_densities_stacked=jnp.asarray(number_density_dense, dtype=jnp.float64),
+        partition_funcs=partition_funcs,
+        include_nahar_h_i=True,
+        include_mhd=False,
+        n_levels_max=6,
+        continuum_cache=None,
+        species_layout=continuum_layout,
+    )
+
+    if linelist is None or len(linelist) == 0:
+        line_opacity = jnp.zeros_like(alpha_continuum)
+    else:
+        # Dense line path: pass dense views + layout directly to avoid per-species copying.
+        line_opacity_np = _calculate_line_opacity_multilayer(
+            wl_array=wl_array,
+            temps=temps,
+            electron_densities=np.asarray(ne_layers, dtype=np.float64),
+            number_densities=None,
+            partition_funcs=partition_funcs,
+            linelist=linelist,
+            line_buffer=line_buffer,
+            microturbulence_kms=vmic,
+            continuum_opacity=np.asarray(alpha_continuum, dtype=np.float64),
+            number_density_dense=np.asarray(number_density_dense, dtype=np.float64),
+            species_layout=species_layout,
+            cutoff_threshold=line_cutoff_threshold,
+            verbose=verbose,
+        )
+        line_opacity = jnp.asarray(line_opacity_np, dtype=jnp.float64)
+
+    alpha_total = jnp.asarray(alpha_continuum, dtype=jnp.float64) + line_opacity
+    temperatures_j = jnp.asarray(temps, dtype=jnp.float64)
+    wavelengths_j = jnp.asarray(wl_array, dtype=jnp.float64)
+    source_matrix = _build_source_function_jax(temperatures_j, wavelengths_j)
+
+    spatial_coord = jnp.asarray(
+        atm_dict.get("height", np.linspace(0.0, 100e5, n_layers)),
+        dtype=jnp.float64,
+    )
+    tau_ref = jnp.asarray(
+        atm_dict.get("tau_5000", np.logspace(-6, 2, n_layers)),
+        dtype=jnp.float64,
+    )
+
+    idx_5000 = np.where(np.isclose(wl_array, 5000.0, atol=1e-6))[0]
+    if idx_5000.size:
+        alpha_ref = alpha_total[:, int(idx_5000[0])]
+    else:
+        alpha_ref = jnp.mean(alpha_continuum, axis=1)
+
+    flux, _, _, _ = radiative_transfer_jax(
+        alpha=alpha_total,
+        source=source_matrix,
+        spatial_coord=spatial_coord,
+        mu_points=mu_values,
+        tau_ref=tau_ref,
+        alpha_ref=alpha_ref,
+        tau_scheme="anchored",
+        I_scheme="linear_flux_only",
+    )
+    continuum_flux, _, _, _ = radiative_transfer_jax(
+        alpha=jnp.asarray(alpha_continuum, dtype=jnp.float64),
+        source=source_matrix,
+        spatial_coord=spatial_coord,
+        mu_points=mu_values,
+        tau_ref=tau_ref,
+        alpha_ref=alpha_ref,
+        tau_scheme="anchored",
+        I_scheme="linear_flux_only",
+    )
+
+    if rectify:
+        flux = flux / jnp.maximum(continuum_flux, 1e-10)
+        flux = jnp.clip(flux, 0.0, 2.0)
+        if rectify_mode == "pseudo":
+            scale = jnp.percentile(flux, rectify_percentile)
+            scale = jnp.where(jnp.isfinite(scale) & (scale > 1e-6), scale, 1.0)
+            flux = jnp.clip(flux / scale, 0.0, 2.0)
+        continuum_flux = jnp.ones_like(continuum_flux)
+
+    return SynthesisStateJax(
+        flux=jnp.asarray(flux, dtype=jnp.float64),
+        continuum=jnp.asarray(continuum_flux, dtype=jnp.float64),
+        alpha_total=jnp.asarray(alpha_total, dtype=jnp.float64),
+        alpha_continuum=jnp.asarray(alpha_continuum, dtype=jnp.float64),
+        source_function=jnp.asarray(source_matrix, dtype=jnp.float64),
+        electron_density=jnp.asarray(ne_layers, dtype=jnp.float64),
+        number_density_dense=jnp.asarray(number_density_dense, dtype=jnp.float64),
+        species_layout=species_layout,
+        wavelengths=wavelengths_j,
+    )
+
+
 # Helper functions moved to LayerProcessor class for better organization
 
 def _normalize_rectified_flux(flux: np.ndarray, percentile: float = 99.5, min_scale: float = 1e-6):
@@ -779,6 +1200,7 @@ def _setup_mu_grid(mu_values):
 def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, number_densities,
                                        partition_funcs, linelist, line_buffer,
                                        microturbulence_kms, continuum_opacity,
+                                       number_density_dense=None, species_layout=None,
                                        cutoff_threshold=3e-4, verbose=False):
     """
     Calculate line opacity for all layers at once using Korg-style windowing.
@@ -801,6 +1223,24 @@ def _calculate_line_opacity_multilayer(wl_array, temps, electron_densities, numb
 
     if continuum_opacity is not None:
         continuum_opacity = np.asarray(continuum_opacity)
+
+    if number_densities is None:
+        if number_density_dense is None or species_layout is None:
+            raise ValueError(
+                "Either number_densities or (number_density_dense + species_layout) must be provided."
+            )
+        dense = np.asarray(number_density_dense, dtype=np.float64)
+        if dense.ndim != 2:
+            raise ValueError("number_density_dense must be rank-2 [n_layers, n_species].")
+        if dense.shape[0] != n_layers:
+            raise ValueError("number_density_dense layer count must match temps.")
+        if dense.shape[1] != len(species_layout.species):
+            raise ValueError("number_density_dense species axis must match species_layout.")
+        # Use direct column views instead of dense->dict copying.
+        number_densities = {
+            sp: dense[:, idx]
+            for sp, idx in species_layout.index.items()
+        }
 
     processor = _get_cached_line_processor(verbose=verbose)
     result = processor.process_lines(
@@ -1318,8 +1758,18 @@ def resynthesize_from_continuum(
 
 
 # Standard API functions matching Korg.jl
-def synthesize(atm, linelist=None, A_X=None, wavelengths=(4000.0, 7000.0), 
-               verbose=True, **kwargs):
+def synthesize(
+    atm,
+    linelist=None,
+    A_X=None,
+    wavelengths=(4000.0, 7000.0),
+    verbose=True,
+    engine: str = "legacy",
+    ce_solver: str = "pinn",
+    ce_pinn_checkpoint: Optional[str] = None,
+    ce_solver_fallback: str = "jax",
+    **kwargs,
+):
     """
     Full stellar synthesis with detailed diagnostics (matches Korg.jl synthesize())
     
@@ -1343,9 +1793,72 @@ def synthesize(atm, linelist=None, A_X=None, wavelengths=(4000.0, 7000.0),
     SynthesisResult
         Complete synthesis results with flux, continuum, opacity, etc.
     """
+    if ce_solver not in {"pinn", "jax"}:
+        raise ValueError(f"ce_solver must be one of {{'pinn', 'jax'}}, got {ce_solver!r}")
+    if ce_solver_fallback != "jax":
+        raise ValueError("ce_solver_fallback currently only supports 'jax'.")
+    if engine not in {"legacy", "jax"}:
+        raise ValueError(f"engine must be one of {{'legacy', 'jax'}}, got {engine!r}")
+
+    if engine == "jax":
+        state = synthesize_jax(
+            atm=atm,
+            linelist=linelist,
+            A_X=A_X,
+            wavelengths=wavelengths,
+            verbose=verbose,
+            **kwargs,
+        )
+        return _synthesis_result_from_jax_state(
+            state,
+            mu_values=kwargs.get("mu_values", 20),
+            return_cntm=bool(kwargs.get("return_cntm", True)),
+        )
+
+    legacy_kwargs = dict(kwargs)
+    explicit_ce_source = legacy_kwargs.get("use_chemical_equilibrium_from")
+    if ce_solver == "pinn" and explicit_ce_source is None:
+        try:
+            pinn_ce_source = _build_pinn_ce_source_for_atmosphere(
+                atm=atm,
+                A_X=A_X,
+                ionization_energies=legacy_kwargs.get("ionization_energies"),
+                partition_funcs=legacy_kwargs.get("partition_funcs"),
+                log_equilibrium_constants=legacy_kwargs.get("log_equilibrium_constants"),
+                ce_pinn_checkpoint=ce_pinn_checkpoint,
+            )
+            legacy_kwargs["use_chemical_equilibrium_from"] = pinn_ce_source
+            if verbose:
+                print("✅ Using PINN checkpoint for default chemical equilibrium source.")
+        except Exception as exc:
+            warnings.warn(
+                "PINN CE setup failed; falling back to engine='jax'. "
+                f"Reason: {exc}",
+                RuntimeWarning,
+            )
+            if ce_solver_fallback == "jax":
+                state = synthesize_jax(
+                    atm=atm,
+                    linelist=linelist,
+                    A_X=A_X,
+                    wavelengths=wavelengths,
+                    verbose=verbose,
+                    **kwargs,
+                )
+                return _synthesis_result_from_jax_state(
+                    state,
+                    mu_values=kwargs.get("mu_values", 20),
+                    return_cntm=bool(kwargs.get("return_cntm", True)),
+                )
+            raise
+
     return synthesize_korg_compatible(
-        atm=atm, linelist=linelist, A_X=A_X, 
-        wavelengths=wavelengths, verbose=verbose, **kwargs
+        atm=atm,
+        linelist=linelist,
+        A_X=A_X,
+        wavelengths=wavelengths,
+        verbose=verbose,
+        **legacy_kwargs,
     )
 
 
@@ -1359,6 +1872,10 @@ def synthesize_spectrum(
     m_H: float = 0.0,
     alpha_H: Optional[float] = None,
     continuum_method: Optional[str] = None,
+    engine: str = "legacy",
+    ce_solver: str = "pinn",
+    ce_pinn_checkpoint: Optional[str] = None,
+    ce_solver_fallback: str = "jax",
     **kwargs
 ):
     """
@@ -1374,7 +1891,7 @@ def synthesize_spectrum(
         )
 
     rectify = kwargs.pop('rectify', False)
-    result = synthesize_korg_compatible(
+    result = synthesize(
         atm=atmosphere,
         linelist=linelist,
         A_X=A_X,
@@ -1382,7 +1899,12 @@ def synthesize_spectrum(
         vmic=vmic,
         return_cntm=True,
         rectify=rectify,
-        **kwargs
+        engine=engine,
+        ce_solver=ce_solver,
+        ce_pinn_checkpoint=ce_pinn_checkpoint,
+        ce_solver_fallback=ce_solver_fallback,
+        verbose=bool(kwargs.pop("verbose", False)),
+        **kwargs,
     )
     return np.asarray(result.flux), np.asarray(result.cntm)
 
@@ -1392,7 +1914,12 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
           R=float('inf'), vsini=0, vmic=1.0,
           hydrogen_lines=True, mu_points=20,
           rt_method="korg_default", use_cubic_interpolation=False,
-          format_A_X_kwargs=None, synthesize_kwargs=None, verbose=False, **abundances):
+          format_A_X_kwargs=None, synthesize_kwargs=None, verbose=False,
+          engine: str = "legacy",
+          ce_solver: str = "pinn",
+          ce_pinn_checkpoint: Optional[str] = None,
+          ce_solver_fallback: str = "jax",
+          **abundances):
     """
     Enhanced stellar synthesis interface (fully compatible with Korg.jl synth())
     
@@ -1499,6 +2026,14 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
         format_A_X_kwargs = {}
     if synthesize_kwargs is None:
         synthesize_kwargs = {}
+    if "engine" in synthesize_kwargs:
+        engine = synthesize_kwargs.pop("engine")
+    if "ce_solver" in synthesize_kwargs:
+        ce_solver = synthesize_kwargs.pop("ce_solver")
+    if "ce_pinn_checkpoint" in synthesize_kwargs:
+        ce_pinn_checkpoint = synthesize_kwargs.pop("ce_pinn_checkpoint")
+    if "ce_solver_fallback" in synthesize_kwargs:
+        ce_solver_fallback = synthesize_kwargs.pop("ce_solver_fallback")
     
     # Add hydrogen_lines and mu_points to synthesize_kwargs
     synthesize_kwargs['hydrogen_lines'] = hydrogen_lines
@@ -1538,15 +2073,20 @@ def synth(Teff, logg, m_H, alpha_H=None, wavelengths=(5000.0, 6000.0),
         atm = interpolate_atmosphere(Teff=Teff, logg=logg, m_H=m_H)
     
     # Run synthesis
-    result = synthesize_korg_compatible(
-        atm=atm, 
-        linelist=linelist, 
-        A_X=A_X, 
-        wavelengths=wavelengths, 
-        logg=logg, 
+    result = synthesize(
+        atm=atm,
+        linelist=linelist,
+        A_X=A_X,
+        wavelengths=wavelengths,
+        logg=logg,
         rectify=rectify,
         vmic=vmic,
-        **synthesize_kwargs
+        engine=engine,
+        ce_solver=ce_solver,
+        ce_pinn_checkpoint=ce_pinn_checkpoint,
+        ce_solver_fallback=ce_solver_fallback,
+        verbose=verbose,
+        **synthesize_kwargs,
     )
     
     # Extract flux for post-processing
@@ -2130,7 +2670,8 @@ def synthesize_with_loggf_adjustments(
 
 
 # Export main functions
-__all__ = ['synth', 'synthesize', 'synthesize_korg_compatible', 'SynthesisResult',
+__all__ = ['synth', 'synthesize', 'synthesize_jax', 'synthesize_korg_compatible', 'SynthesisResult',
+           'SynthesisStateJax',
            'synthesize_spectrum',
            'synthesize_with_loggf_adjustments',  # New log(gf) adjustment function
            'resynthesize_from_continuum',  # Optimized resynthesis for loggf fitting

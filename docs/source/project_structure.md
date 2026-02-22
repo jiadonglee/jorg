@@ -213,6 +213,7 @@ from jorg.constants import SPEED_OF_LIGHT, BOLTZMANN_K
 # Clone and install in development mode
 git clone https://github.com/jorg-project/jorg.git
 cd jorg
+pip install "git+https://github.com/jorg-project/jorg.git@v0.3.1-clean"
 pip install -e ".[dev,docs,gpu]"
 ```
 
@@ -234,7 +235,7 @@ cd docs/ && make html          # Build docs
 ```
 
 ### Release Process
-1. **Version bump**: Update version in `src/jorg/__init__.py`
+1. **Version bump**: Update version in `pyproject.toml` and `src/jorg/__init__.py`
 2. **Testing**: Full test suite including slow tests
 3. **Documentation**: Update docs and changelog
 4. **Build**: `python -m build`

@@ -18,13 +18,16 @@ from .korg_chemical_equilibrium import (
     saha_ion_weights,
     translational_U,
 )
-from .chem_eq_jax import chemical_equilibrium_jax
+from .chem_eq_jax import chemical_equilibrium_jax, chemical_equilibrium_jax_layers
+from .chem_eq_pinn import ChemicalEquilibriumPINNSolver
 from .species import Species, Formula, MAX_ATOMIC_NUMBER
 from .hummer_mihalas import hummer_mihalas_w, hummer_mihalas_U_H
 
 __all__ = [
     "chemical_equilibrium",
     "chemical_equilibrium_jax",
+    "chemical_equilibrium_jax_layers",
+    "ChemicalEquilibriumPINNSolver",
     "saha_ion_weights",
     "translational_U",
     "create_default_partition_functions",

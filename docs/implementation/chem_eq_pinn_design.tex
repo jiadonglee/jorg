@@ -1,0 +1,221 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{A Physics-Informed Neural Surrogate for Stellar Chemical Equilibrium in \texttt{jorg}}
+\author{Implementation Design Note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document specifies the current PINN design for fast chemical-equilibrium inference in \texttt{jorg}. The reference physics follows the Korg formulation implemented in \path{Korg.jl/src/statmech.jl} and ported in \path{jorg/src/jorg/statmech/korg_chemical_equilibrium.py}. The PINN predicts electron density and per-element neutral fractions from thermodynamic state and abundances, and is trained with a two-stage objective: (i) supervised regression to trusted solver outputs, and (ii) residual minimization of atomic element conservation and charge neutrality. The present physics loss is atomic-only; molecular constraints are delegated to the label generator and not yet enforced explicitly in the PINN objective.
+\end{abstract}
+
+\section{Problem Statement and Scope}
+Given
+\begin{align}
+    \left(T,\ n_{\mathrm{tot}},\ \bm{A}\right), \qquad
+    \bm{A} = (A_1,\dots,A_{92}), \quad \sum_{Z=1}^{92} A_Z = 1,
+\end{align}
+we seek a fast approximation to the equilibrium solution
+\begin{align}
+    \left(n_e,\ \bm{f}\right), \qquad \bm{f} = (f_1,\dots,f_{92}),
+\end{align}
+where $n_e$ is electron number density and $f_Z$ is the neutral fraction of element $Z$.
+
+The reference equilibrium labels are produced by the trusted backends:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{jorg/src/jorg/statmech/chem\_eq\_jax.py} (default),
+    \item \texttt{jorg/src/jorg/statmech/korg\_chemical\_equilibrium.py} (SciPy port of Korg).
+\end{itemize}
+The current PINN loss enforces only atomic constraints (neutral, singly ionized, doubly ionized species), consistent with the present phase of development.
+
+\section{Reference Physics: Atomic Ionization Structure}
+\subsection{Saha ionization weights}
+For each element $Z$, define Saha ratios
+\begin{align}
+    w_{Z,\mathrm{II}} &= \frac{n_{Z,\mathrm{II}}}{n_{Z,\mathrm{I}}}, \\
+    w_{Z,\mathrm{III}} &= \frac{n_{Z,\mathrm{III}}}{n_{Z,\mathrm{I}}}.
+\end{align}
+Following \texttt{statmech.jl}, the first-ionization ratio is
+\begin{align}
+    w_{Z,\mathrm{II}} =
+    \frac{2}{n_e}
+    \frac{U_{Z,\mathrm{II}}(T)}{U_{Z,\mathrm{I}}(T)}
+    \left(\frac{2\pi m_e k_B T}{h^2}\right)^{3/2}
+    \exp\!\left(-\frac{\chi_{Z,1}}{k_B T}\right),
+\end{align}
+and the second-ionization ratio is
+\begin{align}
+    w_{Z,\mathrm{III}} =
+    w_{Z,\mathrm{II}}
+    \frac{2}{n_e}
+    \frac{U_{Z,\mathrm{III}}(T)}{U_{Z,\mathrm{II}}(T)}
+    \left(\frac{2\pi m_e k_B T}{h^2}\right)^{3/2}
+    \exp\!\left(-\frac{\chi_{Z,2}}{k_B T}\right),
+\end{align}
+with the hydrogen special case $w_{1,\mathrm{III}}=0$ in the implementation.
+
+\subsection{Atomic number densities}
+Define the nucleus reservoir for element $Z$ as
+\begin{align}
+    n_{\mathrm{nuc},Z} = A_Z\,(n_{\mathrm{tot}} - n_e).
+\end{align}
+Given neutral fraction $f_Z$, the three atomic stages used in the PINN loss are
+\begin{align}
+    n_{Z,\mathrm{I}} &= f_Z\, n_{\mathrm{nuc},Z}, \\
+    n_{Z,\mathrm{II}} &= w_{Z,\mathrm{II}}\, n_{Z,\mathrm{I}}, \\
+    n_{Z,\mathrm{III}} &= w_{Z,\mathrm{III}}\, n_{Z,\mathrm{I}}.
+\end{align}
+
+\section{PINN Parameterization}
+\subsection{Inputs and outputs}
+The model input is the 94-dimensional vector
+\begin{align}
+    \bm{x} = \left[\log_{10}T,\ \log_{10}n_{\mathrm{tot}},\ \bm{A}\right].
+\end{align}
+The network output has 93 channels:
+\begin{align}
+    (\bm{z}_f,\ z_e), \qquad \bm{z}_f\in\mathbb{R}^{92},\ z_e\in\mathbb{R}.
+\end{align}
+It is mapped to physical variables as
+\begin{align}
+    \hat{f}_Z &= \mathrm{clip}\!\left(\sigma(z_{f,Z}),\ 10^{-12},\ 1\right), \\
+    \hat{n}_e &= n_{\mathrm{tot}}\,\sigma(z_e),
+\end{align}
+which guarantees $0<\hat{f}_Z\le 1$ and $0<\hat{n}_e<n_{\mathrm{tot}}$.
+
+\subsection{Architecture}
+The baseline architecture in \texttt{chem\_eq\_pinn\_models.py} is an MLP with hidden widths
+\begin{align}
+    (256,\ 512,\ 512,\ 256,\ 128)
+\end{align}
+and Swish activation. A Flax implementation is used when available, with a pure-JAX fallback path preserving the same functional mapping.
+
+\section{Training Objectives}
+\subsection{Supervised objective}
+Training labels $(n_e^\star,\bm{f}^\star)$ are generated from the reference solvers. The supervised objective is
+\begin{align}
+    \mathcal{L}_{\mathrm{sup}}
+    &= \mathcal{L}_{n_e} + \mathcal{L}_f, \\
+    \mathcal{L}_{n_e}
+    &= \left\langle \left[\log_{10}\hat{n}_e - \log_{10}n_e^\star\right]^2 \right\rangle, \\
+    \mathcal{L}_f
+    &= \left\langle \left[\log_{10}\hat{f}_Z - \log_{10}f_Z^\star\right]^2 \right\rangle,
+\end{align}
+with numerical floors applied in code before logarithms.
+
+\subsection{Physics objective}
+The PINN physics residuals are computed from $\hat{n}_e$ and $\hat{\bm{f}}$.
+
+\paragraph{Element conservation residual}
+\begin{align}
+    r_{\mathrm{elem},Z}
+    = \frac{
+        n_{Z,\mathrm{I}} + n_{Z,\mathrm{II}} + n_{Z,\mathrm{III}} - n_{\mathrm{nuc},Z}
+    }{
+        \max(n_{\mathrm{nuc},Z},\epsilon)
+    },
+    \qquad \epsilon = 10^{-100}.
+\end{align}
+The loss uses abundance-weighted MSE:
+\begin{align}
+    \mathcal{L}_{\mathrm{elem}}
+    = \left\langle
+    \frac{1}{92}\sum_{Z=1}^{92}\omega_Z\,r_{\mathrm{elem},Z}^2
+    \right\rangle, \qquad
+    \omega_Z = \frac{\max(A_Z,10^{-12})}{\langle \max(A_Z,10^{-12})\rangle_Z}.
+\end{align}
+
+\paragraph{Charge-neutrality residual}
+\begin{align}
+    r_{\mathrm{chg}}
+    = \frac{
+        \sum_{Z=1}^{92}\left(n_{Z,\mathrm{II}}+2n_{Z,\mathrm{III}}\right)-n_e
+    }{
+        \max(n_e,\epsilon)
+    },
+    \qquad
+    \mathcal{L}_{\mathrm{chg}}=\langle r_{\mathrm{chg}}^2\rangle.
+\end{align}
+
+The total physics loss is
+\begin{align}
+    \mathcal{L}_{\mathrm{phys}}
+    = w_{\mathrm{elem}}\mathcal{L}_{\mathrm{elem}} + w_{\mathrm{chg}}\mathcal{L}_{\mathrm{chg}},
+\end{align}
+with current defaults $w_{\mathrm{elem}}=1$, $w_{\mathrm{chg}}=10$.
+
+\subsection{Two-phase optimization}
+The default schedule is:
+\begin{enumerate}[leftmargin=1.5em]
+    \item supervised pretraining with $\mathcal{L}_{\mathrm{sup}}$;
+    \item phase-2 fine tuning with either $\mathcal{L}_{\mathrm{phys}}$ only or
+    \begin{align}
+        \mathcal{L}_{\mathrm{phase2}}
+        = w_{\mathrm{sup,2}}\mathcal{L}_{\mathrm{sup}} + \mathcal{L}_{\mathrm{phys}}.
+    \end{align}
+\end{enumerate}
+Optimization uses AdamW with warmup and cosine decay (\texttt{chem\_eq\_pinn\_train.py}).
+
+\section{Data Generation and Solver Coupling}
+Training/validation tuples are
+\begin{align}
+    \left(T,\ n_{\mathrm{tot}},\ \bm{A},\ n_e^\star,\ \bm{f}^\star\right),
+\end{align}
+sampled over broad stellar-atmosphere ranges in $(T,\log_{10}n_{\mathrm{tot}},[M/H],[\alpha/H])$ and filtered for physically valid solutions.
+
+Two points are important for interpretation:
+\begin{itemize}[leftmargin=1.5em]
+    \item The reference solvers may include molecular equilibrium terms, depending on supplied equilibrium-constant tables.
+    \item The current PINN physics loss does not yet include explicit molecular residual equations.
+\end{itemize}
+Therefore, molecular effects are presently learned through supervision rather than enforced as hard residual constraints.
+
+\section{Software Mapping}
+\begin{table}[h!]
+\centering
+\begin{tabular}{p{0.43\linewidth}p{0.5\linewidth}}
+\toprule
+File & Functional role \\
+\midrule
+\path{chem_eq_pinn_models.py} & Network architecture and output parameterization \\
+\path{chem_eq_pinn_loss.py} & Saha weights, residuals, and physics losses \\
+\path{chem_eq_pinn_train.py} & Data generation, objectives, and optimization loops \\
+\path{chem_eq_pinn.py} & High-level train/infer/save/load API \\
+\path{korg_chemical_equilibrium.py} & Full SciPy reference solver (Korg port) \\
+\path{Korg.jl/src/statmech.jl} & Upstream physical formulation and algorithmic reference \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Validation Protocol}
+Model quality is assessed with:
+\begin{itemize}[leftmargin=1.5em]
+    \item supervised agreement metrics (e.g. mean and percentile relative errors in $n_e$ and $f_Z$),
+    \item physics diagnostics ($|r_{\mathrm{elem},Z}|$ and $|r_{\mathrm{chg}}|$ distributions),
+    \item out-of-sample checks over temperature, density, and metallicity slices.
+\end{itemize}
+For operational reproducibility, cached datasets are recommended via
+\path{examples/train_chem_eq_pinn_full.py} options:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{--prepare-data-only},
+    \item \texttt{--load-data},
+    \item \texttt{--data-dir}.
+\end{itemize}
+
+\section{Current Limitations and Next Steps}
+\begin{itemize}[leftmargin=1.5em]
+    \item Physics regularization is atomic-only; molecular equilibrium constraints are not yet explicit in $\mathcal{L}_{\mathrm{phys}}$.
+    \item The surrogate is calibrated over a finite thermodynamic domain; extrapolation to extreme conditions requires dedicated stress testing.
+    \item A direct extension path is to augment the residual system with molecular conservation equations consistent with the Korg formalism.
+\end{itemize}
+
+\end{document}

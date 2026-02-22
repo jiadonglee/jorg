@@ -1,0 +1,15 @@
+\BOOKMARK [1][-]{section.1}{Problem Statement and Scope}{}% 1
+\BOOKMARK [1][-]{section.2}{Reference Physics: Atomic Ionization Structure}{}% 2
+\BOOKMARK [2][-]{subsection.2.1}{Saha ionization weights}{section.2}% 3
+\BOOKMARK [2][-]{subsection.2.2}{Atomic number densities}{section.2}% 4
+\BOOKMARK [1][-]{section.3}{PINN Parameterization}{}% 5
+\BOOKMARK [2][-]{subsection.3.1}{Inputs and outputs}{section.3}% 6
+\BOOKMARK [2][-]{subsection.3.2}{Architecture}{section.3}% 7
+\BOOKMARK [1][-]{section.4}{Training Objectives}{}% 8
+\BOOKMARK [2][-]{subsection.4.1}{Supervised objective}{section.4}% 9
+\BOOKMARK [2][-]{subsection.4.2}{Physics objective}{section.4}% 10
+\BOOKMARK [2][-]{subsection.4.3}{Two-phase optimization}{section.4}% 11
+\BOOKMARK [1][-]{section.5}{Data Generation and Solver Coupling}{}% 12
+\BOOKMARK [1][-]{section.6}{Software Mapping}{}% 13
+\BOOKMARK [1][-]{section.7}{Validation Protocol}{}% 14
+\BOOKMARK [1][-]{section.8}{Current Limitations and Next Steps}{}% 15

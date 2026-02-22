@@ -14,7 +14,7 @@ Key design points:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple, Sequence
+from typing import Callable, Dict, Optional, Tuple, Sequence, List
 
 import numpy as np
 
@@ -100,9 +100,95 @@ _LOG10_MIN = -300.0
 _LOG10_MAX = 250.0
 
 
+_CHEM_DATA_CACHE: Dict[Tuple[int, int, int], "ChemEqData"] = {}
+_SOLVER_CACHE: Dict[Tuple[int, str, int, float, float, int, bool], Tuple[Callable, Callable]] = {}
+_SCAN_SOLVER_CACHE: Dict[Tuple[int, bool], Callable] = {}
+
+
 def _logit(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     x = np.clip(x, eps, 1.0 - eps)
     return np.log(x / (1.0 - x))
+
+
+def _get_cached_chem_data(
+    ionization_energies: Dict[int, Tuple[float, float, float]],
+    partition_funcs: Dict[Species, Callable],
+    log_equilibrium_constants: Optional[Dict],
+) -> ChemEqData:
+    key = (id(ionization_energies), id(partition_funcs), id(log_equilibrium_constants))
+    cached = _CHEM_DATA_CACHE.get(key)
+    if cached is not None:
+        return cached
+    chem_data = prepare_chem_eq_data(
+        ionization_energies=ionization_energies,
+        partition_funcs=partition_funcs,
+        log_equilibrium_constants=log_equilibrium_constants,
+    )
+    _CHEM_DATA_CACHE[key] = chem_data
+    return chem_data
+
+
+def _get_cached_optimality_and_solver(
+    chem_data: ChemEqData,
+    *,
+    method: str,
+    maxiter: int,
+    tol: float,
+    cg_tol: float,
+    cg_maxiter: int,
+    jit: bool,
+) -> Tuple[Callable, Callable]:
+    key = (
+        id(chem_data),
+        str(method).lower(),
+        int(maxiter),
+        float(tol),
+        float(cg_tol),
+        int(cg_maxiter),
+        bool(jit),
+    )
+    cached = _SOLVER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    optimality_fun = make_optimality_fun(chem_data)
+    solve = make_solver(
+        optimality_fun,
+        method=method,
+        maxiter=maxiter,
+        tol=tol,
+        cg_tol=cg_tol,
+        cg_maxiter=cg_maxiter,
+        jit=jit,
+    )
+    _SOLVER_CACHE[key] = (optimality_fun, solve)
+    return optimality_fun, solve
+
+
+def _get_cached_scan_solver(solve: Callable, *, jit: bool) -> Callable:
+    key = (id(solve), bool(jit))
+    cached = _SCAN_SOLVER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def _scan_solve(temps_x, nts_x, y_guess_x, y_init, abs_abund_x, warm_start_flag):
+        def _body(y_prev, payload):
+            T_i, nt_i, y_guess_i = payload
+            y_seed = jax.lax.cond(
+                warm_start_flag,
+                lambda _: y_prev,
+                lambda _: y_guess_i,
+                operand=None,
+            )
+            y_i = solve(y_seed, T_i, nt_i, abs_abund_x)
+            return y_i, y_i
+
+        _, y_hist = jax.lax.scan(_body, y_init, (temps_x, nts_x, y_guess_x))
+        return y_hist
+
+    scan_solver = jax.jit(_scan_solve) if jit else _scan_solve
+    _SCAN_SOLVER_CACHE[key] = scan_solver
+    return scan_solver
 
 
 def _infer_logT_grid(partition_funcs: Dict[Species, Callable]) -> np.ndarray:
@@ -734,6 +820,23 @@ def compute_species_densities_arrays(
     mask1 = jnp.asarray(chem_data.ion.mask1) & jnp.asarray(chem_data.pf.mask_I) & jnp.asarray(chem_data.pf.mask_II)
     mask2 = jnp.asarray(chem_data.ion.mask2) & jnp.asarray(chem_data.pf.mask_II) & jnp.asarray(chem_data.pf.mask_III)
 
+    cubic_logT_grid = None
+    U_I_coeffs = None
+    U_II_coeffs = None
+    U_III_coeffs = None
+    cubic_mask_I = None
+    cubic_mask_II = None
+    cubic_mask_III = None
+    if chem_data.pf.cubic_logT_grid is not None and chem_data.pf.U_I_coeffs is not None:
+        cubic_logT_grid = jnp.asarray(chem_data.pf.cubic_logT_grid)
+        U_I_coeffs = jnp.asarray(chem_data.pf.U_I_coeffs)
+        U_II_coeffs = jnp.asarray(chem_data.pf.U_II_coeffs)
+        U_III_coeffs = jnp.asarray(chem_data.pf.U_III_coeffs)
+        if chem_data.pf.cubic_mask_I is not None:
+            cubic_mask_I = jnp.asarray(chem_data.pf.cubic_mask_I)
+            cubic_mask_II = jnp.asarray(chem_data.pf.cubic_mask_II)
+            cubic_mask_III = jnp.asarray(chem_data.pf.cubic_mask_III)
+
     def _logU_arrays(logT):
         logU_I_lin = _interp_table_jax(logT, logT_grid, logU_I_table)
         logU_II_lin = _interp_table_jax(logT, logT_grid, logU_II_table)
@@ -848,6 +951,136 @@ def solve_equilibrium(
     return solve(y0, T, n_total, abund)
 
 
+def _coerce_absolute_abundance_array(
+    absolute_abundances: Dict[int, float] | np.ndarray,
+) -> jnp.ndarray:
+    if isinstance(absolute_abundances, dict):
+        abs_abund_array = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+        for Z, abund in absolute_abundances.items():
+            if 1 <= Z <= MAX_ATOMIC_NUMBER:
+                abs_abund_array[Z - 1] = abund
+        return jnp.asarray(abs_abund_array, dtype=jnp.float64)
+
+    abs_abund_array = jnp.asarray(absolute_abundances, dtype=jnp.float64)
+    if abs_abund_array.ndim != 1 or abs_abund_array.shape[0] != MAX_ATOMIC_NUMBER:
+        raise ValueError(
+            f"absolute_abundances must be a length-{MAX_ATOMIC_NUMBER} vector."
+        )
+    return abs_abund_array
+
+
+def chemical_equilibrium_jax_layers(
+    temps: np.ndarray,
+    nts: np.ndarray,
+    model_atm_nes: np.ndarray,
+    absolute_abundances: Dict[int, float] | np.ndarray,
+    ionization_energies: Dict[int, Tuple[float, float, float]],
+    partition_funcs: Dict[Species, Callable],
+    log_equilibrium_constants: Optional[Dict] = None,
+    *,
+    chem_data: Optional[ChemEqData] = None,
+    method: str = "levenberg_marquardt",
+    maxiter: int = 300,
+    tol: float = 1e-8,
+    cg_tol: float = 1e-10,
+    cg_maxiter: int = 200,
+    jit: bool = True,
+    warm_start: bool = True,
+):
+    """
+    Solve CE for all layers with JAX scan + warm-start.
+
+    Returns
+    -------
+    tuple
+        (electron_density, number_density_dense, y_solutions, species_layout)
+        where number_density_dense has shape [n_layers, 3*MAX_ATOMIC_NUMBER]
+        with column blocks [neutral, ion1, ion2].
+    """
+    _require_jax()
+
+    from ..core.state_jax import DenseSpeciesLayout
+
+    temps = np.asarray(temps, dtype=np.float64)
+    nts = np.asarray(nts, dtype=np.float64)
+    model_atm_nes = np.asarray(model_atm_nes, dtype=np.float64)
+    if not (temps.shape == nts.shape == model_atm_nes.shape):
+        raise ValueError("temps, nts, and model_atm_nes must have identical shapes.")
+    if temps.size == 0:
+        raise ValueError("temps/nts/model_atm_nes must be non-empty.")
+
+    abs_abund_array = _coerce_absolute_abundance_array(absolute_abundances)
+
+    if chem_data is None:
+        chem_data = _get_cached_chem_data(
+            ionization_energies=ionization_energies,
+            partition_funcs=partition_funcs,
+            log_equilibrium_constants=log_equilibrium_constants,
+        )
+
+    _, solve = _get_cached_optimality_and_solver(
+        chem_data,
+        method=method,
+        maxiter=maxiter,
+        tol=tol,
+        cg_tol=cg_tol,
+        cg_maxiter=cg_maxiter,
+        jit=jit,
+    )
+
+    temps_j = jnp.asarray(temps, dtype=jnp.float64)
+    nts_j = jnp.asarray(nts, dtype=jnp.float64)
+    model_atm_nes_j = jnp.asarray(model_atm_nes, dtype=jnp.float64)
+    abs_abund_j = jnp.asarray(abs_abund_array, dtype=jnp.float64)
+
+    y0_first = jnp.asarray(
+        initial_guess_y(
+            float(temps[0]),
+            float(nts[0]),
+            float(model_atm_nes[0]),
+            chem_data,
+        ),
+        dtype=jnp.float64,
+    )
+
+    # Per-layer fallback guesses for non-warm-start mode.
+    ne_frac_guess = jnp.clip(
+        model_atm_nes_j / jnp.maximum(nts_j, 1e-300),
+        1e-12,
+        1.0 - 1e-12,
+    )
+    y_e_guess = jnp.log(ne_frac_guess / (1.0 - ne_frac_guess))
+    y_f_guess = jnp.broadcast_to(y0_first[:-1], (temps_j.shape[0], MAX_ATOMIC_NUMBER))
+    y_guess_all = jnp.concatenate((y_f_guess, y_e_guess[:, None]), axis=1)
+    warm_start_flag = jnp.asarray(bool(warm_start))
+    scan_solver = _get_cached_scan_solver(solve, jit=jit)
+    y_solutions = scan_solver(
+        temps_j,
+        nts_j,
+        y_guess_all,
+        y0_first,
+        abs_abund_j,
+        warm_start_flag,
+    )
+
+    def _layer_outputs(y_i, T_i, nt_i):
+        ne_i, n0_i, n1_i, n2_i, _, _ = compute_species_densities_arrays(
+            y_i, T_i, nt_i, abs_abund_j, chem_data
+        )
+        dense_i = jnp.concatenate((n0_i, n1_i, n2_i), axis=0)
+        return ne_i, dense_i
+
+    ne_layers, number_density_dense = jax.vmap(_layer_outputs)(y_solutions, temps_j, nts_j)
+
+    species_order: List[Species] = []
+    for charge in range(3):
+        for z in range(1, MAX_ATOMIC_NUMBER + 1):
+            species_order.append(Species.from_atomic_number(z, charge))
+    species_layout = DenseSpeciesLayout.from_species(species_order)
+
+    return ne_layers, number_density_dense, y_solutions, species_layout
+
+
 def chemical_equilibrium_jax(
     temp: float,
     nt: float,
@@ -870,20 +1103,10 @@ def chemical_equilibrium_jax(
 ) -> Tuple[float, np.ndarray] | Tuple[float, np.ndarray, Dict[Species, float]] | Tuple[float, np.ndarray, np.ndarray]:
     _require_jax()
 
-    if isinstance(absolute_abundances, dict):
-        abs_abund_array = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
-        for Z, abund in absolute_abundances.items():
-            if 1 <= Z <= MAX_ATOMIC_NUMBER:
-                abs_abund_array[Z - 1] = abund
-    else:
-        abs_abund_array = np.asarray(absolute_abundances, dtype=np.float64)
-        if abs_abund_array.shape[0] != MAX_ATOMIC_NUMBER:
-            raise ValueError(
-                f"absolute_abundances must have length {MAX_ATOMIC_NUMBER} (got {abs_abund_array.shape[0]})."
-            )
+    abs_abund_array = _coerce_absolute_abundance_array(absolute_abundances)
 
     if chem_data is None:
-        chem_data = prepare_chem_eq_data(
+        chem_data = _get_cached_chem_data(
             ionization_energies,
             partition_funcs,
             log_equilibrium_constants,
@@ -896,9 +1119,8 @@ def chemical_equilibrium_jax(
         chem_data,
     )
 
-    optimality_fun = make_optimality_fun(chem_data)
-    solve = make_solver(
-        optimality_fun,
+    optimality_fun, solve = _get_cached_optimality_and_solver(
+        chem_data,
         method=method,
         maxiter=maxiter,
         tol=tol,
@@ -974,5 +1196,6 @@ __all__ = [
     "unpack_solution",
     "compute_species_densities_arrays",
     "solve_equilibrium",
+    "chemical_equilibrium_jax_layers",
     "chemical_equilibrium_jax",
 ]

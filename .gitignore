@@ -78,6 +78,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+*.ipynb
 
 # IPython
 profile_default/
@@ -177,6 +178,8 @@ examples/comparison_outputs/
 comparison_plots/
 examples/comparison_plots/
 examples/output/
+examples/tmp/
+output/
 valid/
 
 # Temporary files

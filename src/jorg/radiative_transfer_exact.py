@@ -980,9 +980,77 @@ def radiative_transfer(alpha: np.ndarray, source: np.ndarray, spatial_coord: np.
     return flux, intensity, mu_surface_grid, mu_weights
 
 
+def radiative_transfer_jax(
+    alpha: jnp.ndarray,
+    source: jnp.ndarray,
+    spatial_coord: jnp.ndarray,
+    *,
+    mu_points: Union[int, jnp.ndarray] = 20,
+    tau_ref: Optional[jnp.ndarray] = None,
+    alpha_ref: Optional[jnp.ndarray] = None,
+    tau_scheme: str = "anchored",
+    I_scheme: str = "linear_flux_only",
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    JAX-native RT path for differentiable synthesis.
+
+    This path keeps all arrays on-device and avoids host round-trips.
+    It currently supports the dominant plane-parallel flux-only mode used
+    in synthesis (`tau_scheme='anchored'`, `I_scheme='linear_flux_only'`).
+    """
+    alpha = jnp.asarray(alpha, dtype=jnp.float64)
+    source = jnp.asarray(source, dtype=jnp.float64)
+    _ = jnp.asarray(spatial_coord, dtype=jnp.float64)  # kept for API parity
+
+    if alpha.ndim != 2 or source.ndim != 2:
+        raise ValueError("alpha and source must have shape [layers, wavelengths].")
+    if alpha.shape != source.shape:
+        raise ValueError("alpha and source must have identical shapes.")
+    if tau_scheme != "anchored":
+        raise ValueError(f"radiative_transfer_jax only supports tau_scheme='anchored' (got {tau_scheme!r}).")
+    if I_scheme not in ("linear_flux_only", "linear_flux_only_expint"):
+        raise ValueError(
+            "radiative_transfer_jax currently supports I_scheme in "
+            "{'linear_flux_only', 'linear_flux_only_expint'}."
+        )
+
+    n_layers = alpha.shape[0]
+    if tau_ref is None:
+        tau_ref = jnp.geomspace(1e-6, 1e2, n_layers)
+    if alpha_ref is None:
+        alpha_ref = jnp.ones((n_layers,), dtype=jnp.float64)
+
+    tau_ref = jnp.asarray(tau_ref, dtype=jnp.float64)
+    alpha_ref = jnp.asarray(alpha_ref, dtype=jnp.float64)
+    log_tau_ref = jnp.log(jnp.clip(tau_ref, 1e-300, None))
+    integrand_factor = tau_ref / jnp.clip(alpha_ref, 1e-300, None)
+
+    # Vectorized τ integration across wavelengths.
+    tau_matrix = jax.vmap(
+        lambda alpha_col: compute_tau_anchored(alpha_col, integrand_factor, log_tau_ref),
+        in_axes=1,
+        out_axes=1,
+    )(alpha)
+
+    # Vectorized flux-only expint evaluation across wavelengths.
+    surface_intensity = jax.vmap(
+        compute_F_flux_only_expint,
+        in_axes=(1, 1),
+        out_axes=0,
+    )(tau_matrix, source)
+
+    flux = 2.0 * jnp.pi * surface_intensity
+    intensity = surface_intensity[None, :]
+    mu_surface_grid = jnp.asarray([1.0], dtype=jnp.float64)
+    mu_weights = jnp.asarray([1.0], dtype=jnp.float64)
+    _ = mu_points  # reserved for future full-angle support
+    return flux, intensity, mu_surface_grid, mu_weights
+
+
 # Export all functions with exact Korg.jl compatibility
 __all__ = [
     'radiative_transfer',
+    'radiative_transfer_jax',
     'generate_mu_grid',
     'compute_tau_anchored',
     'compute_I_linear_flux_only',

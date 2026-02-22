@@ -11,9 +11,20 @@ Jorg (`jorg`) is a JAX-based stellar spectrum synthesis library for Python.
 
 ## Install
 ```bash
+# From GitHub (recommended for clean/tagged snapshots)
+pip install "git+https://github.com/jorg-project/jorg.git@v0.3.1-clean"
+
+# Local development
 pip install -e .
 pip install -e ".[gpu]"  # optional CUDA support
 ```
+
+By default, legacy synthesis will try a PINN chemical-equilibrium checkpoint first.
+Checkpoint lookup priority:
+1. `ce_pinn_checkpoint=...` argument
+2. `JORG_PINN_CKPT` environment variable
+3. default model paths under `data/models/`
+If none is found, synthesis automatically falls back to the JAX engine.
 
 ## Quick start
 ```python
@@ -81,7 +92,7 @@ if `JORG_DATA_DIR` is not set.
 - NumPy >= 1.20
 
 ## Status
-- v0.3.0 (alpha)
+- v0.3.1 (alpha)
 
 ## Chemical Equilibrium (JAX)
 - `jorg.statmech.chem_eq_jax.chemical_equilibrium_jax` provides a fully JAX-native solver with implicit differentiation.

@@ -18,6 +18,7 @@ import os
 from collections import OrderedDict
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import gamma as jax_gamma
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from functools import lru_cache
@@ -447,7 +448,6 @@ class KorgLineProcessor:
         Pack linelist objects into dense numpy arrays for JAX processing.
         """
         from ..lines.broadening_korg import approximate_vdw_broadening
-        from scipy.special import gamma as scipy_gamma
 
         wavelengths = []
         log_gf = []
@@ -534,7 +534,7 @@ class KorgLineProcessor:
             gamma_stark.append(gamma_stark_val)
             vdw_sigma.append(sigma)
             vdw_alpha.append(alpha)
-            gamma_factor.append(float(scipy_gamma((4.0 - alpha) / 2.0)))
+            gamma_factor.append(float(jax_gamma((4.0 - alpha) / 2.0)))
             vdw_base_gamma.append(float(base_gamma))
             species_idx.append(int(idx))
             atomic_mass.append(float(self._get_atomic_mass(species)))
@@ -597,8 +597,6 @@ class KorgLineProcessor:
             Process lines in chunks to reduce memory peak. If None, auto-compute
             based on available memory and line count. Recommended: 1000-5000.
         """
-        from scipy.special import gamma as scipy_gamma
-
         n_layers = temps.shape[0]
         n_wavelengths = wl_array_cm.shape[0]
         n_lines = line_arrays["wavelength"].shape[0]
@@ -670,8 +668,6 @@ class KorgLineProcessor:
 
         This is the original implementation that processes all lines at once.
         """
-        from scipy.special import gamma as scipy_gamma
-
         n_layers = temps.shape[0]
         n_wavelengths = wl_array_cm.shape[0]
 
@@ -723,7 +719,10 @@ class KorgLineProcessor:
         inv_mu = inv_mu_const + 1.0 / atomic_mass
         vbar = temp_vbar[None, :] * np.sqrt(inv_mu)[:, None]
         if gamma_factor is None:
-            gamma_factor = scipy_gamma((4.0 - vdw_alpha) / 2.0)
+            gamma_factor = np.asarray(
+                jax_gamma(jnp.asarray((4.0 - vdw_alpha) / 2.0)),
+                dtype=float_dtype,
+            )
         else:
             gamma_factor = gamma_factor.astype(float_dtype, copy=False)
         v0 = 1e6
@@ -1554,8 +1553,7 @@ class KorgLineProcessor:
             inv_mu = 1.0 / (1.008 * amu_cgs) + 1.0 / atomic_mass  # Inverse reduced mass
             vbar = np.sqrt(8 * kboltz_cgs * temps / PI * inv_mu)  # Mean relative velocity
             
-            from scipy.special import gamma as gamma_func
-            gamma_factor = gamma_func((4 - alpha) / 2)
+            gamma_factor = float(jax_gamma((4 - alpha) / 2))
             
             # ABO formula from Anstee & O'Mara (1995)
             return 2 * (4/PI)**(alpha/2) * gamma_factor * v0 * sigma * (vbar/v0)**(1-alpha)

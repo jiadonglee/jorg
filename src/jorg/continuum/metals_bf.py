@@ -11,13 +11,16 @@ import jax.numpy as jnp
 import numpy as np
 import h5py
 from typing import Dict, Tuple, Any, Optional
-from functools import lru_cache
 import os
 
 from ..statmech.species import Species
 from ..data import get_data_path
 from ..constants import SPEED_OF_LIGHT
 
+_H_I_SPECIES = Species.from_string("H I")
+_HE_I_SPECIES = Species.from_string("He I")
+_H_II_SPECIES = Species.from_string("H II")
+_METAL_BF_SKIP_SPECIES = frozenset({_H_I_SPECIES, _HE_I_SPECIES, _H_II_SPECIES})
 
 
 class MetalBoundFreeData:
@@ -92,6 +95,17 @@ class MetalBoundFreeData:
                 except Exception as e:
                     print(f"Warning: Could not parse species {species_name}: {e}")
                     continue
+
+        # Fast-path species excludes continuum channels handled elsewhere.
+        self.fast_species = tuple(
+            sp for sp in self.species_list
+            if sp not in _METAL_BF_SKIP_SPECIES
+        )
+        self.fast_log_sigma_stack = (
+            jnp.stack([self.cross_sections[sp] for sp in self.fast_species], axis=0)
+            if self.fast_species
+            else jnp.zeros((0, 1, 1), dtype=jnp.float64)
+        )
         
         # Convert grids to JAX arrays
         self.logT_grid = jnp.array(self.logT_grid)
@@ -203,6 +217,30 @@ _interpolate_metal_cross_section_vectorized = jax.vmap(
 )
 
 
+@jax.jit
+def _metal_bf_absorption_stacked(
+    frequencies: jnp.ndarray,
+    logT: float,
+    number_densities_vec: jnp.ndarray,
+    nu_grid: jnp.ndarray,
+    logT_grid: jnp.ndarray,
+    log_sigma_stack: jnp.ndarray,
+) -> jnp.ndarray:
+    """Compute metal bf absorption from stacked species tables in one JAX kernel."""
+
+    def _single_species(number_density: float, log_sigma_data: jnp.ndarray) -> jnp.ndarray:
+        log_sigma_interp = _interpolate_metal_cross_section_vectorized(
+            frequencies, logT, nu_grid, logT_grid, log_sigma_data
+        )
+        mask = jnp.isfinite(log_sigma_interp)
+        safe_n = jnp.maximum(number_density, 1e-300)
+        alpha = jnp.where(mask, jnp.exp(jnp.log(safe_n) + log_sigma_interp) * 1e-18, 0.0)
+        return jnp.where(number_density > 0.0, alpha, 0.0)
+
+    alpha_by_species = jax.vmap(_single_species, in_axes=(0, 0))(number_densities_vec, log_sigma_stack)
+    return jnp.sum(alpha_by_species, axis=0)
+
+
 def metal_bf_absorption(frequencies: jnp.ndarray,
                        temperature: float, 
                        number_densities: Dict[Species, float],
@@ -238,26 +276,37 @@ def metal_bf_absorption(frequencies: jnp.ndarray,
     # Get metal BF data
     bf_data = get_metal_bf_data()
     
-    if species_list is None:
-        species_list = bf_data.species_list
-    
-    # Initialize total absorption
-    alpha_total = jnp.zeros_like(frequencies, dtype=jnp.float64)
+    freqs = jnp.asarray(frequencies, dtype=jnp.float64)
     
     logT = jnp.log10(temperature)
+
+    if species_list is None:
+        # Fast path: all species in one vectorized kernel.
+        if bf_data.fast_species:
+            ndens_vec = jnp.asarray(
+                [float(number_densities.get(sp, 0.0)) for sp in bf_data.fast_species],
+                dtype=jnp.float64,
+            )
+            return _metal_bf_absorption_stacked(
+                frequencies=freqs,
+                logT=logT,
+                number_densities_vec=ndens_vec,
+                nu_grid=bf_data.nu_grid,
+                logT_grid=bf_data.logT_grid,
+                log_sigma_stack=bf_data.fast_log_sigma_stack,
+            )
+        return jnp.zeros_like(freqs, dtype=jnp.float64)
+
+    # Custom-species fallback path.
+    alpha_total = jnp.zeros_like(freqs, dtype=jnp.float64)
     
     # Add contributions from each metal species
     for species in species_list:
         # Skip if species not in number_densities or not available in data
         if species not in number_densities or species not in bf_data.cross_sections:
             continue
-            
-        # Skip H I, He I, H II as these are handled elsewhere (exact match to Korg.jl)
-        h_i = Species.from_string("H I")
-        he_i = Species.from_string("He I") 
-        h_ii = Species.from_string("H II")
-        
-        if species in [h_i, he_i, h_ii]:
+
+        if species in _METAL_BF_SKIP_SPECIES:
             continue
             
         number_density = number_densities[species]
@@ -269,7 +318,7 @@ def metal_bf_absorption(frequencies: jnp.ndarray,
         
         # Interpolate cross-sections at all frequencies
         log_sigma_interp = _interpolate_metal_cross_section_vectorized(
-            frequencies, logT, bf_data.nu_grid, bf_data.logT_grid, log_sigma_data
+            freqs, logT, bf_data.nu_grid, bf_data.logT_grid, log_sigma_data
         )
         
         # Apply mask to avoid NaNs in derivatives (exact match to Korg.jl logic)
@@ -292,6 +341,55 @@ def metal_bf_absorption(frequencies: jnp.ndarray,
         alpha_total += alpha_contribution
     
     return alpha_total
+
+
+def metal_bf_absorption_dense_batch(
+    frequencies: jnp.ndarray,
+    temperatures: jnp.ndarray,
+    number_densities_dense: jnp.ndarray,
+    species_layout: Any,
+) -> jnp.ndarray:
+    """
+    Vectorized metal bound-free absorption for dense [layers, species] inputs.
+    """
+    bf_data = get_metal_bf_data()
+
+    freqs = jnp.asarray(frequencies, dtype=jnp.float64)
+    temps = jnp.asarray(temperatures, dtype=jnp.float64)
+    dense = jnp.asarray(number_densities_dense, dtype=jnp.float64)
+
+    if dense.ndim != 2:
+        raise ValueError("number_densities_dense must be rank-2 [n_layers, n_species].")
+    if dense.shape[0] != temps.shape[0]:
+        raise ValueError("number_densities_dense layer count must match temperatures.")
+    if dense.shape[1] != len(species_layout.species):
+        raise ValueError("number_densities_dense species axis must match species_layout.")
+
+    n_layers = dense.shape[0]
+    if not bf_data.fast_species:
+        return jnp.zeros((n_layers, freqs.shape[0]), dtype=jnp.float64)
+
+    ndens_cols = []
+    for sp in bf_data.fast_species:
+        idx = species_layout.index.get(sp)
+        if idx is None:
+            ndens_cols.append(jnp.zeros((n_layers,), dtype=jnp.float64))
+        else:
+            ndens_cols.append(dense[:, idx])
+
+    ndens_stack = jnp.stack(ndens_cols, axis=1)
+
+    def _single_layer(temp: float, ndens_vec: jnp.ndarray) -> jnp.ndarray:
+        return _metal_bf_absorption_stacked(
+            frequencies=freqs,
+            logT=jnp.log10(jnp.maximum(temp, 1e-300)),
+            number_densities_vec=ndens_vec,
+            nu_grid=bf_data.nu_grid,
+            logT_grid=bf_data.logT_grid,
+            log_sigma_stack=bf_data.fast_log_sigma_stack,
+        )
+
+    return jax.vmap(_single_layer, in_axes=(0, 0))(temps, ndens_stack)
 
 
 @jax.jit

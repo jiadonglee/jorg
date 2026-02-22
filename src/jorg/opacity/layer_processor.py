@@ -22,7 +22,12 @@ from ..statmech import (
 )
 # Use Korg.jl-equivalent chemical equilibrium solver
 from ..statmech.korg_chemical_equilibrium import chemical_equilibrium
-from ..continuum.exact_physics_continuum import total_continuum_absorption_exact_physics_only
+from ..continuum.exact_physics_continuum import (
+    ContinuumTableCache,
+    total_continuum_absorption_exact_physics_only,
+    total_continuum_absorption_batch_fast,
+    total_continuum_absorption_fast,
+)
 from ..constants import kboltz_cgs, c_cgs, kboltz_eV
 
 # Constants
@@ -40,7 +45,9 @@ class LayerProcessor:
     def __init__(self, ionization_energies, partition_funcs, log_equilibrium_constants,
                  electron_density_warn_threshold=float('inf'), line_cutoff_threshold=3e-4, verbose=False,
                  warn_on_ne_discrepancy=False, print_ne_comparison=False,
-                 collect_ce_stats=False, use_prev_ne_initial=False):
+                 collect_ce_stats=False, use_prev_ne_initial=False,
+                 continuum_backend="legacy", continuum_cache=None,
+                 enable_batch_continuum=False):
         """
         Initialize layer processor with atomic physics data
 
@@ -69,6 +76,13 @@ class LayerProcessor:
         self.print_ne_comparison = print_ne_comparison
         self.collect_ce_stats = collect_ce_stats
         self.use_prev_ne_initial = use_prev_ne_initial
+        self.continuum_backend = continuum_backend
+        self.enable_batch_continuum = bool(enable_batch_continuum)
+        if self.continuum_backend not in ("legacy", "jax_fast"):
+            raise ValueError("continuum_backend must be one of {'legacy', 'jax_fast'}")
+        if continuum_cache is None and self.continuum_backend == "jax_fast":
+            continuum_cache = ContinuumTableCache(partition_funcs=partition_funcs)
+        self.continuum_cache = continuum_cache
         
         # Statistics tracking
         self.stats = {
@@ -153,6 +167,63 @@ class LayerProcessor:
         all_electron_densities = np.zeros(n_layers)
         
         prev_ne_initial = None
+        continuum_only_mode = (not linelist or len(linelist) == 0) and (not hydrogen_lines)
+        use_batch_continuum = (
+            continuum_only_mode
+            and self.continuum_backend == "jax_fast"
+            and self.enable_batch_continuum
+        )
+
+        if use_batch_continuum:
+            failed_layers = np.zeros(n_layers, dtype=bool)
+            temps = np.asarray(atm["temperature"], dtype=np.float64)
+
+            for layer_idx in range(n_layers):
+                if self.verbose and (layer_idx % 10 == 0 or layer_idx < 5):
+                    progress = (layer_idx + 1) / n_layers * 100
+                    print(f"   Layer {layer_idx+1:2d}/{n_layers:2d} ({progress:5.1f}%)")
+
+                try:
+                    _, layer_number_densities, layer_ne = self._solve_layer_chemistry(
+                        layer_idx=layer_idx,
+                        atm=atm,
+                        abs_abundances=abs_abundances_norm,
+                        use_chemical_equilibrium_from=use_chemical_equilibrium_from,
+                        initial_ne=prev_ne_initial,
+                    )
+                    all_electron_densities[layer_idx] = layer_ne
+
+                    for species, density in layer_number_densities.items():
+                        if species not in all_number_densities:
+                            all_number_densities[species] = np.zeros(n_layers)
+                        all_number_densities[species][layer_idx] = float(density)
+
+                    self.stats['layers_processed'] += 1
+                    if self.use_prev_ne_initial and np.isfinite(layer_ne) and layer_ne > 0.0:
+                        prev_ne_initial = float(layer_ne)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"   ⚠️  Layer {layer_idx+1} failed: {e}")
+                    failed_layers[layer_idx] = True
+                    all_electron_densities[layer_idx] = 1e10
+
+            alpha_matrix = self._calculate_continuum_opacity_batch(
+                wl_array=wl_array,
+                temps=temps,
+                electron_densities=all_electron_densities,
+                number_densities_stacked=all_number_densities,
+                cntm_step=cntm_step,
+                line_buffer=line_buffer,
+            )
+            if np.any(failed_layers):
+                alpha_matrix[failed_layers, :] = 1e-20
+
+            self.stats['total_processing_time'] = time.time() - start_time
+
+            if self.verbose:
+                self._print_processing_summary(alpha_matrix)
+
+            return alpha_matrix, all_number_densities, all_electron_densities
 
         # Process each layer
         for layer_idx in range(n_layers):
@@ -211,6 +282,32 @@ class LayerProcessor:
         4. Calculate line opacity  
         5. Combine total opacity
         """
+        T, layer_number_densities, ne_solution = self._solve_layer_chemistry(
+            layer_idx=layer_idx,
+            atm=atm,
+            abs_abundances=abs_abundances,
+            use_chemical_equilibrium_from=use_chemical_equilibrium_from,
+            initial_ne=initial_ne,
+        )
+
+        # 2. Calculate opacity components
+        layer_opacity = self._calculate_layer_opacity(
+            wl_array, T, ne_solution, layer_number_densities,
+            linelist, line_buffer, hydrogen_lines, vmic, log_g,
+            cntm_step=cntm_step
+        )
+        
+        return layer_opacity, layer_number_densities, ne_solution
+
+    def _solve_layer_chemistry(
+        self,
+        layer_idx,
+        atm,
+        abs_abundances,
+        use_chemical_equilibrium_from,
+        initial_ne=None,
+    ):
+        """Resolve atmospheric state + chemical equilibrium for one layer."""
         # 1. Extract layer atmospheric conditions
         T = float(atm['temperature'][layer_idx])
         P = float(atm['pressure'][layer_idx])
@@ -253,15 +350,7 @@ class LayerProcessor:
                 T, nt, ne_guess, abs_abundances, use_chemical_equilibrium_from, layer_idx,
                 initial_ne=initial_ne
             )
-        
-        # 3. Calculate opacity components
-        layer_opacity = self._calculate_layer_opacity(
-            wl_array, T, ne_solution, layer_number_densities,
-            linelist, line_buffer, hydrogen_lines, vmic, log_g,
-            cntm_step=cntm_step
-        )
-        
-        return layer_opacity, layer_number_densities, ne_solution
+        return T, layer_number_densities, ne_solution
     
     def _calculate_chemical_equilibrium(self, T, nt, ne_guess, abs_abundances,
                                       use_chemical_equilibrium_from, layer_idx,
@@ -489,36 +578,79 @@ class LayerProcessor:
         total_opacity = continuum_opacity + line_opacity
         
         return total_opacity
+
+    def _get_or_build_continuum_grid(self, wl_array, cntm_step, line_buffer):
+        """Return coarse wavelength/frequency grid used by continuum interpolation."""
+        wl_min = float(wl_array[0]) - float(line_buffer)
+        wl_max = float(wl_array[-1]) + float(line_buffer)
+        if wl_max <= wl_min:
+            wl_min = float(wl_array[0])
+            wl_max = float(wl_array[-1])
+
+        cache_key = (
+            float(wl_min),
+            float(wl_max),
+            float(cntm_step),
+            float(wl_array.size),
+        )
+
+        wl_coarse = None
+        frequencies = None
+        if self.continuum_cache is not None:
+            cached = self.continuum_cache.coarse_grid_cache.get(cache_key)
+            if cached is not None:
+                wl_coarse, frequencies = cached
+
+        if wl_coarse is None or frequencies is None:
+            n_steps = int((wl_max - wl_min) / float(cntm_step)) + 1
+            wl_coarse = wl_min + float(cntm_step) * np.arange(n_steps)
+            if wl_coarse[-1] < wl_max:
+                wl_coarse = np.append(wl_coarse, wl_max)
+            frequencies = c_cgs / (wl_coarse * 1e-8)
+            if self.continuum_cache is not None:
+                self.continuum_cache.coarse_grid_cache[cache_key] = (wl_coarse, frequencies)
+
+        return wl_coarse, frequencies
     
     def _calculate_continuum_opacity(self, wl_array, T, ne, number_densities,
                                      cntm_step=1.0, line_buffer=0.0):
         """Calculate continuum opacity using exact physics module"""
         try:
-            wl_array = np.asarray(wl_array)
+            wl_array = np.asarray(wl_array, dtype=np.float64)
+            use_fast_backend = self.continuum_backend == "jax_fast"
+
+            def _compute_continuum(freq_grid):
+                if use_fast_backend:
+                    return total_continuum_absorption_fast(
+                        freq_grid,
+                        T,
+                        ne,
+                        number_densities,
+                        partition_funcs=self.partition_funcs,
+                        continuum_cache=self.continuum_cache,
+                    )
+                return total_continuum_absorption_exact_physics_only(
+                    freq_grid,
+                    T,
+                    ne,
+                    number_densities,
+                    partition_funcs=self.partition_funcs,
+                )
+
             if cntm_step is None or cntm_step <= 0:
                 # Full-resolution continuum (fallback)
                 frequencies = c_cgs / (wl_array * 1e-8)
-                continuum_opacity = total_continuum_absorption_exact_physics_only(
-                    frequencies, T, ne, number_densities, partition_funcs=self.partition_funcs
-                )
+                continuum_opacity = _compute_continuum(frequencies)
                 return np.array(continuum_opacity)
 
             # Korg-style coarse continuum grid with interpolation to output grid
-            wl_min = float(wl_array[0]) - float(line_buffer)
-            wl_max = float(wl_array[-1]) + float(line_buffer)
-            if wl_max <= wl_min:
-                wl_min = float(wl_array[0])
-                wl_max = float(wl_array[-1])
-
-            n_steps = int((wl_max - wl_min) / float(cntm_step)) + 1
-            wl_coarse = wl_min + float(cntm_step) * np.arange(n_steps)
-            if wl_coarse[-1] < wl_max:
-                wl_coarse = np.append(wl_coarse, wl_max)
-
-            frequencies = c_cgs / (wl_coarse * 1e-8)
-            continuum_coarse = total_continuum_absorption_exact_physics_only(
-                frequencies, T, ne, number_densities, partition_funcs=self.partition_funcs
+            wl_coarse, frequencies = self._get_or_build_continuum_grid(
+                wl_array=wl_array,
+                cntm_step=cntm_step,
+                line_buffer=line_buffer,
             )
+
+            continuum_coarse = _compute_continuum(frequencies)
             continuum_coarse = np.asarray(continuum_coarse, dtype=float)
             continuum_full = np.interp(
                 wl_array, wl_coarse, continuum_coarse,
@@ -532,6 +664,117 @@ class LayerProcessor:
             if self.verbose:
                 print(f"     Continuum calculation failed: {e}")
             return np.zeros_like(wl_array)
+
+    def _calculate_continuum_opacity_batch(
+        self,
+        wl_array,
+        temps,
+        electron_densities,
+        number_densities_stacked,
+        cntm_step=1.0,
+        line_buffer=0.0,
+    ):
+        """Batch continuum evaluation used by the continuum-only fast path."""
+        try:
+            wl_array = np.asarray(wl_array, dtype=np.float64)
+            temps = np.asarray(temps, dtype=np.float64)
+            electron_densities = np.asarray(electron_densities, dtype=np.float64)
+            n_layers = len(temps)
+            use_fast_backend = self.continuum_backend == "jax_fast"
+
+            if cntm_step is None or cntm_step <= 0:
+                frequencies = c_cgs / (wl_array * 1e-8)
+                if use_fast_backend:
+                    continuum = total_continuum_absorption_batch_fast(
+                        frequencies=frequencies,
+                        temps=temps,
+                        electron_densities=electron_densities,
+                        number_densities_stacked=number_densities_stacked,
+                        partition_funcs=self.partition_funcs,
+                        continuum_cache=self.continuum_cache,
+                    )
+                    return np.asarray(continuum, dtype=np.float64)
+
+                continuum_full = np.zeros((n_layers, wl_array.size), dtype=np.float64)
+                for i in range(n_layers):
+                    layer_number_densities = {
+                        species: float(densities[i])
+                        for species, densities in number_densities_stacked.items()
+                        if densities[i] > 0.0
+                    }
+                    alpha_i = total_continuum_absorption_exact_physics_only(
+                        frequencies=frequencies,
+                        temperature=temps[i],
+                        electron_density=electron_densities[i],
+                        number_densities=layer_number_densities,
+                        partition_funcs=self.partition_funcs,
+                    )
+                    continuum_full[i, :] = np.asarray(alpha_i, dtype=np.float64)
+                return continuum_full
+
+            wl_coarse, frequencies = self._get_or_build_continuum_grid(
+                wl_array=wl_array,
+                cntm_step=cntm_step,
+                line_buffer=line_buffer,
+            )
+
+            if use_fast_backend:
+                continuum_coarse = total_continuum_absorption_batch_fast(
+                    frequencies=frequencies,
+                    temps=temps,
+                    electron_densities=electron_densities,
+                    number_densities_stacked=number_densities_stacked,
+                    partition_funcs=self.partition_funcs,
+                    continuum_cache=self.continuum_cache,
+                )
+                continuum_coarse = np.asarray(continuum_coarse, dtype=np.float64)
+            else:
+                continuum_coarse = np.zeros((n_layers, wl_coarse.size), dtype=np.float64)
+                for i in range(n_layers):
+                    layer_number_densities = {
+                        species: float(densities[i])
+                        for species, densities in number_densities_stacked.items()
+                        if densities[i] > 0.0
+                    }
+                    alpha_i = total_continuum_absorption_exact_physics_only(
+                        frequencies=frequencies,
+                        temperature=temps[i],
+                        electron_density=electron_densities[i],
+                        number_densities=layer_number_densities,
+                        partition_funcs=self.partition_funcs,
+                    )
+                    continuum_coarse[i, :] = np.asarray(alpha_i, dtype=np.float64)
+
+            idx_hi = np.searchsorted(wl_coarse, wl_array, side="left")
+            idx_hi = np.clip(idx_hi, 1, wl_coarse.size - 1)
+            idx_lo = idx_hi - 1
+            x0 = wl_coarse[idx_lo]
+            x1 = wl_coarse[idx_hi]
+            denom = x1 - x0
+
+            frac = np.zeros_like(wl_array, dtype=np.float64)
+            np.divide(wl_array - x0, denom, out=frac, where=denom > 0.0)
+            frac = np.clip(frac, 0.0, 1.0)
+
+            continuum_full = (
+                continuum_coarse[:, idx_lo] * (1.0 - frac[None, :])
+                + continuum_coarse[:, idx_hi] * frac[None, :]
+            )
+
+            left_mask = wl_array <= wl_coarse[0]
+            right_mask = wl_array >= wl_coarse[-1]
+            if np.any(left_mask):
+                continuum_full[:, left_mask] = continuum_coarse[:, [0]]
+            if np.any(right_mask):
+                continuum_full[:, right_mask] = continuum_coarse[:, [-1]]
+
+            return continuum_full
+
+        except Exception as e:
+            self.stats['continuum_failures'] += 1
+            if self.verbose:
+                print(f"     Batch continuum calculation failed: {e}")
+            return np.zeros((len(temps), len(wl_array)), dtype=np.float64)
     
     def _calculate_line_opacity(self, wl_array, T, ne, number_densities,
                               linelist, line_buffer, hydrogen_lines, vmic, log_g,

@@ -242,6 +242,28 @@ def run_steps(
     collect_ce_stats=False,
     use_prev_ne_initial=False,
 ):
+    params_list = build_spectra_params(n_spec)
+    compile_ref = params_list[0]
+
+    # Cold run metric: includes JAX compile + first execution.
+    t_compile = time.perf_counter()
+    _ = run_jorg_pipeline(
+        compile_ref["Teff"],
+        compile_ref["logg"],
+        compile_ref["m_H"],
+        wl_array,
+        linelist,
+        hydrogen_lines=hydrogen_lines,
+        cntm_step=cntm_step,
+        vmic=vmic,
+        line_buffer=line_buffer,
+        rt_method=rt_method,
+        compute_continuum=False,
+        collect_ce_stats=False,
+        use_prev_ne_initial=use_prev_ne_initial,
+    )
+    compile_time_s = time.perf_counter() - t_compile
+
     if warmup:
         wl_warm = np.linspace(wl_array[0], wl_array[-1], 200)
         _ = run_jorg_pipeline(
@@ -257,7 +279,6 @@ def run_steps(
             use_prev_ne_initial=use_prev_ne_initial,
         )
 
-    params_list = build_spectra_params(n_spec)
     totals = {
         "atmosphere": 0.0,
         "chem_eq_continuum": 0.0,
@@ -299,6 +320,8 @@ def run_steps(
         "n_pix": len(wl_array),
         "n_spec": n_spec,
         "pixels_total": pixels_total,
+        "compile_time_s": float(compile_time_s),
+        "steady_state_s": float(total_time),
         **totals,
         "total": total_time,
         "pixels_per_sec": pixels_total / max(total_time, 1e-12),

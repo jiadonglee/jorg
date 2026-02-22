@@ -7,10 +7,12 @@ van Hoof et al. (2014) for accurate hydrogenic absorption calculations.
 
 import jax.numpy as jnp
 from jax import jit
+from functools import partial
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 from typing import Tuple, Optional
 import os
+
+from .interp_jax import interp2_linear_clamped
 
 # Physical constants (CGS units)
 HPLANCK_CGS = 6.62607015e-27      # erg·s
@@ -217,18 +219,14 @@ class VanHoofGauntFactors:
         self.γ2_min, self.γ2_max = self.log10_γ2[0], self.log10_γ2[-1]
         self.u_min, self.u_max = self.log10_u[0], self.log10_u[-1]
 
-        # Create interpolator
-        self.interpolator = RegularGridInterpolator(
-            (self.log10_u, self.log10_γ2),
-            self.gaunt_table,
-            bounds_error=False,
-            fill_value=None,
-            method='linear'
-        )
-        
         # Store bounds for validation
         self.T_bounds = T_extrema
         self.λ_bounds = λ_extrema
+
+        # Pre-convert to JAX arrays for fast interpolation.
+        self._log10_u_jnp = jnp.asarray(self.log10_u, dtype=jnp.float64)
+        self._log10_γ2_jnp = jnp.asarray(self.log10_γ2, dtype=jnp.float64)
+        self._gaunt_table_jnp = jnp.asarray(self.gaunt_table, dtype=jnp.float64)
     
     def gaunt_ff_vanHoof(self, log_u: float, log_γ2: float) -> float:
         """
@@ -241,20 +239,24 @@ class VanHoofGauntFactors:
         Returns:
             Free-free Gaunt factor
         """
-        log_u_arr = np.asarray(log_u, dtype=float)
-        log_γ2_arr = np.asarray(log_γ2, dtype=float)
-
-        log_u_arr = np.clip(log_u_arr, self.u_min, self.u_max)
-        log_γ2_arr = np.clip(log_γ2_arr, self.γ2_min, self.γ2_max)
-
+        log_u_arr = np.asarray(log_u, dtype=np.float64)
+        log_γ2_arr = np.asarray(log_γ2, dtype=np.float64)
         log_u_arr, log_γ2_arr = np.broadcast_arrays(log_u_arr, log_γ2_arr)
-        points = np.column_stack([log_u_arr.ravel(), log_γ2_arr.ravel()])
-        values = self.interpolator(points)
-        values = values.reshape(log_u_arr.shape)
+
+        values = interp2_linear_clamped(
+            log_u_arr,
+            log_γ2_arr,
+            self._log10_u_jnp,
+            self._log10_γ2_jnp,
+            self._gaunt_table_jnp,
+            x_mode="flat",
+            y_mode="flat",
+        )
+        values = np.asarray(values, dtype=np.float64)
 
         if values.size == 1:
-            return float(values.ravel()[0])
-        return values
+            return float(values.reshape(-1)[0])
+        return values.reshape(log_u_arr.shape)
     
     def hydrogenic_ff_absorption(self, frequency: float, temperature: float, 
                                Z: int, ni: float, ne: float) -> float:
@@ -315,6 +317,22 @@ def gaunt_ff_vanHoof(log_u: float, log_γ2: float) -> float:
     return _VAN_HOOF_GAUNT.gaunt_ff_vanHoof(log_u, log_γ2)
 
 
+@jit
+def gaunt_ff_vanHoof_jax(log_u: jnp.ndarray, log_gamma2: jnp.ndarray) -> jnp.ndarray:
+    """
+    JAX-native thermally-averaged free-free Gaunt factor interpolation.
+    """
+    return interp2_linear_clamped(
+        jnp.asarray(log_u, dtype=jnp.float64),
+        jnp.asarray(log_gamma2, dtype=jnp.float64),
+        _VAN_HOOF_GAUNT._log10_u_jnp,
+        _VAN_HOOF_GAUNT._log10_γ2_jnp,
+        _VAN_HOOF_GAUNT._gaunt_table_jnp,
+        x_mode="flat",
+        y_mode="flat",
+    )
+
+
 def hydrogenic_ff_absorption(frequency: float, temperature: float, 
                            Z: int, ni: float, ne: float) -> float:
     """
@@ -331,6 +349,37 @@ def hydrogenic_ff_absorption(frequency: float, temperature: float,
         Free-free absorption coefficient in cm⁻¹
     """
     return _VAN_HOOF_GAUNT.hydrogenic_ff_absorption(frequency, temperature, Z, ni, ne)
+
+
+@partial(jit, static_argnums=(2,))
+def hydrogenic_ff_absorption_jax(
+    frequency: jnp.ndarray,
+    temperature: jnp.ndarray,
+    Z: int,
+    ni: jnp.ndarray,
+    ne: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    JAX-native hydrogenic free-free absorption coefficient.
+    """
+    freq_arr = jnp.asarray(frequency, dtype=jnp.float64)
+    temp_arr = jnp.asarray(temperature, dtype=jnp.float64)
+    ni_arr = jnp.asarray(ni, dtype=jnp.float64)
+    ne_arr = jnp.asarray(ne, dtype=jnp.float64)
+
+    inv_T = 1.0 / jnp.maximum(temp_arr, 1e-300)
+    z2 = float(Z * Z)
+
+    hnu_div_kT = (HPLANCK_EV / KBOLTZ_EV) * freq_arr * inv_T
+    log_u = jnp.log10(jnp.maximum(hnu_div_kT, 1e-300))
+    log_gamma2 = jnp.log10((RYDBERG_EV / KBOLTZ_EV) * z2 * inv_T)
+
+    gaunt_ff = gaunt_ff_vanHoof_jax(log_u, log_gamma2)
+    freq_safe = jnp.maximum(freq_arr, 1e-300)
+    F_nu = 3.6919e8 * gaunt_ff * z2 * jnp.sqrt(inv_T) / (freq_safe * freq_safe * freq_safe)
+    stim = 1.0 - jnp.exp(-hnu_div_kT)
+
+    return ni_arr * ne_arr * F_nu * stim
 
 
 @jit

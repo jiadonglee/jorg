@@ -9,6 +9,7 @@ and radiative transfer when GPU is available.
 
 ## Installation
 ```bash
+pip install "git+https://github.com/jorg-project/jorg.git@v0.3.1-clean"
 pip install -e .
 pip install -e ".[gpu]"  # CUDA-enabled JAX
 ```
