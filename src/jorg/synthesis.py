@@ -123,6 +123,11 @@ Usage Notes:
 - VALD parsing now fully compatible with Korg.jl including isotopic corrections
 - Air/vacuum wavelength conversion handled automatically based on VALD header
 
+Autodiff Modes:
+- `synthesize(..., engine='legacy')`: default stable compatibility path
+- `synthesize(..., engine='jax')`: differentiable state pipeline
+- `synthesize_jax(..., autodiff_strict=True, line_backend='jax')`: strict autodiff mode
+
 PRODUCTION STATUS (December 2025): ✅ FULLY OPERATIONAL - COMPLETE KORG.JL PARITY
 - **LINE PARSING BREAKTHROUGH**: 19,257 lines parsed vs Korg.jl's 19,236 (99.9% compatibility)
 - **ALL SPECIES INCLUDED**: Molecular lines, rare earth elements, heavy elements restored
@@ -215,6 +220,7 @@ from .constants import kboltz_cgs, c_cgs, hplanck_cgs
 from .opacity.layer_processor import LayerProcessor
 # Import KorgLineProcessor - the complete solution to line opacity discrepancy (December 2024)
 from .opacity.korg_line_processor import KorgLineProcessor
+from .opacity.line_opacity_jax import compute_line_opacity_jax
 
 # Constants matching Korg.jl exactly
 MAX_ATOMIC_NUMBER = 92
@@ -982,11 +988,19 @@ def synthesize_jax(
     rectify: bool = False,
     rectify_mode: str = "continuum",
     rectify_percentile: float = 99.5,
+    autodiff_strict: bool = False,
+    line_backend: str = "jax",
+    line_loggf_deltas: Optional[Union[np.ndarray, jnp.ndarray]] = None,
     verbose: bool = False,
     **_: Any,
 ) -> SynthesisStateJax:
     """
     Pure-JAX synthesis entrypoint returning the full differentiable state.
+
+    Parameters specific to autodiff behavior:
+    - autodiff_strict: if True, reject non-differentiable line backends.
+    - line_backend: "jax" (default, autodiff path) or "numpy" (legacy compatibility).
+    - line_loggf_deltas: optional per-line log(gf) delta vector for JAX backend.
     """
     if rectify_mode not in ("continuum", "pseudo"):
         raise ValueError(f"rectify_mode must be 'continuum' or 'pseudo', got {rectify_mode!r}")
@@ -995,12 +1009,54 @@ def synthesize_jax(
     A_X_arr = jnp.asarray(A_X, dtype=jnp.float64)
     if A_X_arr.ndim != 1 or A_X_arr.shape[0] != MAX_ATOMIC_NUMBER:
         raise ValueError(f"A_X must be a length-{MAX_ATOMIC_NUMBER} vector.")
-    if not isinstance(A_X_arr, jax.core.Tracer):
-        if float(np.asarray(A_X_arr[0])) != 12.0:
-            raise ValueError(f"A_X must satisfy A_X[0] == 12 (got {float(np.asarray(A_X_arr[0]))}).")
+    # Only validate A_X[0] when it is concretely available.
+    # In jitted/autodiff traces A_X elements can be tracers, and forcing
+    # host conversion here would break compilation.
+    a0_concrete = None
+    try:
+        a0_concrete = float(np.asarray(jax.device_get(A_X_arr[0])))
+    except Exception:
+        a0_concrete = None
+    if a0_concrete is not None and a0_concrete != 12.0:
+        raise ValueError(f"A_X must satisfy A_X[0] == 12 (got {a0_concrete}).")
 
     if isinstance(linelist, str):
         linelist = read_linelist(linelist, format="auto")
+    if line_backend not in ("numpy", "jax"):
+        raise ValueError(f"line_backend must be 'numpy' or 'jax', got {line_backend!r}.")
+
+    line_count = 0 if linelist is None else len(linelist)
+    line_loggf_deltas_arr = None
+    if line_loggf_deltas is not None:
+        if line_backend != "jax":
+            raise ValueError("line_loggf_deltas requires line_backend='jax'.")
+        line_loggf_deltas_arr = jnp.asarray(line_loggf_deltas, dtype=jnp.float64)
+        if line_loggf_deltas_arr.ndim != 1:
+            raise ValueError("line_loggf_deltas must be a 1-D array when provided.")
+        if line_loggf_deltas_arr.shape[0] != line_count:
+            raise ValueError(
+                "line_loggf_deltas length must match linelist length "
+                f"(got {line_loggf_deltas_arr.shape[0]}, expected {line_count})."
+            )
+
+    if autodiff_strict and line_count and line_backend != "jax":
+        raise ValueError(
+            "autodiff_strict=True requires line_backend='jax' when linelist is non-empty."
+        )
+
+    global _NUMPY_LINE_BACKEND_WARNING_EMITTED
+    if (
+        line_count
+        and line_backend == "numpy"
+        and not autodiff_strict
+        and not _NUMPY_LINE_BACKEND_WARNING_EMITTED
+    ):
+        warnings.warn(
+            "synthesize_jax with non-empty linelist and line_backend='numpy' is not fully "
+            "autodiff-safe. Set line_backend='jax' or autodiff_strict=True for strict mode.",
+            RuntimeWarning,
+        )
+        _NUMPY_LINE_BACKEND_WARNING_EMITTED = True
 
     wl_array = _build_wavelength_grid(wavelengths)
     atm_dict = _coerce_atmosphere_dict(atm)
@@ -1060,8 +1116,22 @@ def synthesize_jax(
         species_layout=continuum_layout,
     )
 
-    if linelist is None or len(linelist) == 0:
+    if line_count == 0:
         line_opacity = jnp.zeros_like(alpha_continuum)
+    elif line_backend == "jax":
+        line_opacity = compute_line_opacity_jax(
+            wl_array=jnp.asarray(wl_array, dtype=jnp.float64),
+            temps=jnp.asarray(temps, dtype=jnp.float64),
+            electron_densities=jnp.asarray(ne_layers, dtype=jnp.float64),
+            number_density_dense=jnp.asarray(number_density_dense, dtype=jnp.float64),
+            species_layout=species_layout,
+            partition_funcs=partition_funcs,
+            linelist=linelist,
+            microturbulence_kms=vmic,
+            continuum_opacity=jnp.asarray(alpha_continuum, dtype=jnp.float64),
+            line_loggf_deltas=line_loggf_deltas_arr,
+            cutoff_threshold=line_cutoff_threshold,
+        )
     else:
         # Dense line path: pass dense views + layout directly to avoid per-species copying.
         line_opacity_np = _calculate_line_opacity_multilayer(
@@ -1160,6 +1230,7 @@ def _normalize_rectified_flux(flux: np.ndarray, percentile: float = 99.5, min_sc
 _LINE_WINDOW_CACHE = OrderedDict()
 _LINE_WINDOW_CACHE_MAX = 64
 _KORG_LINE_PROCESSOR = None
+_NUMPY_LINE_BACKEND_WARNING_EMITTED = False
 
 
 def _get_relevant_lines_cached(linelist, wl_min_cm: float, wl_max_cm: float):
@@ -1816,6 +1887,8 @@ def synthesize(
         )
 
     legacy_kwargs = dict(kwargs)
+    for key in ("autodiff_strict", "line_backend", "line_loggf_deltas"):
+        legacy_kwargs.pop(key, None)
     explicit_ce_source = legacy_kwargs.get("use_chemical_equilibrium_from")
     if ce_solver == "pinn" and explicit_ce_source is None:
         try:

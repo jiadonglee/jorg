@@ -86,6 +86,17 @@ if `JORG_DATA_DIR` is not set.
 - `synthesize(atm, linelist, A_X, ...)` returns `SynthesisResult` with diagnostics
 - `interpolate_atmosphere(...)` and `format_abundances(...)` are available in `jorg.synthesis`
 
+## Autodiff modes
+- `synthesize(..., engine="legacy")` remains the default stable path.
+- `synthesize(..., engine="jax")` uses the differentiable JAX pipeline.
+- `synthesize_jax(..., autodiff_strict=True)` enforces strict autodiff behavior:
+  - with non-empty `linelist`, `line_backend` must be `"jax"`.
+  - `line_backend="numpy"` is legacy compatibility mode and not fully autodiff-safe.
+- `line_backend` default is `"jax"` for full line-opacity autodiff in JAX engine.
+- `line_loggf_deltas` (JAX backend only) enables direct differentiation wrt line `log_gf`:
+  - shape must match input `linelist` length and index order.
+  - filtered/invalid lines are ignored in opacity accumulation, so their effective gradient is zero.
+
 ## Requirements
 - Python >= 3.8
 - JAX >= 0.4
