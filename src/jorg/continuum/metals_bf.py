@@ -22,6 +22,11 @@ _HE_I_SPECIES = Species.from_string("He I")
 _H_II_SPECIES = Species.from_string("H II")
 _METAL_BF_SKIP_SPECIES = frozenset({_H_I_SPECIES, _HE_I_SPECIES, _H_II_SPECIES})
 
+# Cross-section tables contain -inf sentinels for effectively zero opacity.
+# Interpolating across those entries can yield NaN gradients; clamp to a
+# finite floor that still underflows to zero after exp().
+_LOG_SIGMA_FLOOR = -745.0
+
 
 class MetalBoundFreeData:
     """
@@ -87,6 +92,11 @@ class MetalBoundFreeData:
                     # HDF5 stores as (n_temp, n_freq) in Python but (n_freq, n_temp) in Julia
                     # We need to transpose to get (n_freq, n_temp) = (60185, 31)
                     log_sigma_data = np.array(cs_group[species_name], dtype=np.float64).T
+                    log_sigma_data = np.where(
+                        np.isfinite(log_sigma_data),
+                        log_sigma_data,
+                        _LOG_SIGMA_FLOOR,
+                    )
                     
                     # Store as JAX arrays for efficient computation
                     self.cross_sections[species] = jnp.array(log_sigma_data)
@@ -117,6 +127,12 @@ class MetalBoundFreeData:
 
 # Global data instance (loaded once)
 _metal_bf_data = None
+
+
+def clear_metal_bf_cache() -> None:
+    """Clear global metal bound-free data cache."""
+    global _metal_bf_data
+    _metal_bf_data = None
 
 
 def get_metal_bf_data(data_file: Optional[str] = None) -> MetalBoundFreeData:
@@ -232,9 +248,11 @@ def _metal_bf_absorption_stacked(
         log_sigma_interp = _interpolate_metal_cross_section_vectorized(
             frequencies, logT, nu_grid, logT_grid, log_sigma_data
         )
-        mask = jnp.isfinite(log_sigma_interp)
+        safe_log_sigma = jnp.where(
+            jnp.isfinite(log_sigma_interp), log_sigma_interp, _LOG_SIGMA_FLOOR
+        )
         safe_n = jnp.maximum(number_density, 1e-300)
-        alpha = jnp.where(mask, jnp.exp(jnp.log(safe_n) + log_sigma_interp) * 1e-18, 0.0)
+        alpha = jnp.exp(jnp.log(safe_n) + safe_log_sigma) * 1e-18
         return jnp.where(number_density > 0.0, alpha, 0.0)
 
     alpha_by_species = jax.vmap(_single_species, in_axes=(0, 0))(number_densities_vec, log_sigma_stack)
@@ -321,22 +339,13 @@ def metal_bf_absorption(frequencies: jnp.ndarray,
             freqs, logT, bf_data.nu_grid, bf_data.logT_grid, log_sigma_data
         )
         
-        # Apply mask to avoid NaNs in derivatives (exact match to Korg.jl logic)
-        # When σ = 0, log(σ) = -∞, which causes issues
-        mask = jnp.isfinite(log_sigma_interp)
-        
         # Calculate absorption exactly as in Korg.jl: α = exp(log(n) + log_σ) * 1e-18
         # log_sigma_interp is ln(σ in Mb), not log10 - this is the key insight!
-        ln_sigma_mb = log_sigma_interp  # Data is already in natural log
-        ln_n = jnp.log(number_density)
-        
-        # Add contribution (using mask to avoid NaN propagation)
-        # This exactly matches Korg.jl: exp(log(n) + log_σ) * 1e-18
-        alpha_contribution = jnp.where(
-            mask,
-            jnp.exp(ln_n + ln_sigma_mb) * 1e-18,  # Convert Mb to cm^2
-            0.0
+        ln_sigma_mb = jnp.where(
+            jnp.isfinite(log_sigma_interp), log_sigma_interp, _LOG_SIGMA_FLOOR
         )
+        ln_n = jnp.log(number_density)
+        alpha_contribution = jnp.exp(ln_n + ln_sigma_mb) * 1e-18
         
         alpha_total += alpha_contribution
     
@@ -457,15 +466,12 @@ def _compute_single_species_absorption(frequencies: jnp.ndarray,
         frequencies, logT, nu_grid, logT_grid, log_sigma_data
     )
     
-    # Apply mask for finite values
-    mask = jnp.isfinite(log_sigma_interp)
-    
     # Calculate absorption exactly as in Korg.jl: α = exp(log(n) + log_σ) * 1e-18
-    ln_sigma_mb = log_sigma_interp  # Data is already in natural log
+    ln_sigma_mb = jnp.where(
+        jnp.isfinite(log_sigma_interp), log_sigma_interp, _LOG_SIGMA_FLOOR
+    )
     ln_n = jnp.log(number_density)
-    
-    # Calculate absorption with masking
-    return jnp.where(mask, jnp.exp(ln_n + ln_sigma_mb) * 1e-18, 0.0)
+    return jnp.exp(ln_n + ln_sigma_mb) * 1e-18
 
 
 def validate_metal_bf_implementation():

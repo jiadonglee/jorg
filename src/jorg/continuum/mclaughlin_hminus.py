@@ -24,13 +24,24 @@ from ..data import get_data_path
 _H_MINUS_ION_ENERGY_EV = 0.754204  # eV, McLaughlin+ 2017 value
 _H_MINUS_ION_NU = _H_MINUS_ION_ENERGY_EV / hplanck_eV  # Hz
 
-# Global variables for McLaughlin data
-_mclaughlin_frequencies = None
-_mclaughlin_cross_sections = None
+# Global host-only cache for McLaughlin data.
+# Keep this NumPy-only so traced JAX values cannot leak into module globals.
+_mclaughlin_frequencies_np = None
+_mclaughlin_cross_sections_np = None
 _min_interp_nu = None
 _low_nu_coefficient = None
 
-def _load_mclaughlin_data() -> Tuple[jnp.ndarray, jnp.ndarray, float, float]:
+def clear_mclaughlin_cache() -> None:
+    """Clear cached McLaughlin host data."""
+    global _mclaughlin_frequencies_np, _mclaughlin_cross_sections_np
+    global _min_interp_nu, _low_nu_coefficient
+    _mclaughlin_frequencies_np = None
+    _mclaughlin_cross_sections_np = None
+    _min_interp_nu = None
+    _low_nu_coefficient = None
+
+
+def _load_mclaughlin_data() -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
     Load McLaughlin+ 2017 H^- cross-section data from Korg's HDF5 file
     
@@ -45,10 +56,10 @@ def _load_mclaughlin_data() -> Tuple[jnp.ndarray, jnp.ndarray, float, float]:
     low_nu_coefficient : float
         Low-frequency extrapolation coefficient
     """
-    global _mclaughlin_frequencies, _mclaughlin_cross_sections, _min_interp_nu, _low_nu_coefficient
-    
-    if _mclaughlin_frequencies is not None:
-        return _mclaughlin_frequencies, _mclaughlin_cross_sections, _min_interp_nu, _low_nu_coefficient
+    global _mclaughlin_frequencies_np, _mclaughlin_cross_sections_np, _min_interp_nu, _low_nu_coefficient
+
+    if _mclaughlin_frequencies_np is not None:
+        return _mclaughlin_frequencies_np, _mclaughlin_cross_sections_np, _min_interp_nu, _low_nu_coefficient
     
     try:
         korg_data_path = get_data_path("McLaughlin2017Hminusbf.h5")
@@ -63,8 +74,10 @@ def _load_mclaughlin_data() -> Tuple[jnp.ndarray, jnp.ndarray, float, float]:
         cross_sections = f['sigma'][:]
     
     # Convert to JAX arrays
-    _mclaughlin_frequencies = jnp.array(frequencies)
-    _mclaughlin_cross_sections = jnp.array(cross_sections)
+    _mclaughlin_frequencies_np = np.ascontiguousarray(frequencies, dtype=np.float64)
+    _mclaughlin_cross_sections_np = np.ascontiguousarray(cross_sections, dtype=np.float64)
+    _mclaughlin_frequencies_np.setflags(write=False)
+    _mclaughlin_cross_sections_np.setflags(write=False)
     
     # Find minimum interpolation frequency (first frequency in table)
     _min_interp_nu = float(frequencies[0])
@@ -76,7 +89,7 @@ def _load_mclaughlin_data() -> Tuple[jnp.ndarray, jnp.ndarray, float, float]:
     freq_diff = _min_interp_nu - _H_MINUS_ION_NU
     _low_nu_coefficient = sigma_at_min / (freq_diff ** 1.5)
     
-    return _mclaughlin_frequencies, _mclaughlin_cross_sections, _min_interp_nu, _low_nu_coefficient
+    return _mclaughlin_frequencies_np, _mclaughlin_cross_sections_np, _min_interp_nu, _low_nu_coefficient
 
 
 def mclaughlin_hminus_bf_cross_section(frequencies: jnp.ndarray) -> jnp.ndarray:
@@ -99,7 +112,9 @@ def mclaughlin_hminus_bf_cross_section(frequencies: jnp.ndarray) -> jnp.ndarray:
         H^- bound-free cross-sections in cm^2
     """
     # Load McLaughlin data
-    mclaughlin_freq, mclaughlin_sigma, min_interp_nu, low_nu_coeff = _load_mclaughlin_data()
+    mclaughlin_freq_np, mclaughlin_sigma_np, min_interp_nu, low_nu_coeff = _load_mclaughlin_data()
+    mclaughlin_freq = jnp.asarray(mclaughlin_freq_np, dtype=jnp.float64)
+    mclaughlin_sigma = jnp.asarray(mclaughlin_sigma_np, dtype=jnp.float64)
     
     # Initialize result array
     result = jnp.zeros_like(frequencies, dtype=jnp.float64)

@@ -235,28 +235,10 @@ class Stancil1994Data:
         self.σ_H2plus_ff_table *= 1e-39   # Convert to cm⁻⁵ from table units
         self.σ_H2plus_bf_table *= 1e-18   # Convert to cm⁻⁵ from table units
         
-        # Create interpolators
-        self._create_interpolators()
-    
-    def _create_interpolators(self):
-        """
-        Prepare JAX interpolation tables.
-
-        Korg uses linear extrapolation (`Line`) for Stancil tables and
-        equilibrium constants; we match that behavior via `interp_jax`.
-        """
-        self._λs_He2plus_ff_jnp = jnp.asarray(self.λs_He2plus_ff, dtype=jnp.float64)
-        self._λs_H2plus_ff_jnp = jnp.asarray(self.λs_H2plus_ff, dtype=jnp.float64)
-        self._λs_bf_jnp = jnp.asarray(self.λs_bf, dtype=jnp.float64)
-        self._Ts_He2plus_jnp = jnp.asarray(self.Ts_He2plus, dtype=jnp.float64)
-        self._Ts_H2plus_jnp = jnp.asarray(self.Ts_H2plus, dtype=jnp.float64)
-
-        self._σ_He2plus_ff_table_jnp = jnp.asarray(self.σ_He2plus_ff_table, dtype=jnp.float64)
-        self._σ_He2plus_bf_table_jnp = jnp.asarray(self.σ_He2plus_bf_table, dtype=jnp.float64)
-        self._σ_H2plus_ff_table_jnp = jnp.asarray(self.σ_H2plus_ff_table, dtype=jnp.float64)
-        self._σ_H2plus_bf_table_jnp = jnp.asarray(self.σ_H2plus_bf_table, dtype=jnp.float64)
-        self._K_He2plus_vals_jnp = jnp.asarray(self.K_He2plus_vals, dtype=jnp.float64)
-        self._K_H2plus_vals_jnp = jnp.asarray(self.K_H2plus_vals, dtype=jnp.float64)
+    @staticmethod
+    def _to_jax(values: np.ndarray) -> jnp.ndarray:
+        """Convert host table to JAX array locally to avoid tracer leaks in globals."""
+        return jnp.asarray(values, dtype=jnp.float64)
 
     def _interp_cross_section_line(
         self,
@@ -289,9 +271,9 @@ class Stancil1994Data:
         result = self._interp_cross_section_line(
             jnp.asarray(wavelength, dtype=jnp.float64),
             jnp.asarray(temperature, dtype=jnp.float64),
-            self._λs_He2plus_ff_jnp,
-            self._Ts_He2plus_jnp,
-            self._σ_He2plus_ff_table_jnp,
+            self._to_jax(self.λs_He2plus_ff),
+            self._to_jax(self.Ts_He2plus),
+            self._to_jax(self.σ_He2plus_ff_table),
         )
         return float(result) if np.ndim(result) == 0 else np.asarray(result)
     
@@ -309,9 +291,9 @@ class Stancil1994Data:
         result = self._interp_cross_section_line(
             jnp.asarray(wavelength, dtype=jnp.float64),
             jnp.asarray(temperature, dtype=jnp.float64),
-            self._λs_bf_jnp,
-            self._Ts_He2plus_jnp,
-            self._σ_He2plus_bf_table_jnp,
+            self._to_jax(self.λs_bf),
+            self._to_jax(self.Ts_He2plus),
+            self._to_jax(self.σ_He2plus_bf_table),
         )
         return float(result) if np.ndim(result) == 0 else np.asarray(result)
     
@@ -329,9 +311,9 @@ class Stancil1994Data:
         result = self._interp_cross_section_line(
             jnp.asarray(wavelength, dtype=jnp.float64),
             jnp.asarray(temperature, dtype=jnp.float64),
-            self._λs_H2plus_ff_jnp,
-            self._Ts_H2plus_jnp,
-            self._σ_H2plus_ff_table_jnp,
+            self._to_jax(self.λs_H2plus_ff),
+            self._to_jax(self.Ts_H2plus),
+            self._to_jax(self.σ_H2plus_ff_table),
         )
         return float(result) if np.ndim(result) == 0 else np.asarray(result)
     
@@ -349,9 +331,9 @@ class Stancil1994Data:
         result = self._interp_cross_section_line(
             jnp.asarray(wavelength, dtype=jnp.float64),
             jnp.asarray(temperature, dtype=jnp.float64),
-            self._λs_bf_jnp,
-            self._Ts_H2plus_jnp,
-            self._σ_H2plus_bf_table_jnp,
+            self._to_jax(self.λs_bf),
+            self._to_jax(self.Ts_H2plus),
+            self._to_jax(self.σ_H2plus_bf_table),
         )
         return float(result) if np.ndim(result) == 0 else np.asarray(result)
 
@@ -365,10 +347,14 @@ class Stancil1994Data:
         wl = jnp.asarray(wavelengths, dtype=jnp.float64)
         t = jnp.asarray(temperature, dtype=jnp.float64)
         sigma_bf = self._interp_cross_section_line(
-            wl, t, self._λs_bf_jnp, self._Ts_H2plus_jnp, self._σ_H2plus_bf_table_jnp
+            wl, t, self._to_jax(self.λs_bf), self._to_jax(self.Ts_H2plus), self._to_jax(self.σ_H2plus_bf_table)
         )
         sigma_ff = self._interp_cross_section_line(
-            wl, t, self._λs_H2plus_ff_jnp, self._Ts_H2plus_jnp, self._σ_H2plus_ff_table_jnp
+            wl,
+            t,
+            self._to_jax(self.λs_H2plus_ff),
+            self._to_jax(self.Ts_H2plus),
+            self._to_jax(self.σ_H2plus_ff_table),
         )
         return sigma_bf, sigma_ff
     
@@ -384,8 +370,8 @@ class Stancil1994Data:
         """
         result = interp1_linear_clamped(
             jnp.asarray(temperature, dtype=jnp.float64),
-            self._Ts_He2plus_jnp,
-            self._K_He2plus_vals_jnp,
+            self._to_jax(self.Ts_He2plus),
+            self._to_jax(self.K_He2plus_vals),
             mode="line",
         )
         if np.isscalar(temperature):
@@ -404,8 +390,8 @@ class Stancil1994Data:
         """
         result = interp1_linear_clamped(
             jnp.asarray(temperature, dtype=jnp.float64),
-            self._Ts_H2plus_jnp,
-            self._K_H2plus_vals_jnp,
+            self._to_jax(self.Ts_H2plus),
+            self._to_jax(self.K_H2plus_vals),
             mode="line",
         )
         if np.isscalar(temperature):
@@ -415,6 +401,12 @@ class Stancil1994Data:
 
 # Global instance
 _STANCIL_DATA = Stancil1994Data()
+
+
+def clear_stancil_cache() -> None:
+    """Reset global Stancil data container."""
+    global _STANCIL_DATA
+    _STANCIL_DATA = Stancil1994Data()
 
 
 def get_he2plus_ff_cross_section(wavelength: float, temperature: float) -> float:

@@ -32,7 +32,17 @@ _energy_grids = None
 _cross_section_grids = None
 _n_levels = None
 
-def _load_nahar_h_i_data() -> Tuple[Dict, Dict, jnp.ndarray]:
+
+def clear_nahar_h_i_cache() -> None:
+    """Clear cached Nahar H I host tables."""
+    global _nahar_h_i_data, _energy_grids, _cross_section_grids, _n_levels
+    _nahar_h_i_data = None
+    _energy_grids = None
+    _cross_section_grids = None
+    _n_levels = None
+
+
+def _load_nahar_h_i_data() -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], np.ndarray]:
     """
     Load Nahar 2021 H I bound-free data from Korg's HDF5 file
     
@@ -42,7 +52,7 @@ def _load_nahar_h_i_data() -> Tuple[Dict, Dict, jnp.ndarray]:
         Dictionary mapping n level to energy grid in eV
     cross_section_grids : Dict
         Dictionary mapping n level to cross-section grid in Mb
-    n_levels : jnp.ndarray
+    n_levels : np.ndarray
         Array of principal quantum numbers available
     """
     global _nahar_h_i_data, _energy_grids, _cross_section_grids, _n_levels
@@ -74,11 +84,14 @@ def _load_nahar_h_i_data() -> Tuple[Dict, Dict, jnp.ndarray]:
         energy_grid = energies[i, :]  # All 1000 energy points for this n level
         sigma_grid = cross_sections[i, :]  # All 1000 cross-section points for this n level
         
-        # Convert to JAX arrays
-        _energy_grids[int(n)] = jnp.array(energy_grid, dtype=jnp.float64)
-        _cross_section_grids[int(n)] = jnp.array(sigma_grid, dtype=jnp.float64)
-    
-    _n_levels = jnp.array(n_values, dtype=jnp.int32)
+        # Keep caches as host NumPy arrays so traced values cannot leak.
+        _energy_grids[int(n)] = np.ascontiguousarray(energy_grid, dtype=np.float64)
+        _cross_section_grids[int(n)] = np.ascontiguousarray(sigma_grid, dtype=np.float64)
+        _energy_grids[int(n)].setflags(write=False)
+        _cross_section_grids[int(n)].setflags(write=False)
+
+    _n_levels = np.ascontiguousarray(n_values, dtype=np.int32)
+    _n_levels.setflags(write=False)
     _nahar_h_i_data = True
     
     return _energy_grids, _cross_section_grids, _n_levels
@@ -155,8 +168,8 @@ def nahar_h_i_bf_cross_section(
     photon_energies = hplanck_eV * frequencies  # eV
     
     # Get data for this n level
-    energy_grid = energy_grids[n_level]
-    sigma_grid = sigma_grids[n_level]
+    energy_grid = jnp.asarray(energy_grids[n_level], dtype=jnp.float64)
+    sigma_grid = jnp.asarray(sigma_grids[n_level], dtype=jnp.float64)
     
     # Vectorized interpolation
     def interpolate_single(energy):

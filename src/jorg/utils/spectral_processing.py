@@ -28,21 +28,22 @@ def _simple_gaussian_filter(flux: jnp.ndarray, sigma: float) -> jnp.ndarray:
     jnp.ndarray
         Convolved flux
     """
-    if sigma <= 0.1:
-        return flux
-    
-    # Create Gaussian kernel
-    kernel_size = int(6 * sigma) + 1  # Ensure odd size
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    
-    half_size = kernel_size // 2
-    x = jnp.arange(-half_size, half_size + 1)
-    kernel = jnp.exp(-0.5 * (x / sigma)**2)
-    kernel = kernel / jnp.sum(kernel)  # Normalize
-    
-    # Apply convolution using jax.scipy.signal.convolve
-    return jax.scipy.signal.convolve(flux, kernel, mode='same')
+    sigma_arr = jnp.asarray(sigma, dtype=flux.dtype)
+    sigma_safe = jnp.maximum(sigma_arr, jnp.asarray(1e-3, dtype=flux.dtype))
+
+    # Keep kernel extent static for JIT/autodiff safety.
+    kernel_radius = 32
+    x = jnp.arange(-kernel_radius, kernel_radius + 1, dtype=flux.dtype)
+    kernel = jnp.exp(-0.5 * (x / sigma_safe) ** 2)
+    kernel = kernel / jnp.maximum(jnp.sum(kernel), jnp.asarray(1e-30, dtype=flux.dtype))
+
+    convolved = jax.scipy.signal.convolve(flux, kernel, mode='same')
+    return jax.lax.cond(
+        sigma_arr <= jnp.asarray(0.1, dtype=flux.dtype),
+        lambda _: flux,
+        lambda _: convolved,
+        operand=None,
+    )
 
 
 @jit

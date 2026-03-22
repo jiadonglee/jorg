@@ -63,6 +63,7 @@ from .stellar_parameters import (
     PARAMETER_ORDER,
     StellarParameters,
     StellarFitResult,
+    fit_stellar_parameters_autodiff,
     fit_stellar_parameters,
 )
 
@@ -92,6 +93,15 @@ from .loggf_fitter import (
     FitResult as LogGFFitResult,
 )
 
+# Joint loggf + stellar-parameter alternating fitting
+from .joint_loggf_stellar import (
+    JointFitConfig,
+    JointStarState,
+    JointLineState,
+    JointFitResult as JointLogGFStellarFitResult,
+    fit_joint_loggf_stellar_parameters,
+)
+
 __all__ = [
     # Core fitting
     'fit_spectrum',
@@ -104,6 +114,7 @@ __all__ = [
     'PARAMETER_ORDER',
     'StellarParameters',
     'StellarFitResult',
+    'fit_stellar_parameters_autodiff',
     'fit_stellar_parameters',
 
     # Equivalent width calculation (NEW)
@@ -125,6 +136,13 @@ __all__ = [
     'LogGFFitter',
     'fit_loggf_quick',
     'LogGFFitResult',
+
+    # Joint loggf + stellar fitting
+    'JointFitConfig',
+    'JointStarState',
+    'JointLineState',
+    'JointLogGFStellarFitResult',
+    'fit_joint_loggf_stellar_parameters',
 ]
 
 # Module metadata

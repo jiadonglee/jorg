@@ -19,12 +19,11 @@ pip install -e .
 pip install -e ".[gpu]"  # optional CUDA support
 ```
 
-By default, legacy synthesis will try a PINN chemical-equilibrium checkpoint first.
-Checkpoint lookup priority:
-1. `ce_pinn_checkpoint=...` argument
-2. `JORG_PINN_CKPT` environment variable
-3. default model paths under `data/models/`
-If none is found, synthesis automatically falls back to the JAX engine.
+By default, synthesis now uses the JAX engine with strict autodiff settings.
+Legacy PINN-based CE remains available only when you explicitly select:
+- `engine="legacy"`
+- `ce_solver="pinn"`
+- optional `ce_pinn_checkpoint=...` / `JORG_PINN_CKPT`
 
 ## Quick start
 ```python
@@ -46,19 +45,25 @@ Jorg includes a direct-fitting pipeline for:
 - `[alpha/Fe]`
 
 ```python
-from jorg.fit import fit_stellar_parameters
+from jorg.fit import fit_stellar_parameters_autodiff
 from jorg.lines import get_VALD_solar_linelist
 
-result = fit_stellar_parameters(
+result = fit_stellar_parameters_autodiff(
     obs_wavelengths=obs_wave,
     obs_flux=obs_flux,
-    obs_error=obs_err,              # optional; auto-estimated if omitted
+    obs_error=obs_err,
     linelist=get_VALD_solar_linelist(),
-    initial_guess={"Teff": 5600, "logg": 4.3, "m_h": -0.2, "alpha_fe": 0.1},
+    initial_guess={"Teff": 5600.0, "logg": 4.3, "m_h": -0.2, "alpha_fe": 0.1},
+    bounds={
+        "Teff": (4800.0, 6500.0),
+        "logg": (3.5, 5.0),
+        "m_h": (-1.5, 0.5),
+        "alpha_fe": (-0.2, 0.6),
+    },
     windows=[(5166.0, 5190.0), (5205.0, 5240.0)],
     R=50_000,
-    optimizer="jax_surrogate",      # JAX-accelerated local surrogate optimizer
-    compute_uncertainties=False,    # set True only when covariance is needed
+    execution_profile="interactive",
+    compute_uncertainties=False,
 )
 
 print(result.summary())
@@ -67,6 +72,20 @@ print(result.summary())
 Notes:
 - Internally, `[alpha/Fe]` is converted to `alpha_H = [M/H] + [alpha/Fe]`.
 - The fitter uses Korg-style parameter scaling, weak regularization, and window-level continuum adjustment.
+- `fit_stellar_parameters_autodiff(...)` fixes `optimizer="jax_value_and_grad"` and
+  injects the strict JAX defaults required by the full autodiff path.
+- `execution_profile="interactive"` is now the default:
+  - `"debug"` keeps atmosphere/objective/solver JIT off for tracing and diagnostics.
+  - `"interactive"` requests atmosphere/objective JIT with solver JIT off.
+  - `"batch"` requests atmosphere/objective/solver JIT for repeated same-shape fits.
+  - In the current physical `jax_value_and_grad` path, objective/solver JIT are still
+    disabled at runtime because nested tracing through atmosphere/CE caches is not yet
+    tracer-safe; atmosphere interpolation JIT still applies.
+- In the autodiff fit path, JAX line synthesis now prefilters the linelist to the active
+  fitting wavelength span plus `line_buffer`, so small windows no longer scan the full line table.
+- If you need the lower-level API, call `fit_stellar_parameters(..., optimizer="jax_value_and_grad")`
+  and ensure `model_context["synth_kwargs"]["synthesize_kwargs"]` includes:
+  `line_backend="jax"`, `autodiff_strict=True`, and `ce_jit=True`.
 
 ## Data files
 Jorg relies on external data (linelists, partition functions, opacity tables, MARCS grids).
@@ -87,11 +106,15 @@ if `JORG_DATA_DIR` is not set.
 - `interpolate_atmosphere(...)` and `format_abundances(...)` are available in `jorg.synthesis`
 
 ## Autodiff modes
-- `synthesize(..., engine="legacy")` remains the default stable path.
-- `synthesize(..., engine="jax")` uses the differentiable JAX pipeline.
-- `synthesize_jax(..., autodiff_strict=True)` enforces strict autodiff behavior:
-  - with non-empty `linelist`, `line_backend` must be `"jax"`.
-  - `line_backend="numpy"` is legacy compatibility mode and not fully autodiff-safe.
+- Default path: `synthesize(...)`, `synthesize_spectrum(...)`, and `synth(...)` run with
+  `engine="jax"` and `ce_solver="jax"`.
+- `synthesize(..., engine="legacy")` is still supported, but must be explicit.
+- `synthesize_jax(..., autodiff_strict=True)` is now the default strict mode:
+  - with non-empty `linelist`, `line_backend` must be `"jax"`;
+  - `ce_jit` must be `True` (strict mode rejects `ce_jit=False`);
+  - `ce_warm_start` defaults to `False` to avoid layer-to-layer solver drift and
+    keep Jorg/Korg agreement stable (you can set `ce_warm_start=True` for speed experiments);
+  - `line_backend="numpy"` is only allowed when `autodiff_strict=False`.
 - `line_backend` default is `"jax"` for full line-opacity autodiff in JAX engine.
 - `line_loggf_deltas` (JAX backend only) enables direct differentiation wrt line `log_gf`:
   - shape must match input `linelist` length and index order.
