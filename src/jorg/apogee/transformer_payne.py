@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 import urllib.request
 
@@ -16,6 +18,67 @@ DEFAULT_TPAYNE_CHECKPOINT_URL = (
     "https://huggingface.co/RozanskiT/transformer_payne/resolve/main/"
     "TransformerPayneIntensities_v2.pkl"
 )
+
+_NUMPY_PICKLE_ALIAS_MAP = {
+    "numpy._core": "numpy.core",
+    "numpy._core._multiarray_umath": "numpy.core._multiarray_umath",
+    "numpy._core.multiarray": "numpy.core.multiarray",
+    "numpy._core.numerictypes": "numpy.core.numerictypes",
+    "numpy._core.umath": "numpy.core.umath",
+}
+
+
+def _install_numpy_pickle_aliases() -> bool:
+    """Alias legacy NumPy pickle module paths when the current env lacks them."""
+    try:
+        importlib.import_module("numpy._core")
+        return False
+    except ModuleNotFoundError:
+        pass
+
+    installed = False
+    for legacy_name, current_name in _NUMPY_PICKLE_ALIAS_MAP.items():
+        if legacy_name in sys.modules:
+            continue
+        try:
+            sys.modules[legacy_name] = importlib.import_module(current_name)
+            installed = True
+        except ModuleNotFoundError:
+            continue
+    return installed
+
+
+def load_transformer_payne_checkpoint(checkpoint_path: str | Path) -> dict[str, Any]:
+    """Load a TP checkpoint, retrying with NumPy pickle aliases if needed."""
+    checkpoint_path = Path(checkpoint_path)
+    try:
+        return joblib.load(checkpoint_path)
+    except ModuleNotFoundError as exc:
+        missing_name = exc.name or ""
+        if not missing_name.startswith("numpy._core"):
+            raise
+        if not _install_numpy_pickle_aliases():
+            raise
+        return joblib.load(checkpoint_path)
+
+
+def normalize_tp_labels(
+    definition: "TransformerPayneDefinition",
+    tp_labels: np.ndarray,
+) -> np.ndarray:
+    """Scale absolute TP labels onto the [0, 1] range expected by the original model."""
+    labels = np.asarray(tp_labels, dtype=np.float32)
+    squeeze = labels.ndim == 1
+    if squeeze:
+        labels = labels[None, :]
+    mins = np.asarray(definition.min_spectral_parameters, dtype=np.float32)
+    maxs = np.asarray(definition.max_spectral_parameters, dtype=np.float32)
+    if labels.shape[1] != mins.shape[0]:
+        raise ValueError(
+            f"Expected TP labels with {mins.shape[0]} columns, got shape {labels.shape}."
+        )
+    scaled = (labels - mins[None, :]) / (maxs - mins)[None, :]
+    return scaled[0] if squeeze else scaled
 
 
 @dataclass(frozen=True)
@@ -32,8 +95,7 @@ class TransformerPayneDefinition:
     emulator_weights: str | None = None
 
     @classmethod
-    def from_checkpoint(cls, checkpoint_path: str | Path) -> "TransformerPayneDefinition":
-        payload = joblib.load(checkpoint_path)
+    def from_payload(cls, payload: Mapping[str, Any]) -> "TransformerPayneDefinition":
         return cls(
             spectral_parameters=tuple(payload["spectral_parameters"]),
             solar_parameters=np.asarray(payload["solar_parameters"], dtype=np.float64),
@@ -44,6 +106,10 @@ class TransformerPayneDefinition:
             architecture_parameters=payload.get("architecture_parameters"),
             emulator_weights=payload.get("emulator_weights"),
         )
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str | Path) -> "TransformerPayneDefinition":
+        return cls.from_payload(load_transformer_payne_checkpoint(checkpoint_path))
 
 
 def ensure_default_checkpoint(destination: str | Path) -> Path:

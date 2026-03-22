@@ -8,10 +8,11 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import h5py
 import numpy as np
+from scipy import sparse
 
 from .constants import SynthesisGrid, apogee_root, default_korg_root, repo_root
 from .contracts import SyntheticDatasetMetadata, save_synthetic_dataset
@@ -72,6 +73,103 @@ class KorgSynthesisResult:
     @property
     def n_mu(self) -> int:
         return int(self.mu_values.shape[0])
+
+
+def _resolve_resolution(
+    resolution: int | float | Callable[[float], float],
+    wavelength_angstrom: float,
+) -> float:
+    if callable(resolution):
+        return float(resolution(wavelength_angstrom))
+    return float(resolution)
+
+
+def compute_korg_lsf_matrix(
+    synthesis_wavelengths: Sequence[float] | np.ndarray,
+    observed_wavelengths: Sequence[float] | np.ndarray,
+    resolution: int | float | Callable[[float], float],
+    *,
+    window_size: float = 4.0,
+) -> sparse.csr_matrix:
+    """Reproduce Korg.compute_LSF_matrix for 1-D wavelength grids in Angstrom."""
+    synth = np.asarray(synthesis_wavelengths, dtype=np.float64)
+    obs = np.asarray(observed_wavelengths, dtype=np.float64)
+    if synth.ndim != 1 or obs.ndim != 1:
+        raise ValueError("synthesis_wavelengths and observed_wavelengths must both be 1-D.")
+    if synth.size == 0 or obs.size == 0:
+        raise ValueError("wavelength grids must be non-empty.")
+    if np.any(np.diff(synth) <= 0.0) or np.any(np.diff(obs) <= 0.0):
+        raise ValueError("wavelength grids must be strictly increasing.")
+
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    data: list[np.ndarray] = []
+    fwhm_to_sigma = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+    for row_index, lambda_0 in enumerate(obs):
+        current_resolution = _resolve_resolution(resolution, float(lambda_0))
+        sigma = float(lambda_0) / current_resolution / fwhm_to_sigma
+        lower = float(lambda_0) - window_size * sigma
+        upper = float(lambda_0) + window_size * sigma
+        lower_index = int(np.searchsorted(synth, lower, side="left"))
+        upper_index = int(np.searchsorted(synth, upper, side="right"))
+        if upper_index <= lower_index:
+            nearest = min(max(int(np.searchsorted(synth, lambda_0)), 0), synth.size - 1)
+            lower_index = nearest
+            upper_index = nearest + 1
+
+        window = synth[lower_index:upper_index]
+        kernel = np.exp(-0.5 * ((window - float(lambda_0)) / sigma) ** 2)
+        kernel_sum = float(kernel.sum())
+        if not np.isfinite(kernel_sum) or kernel_sum <= 0.0:
+            raise RuntimeError(f"Failed to build a valid LSF kernel at {lambda_0:.6f} A.")
+        kernel /= kernel_sum
+
+        rows.append(np.full(kernel.shape[0], row_index, dtype=np.int32))
+        cols.append(np.arange(lower_index, upper_index, dtype=np.int32))
+        data.append(kernel.astype(np.float64, copy=False))
+
+    return sparse.csr_matrix(
+        (
+            np.concatenate(data),
+            (np.concatenate(rows), np.concatenate(cols)),
+        ),
+        shape=(obs.size, synth.size),
+        dtype=np.float64,
+    )
+
+
+def compute_apogee_lsf_matrix(
+    synthesis_grid: SynthesisGrid = SynthesisGrid(),
+    *,
+    window_size: float = 4.0,
+) -> sparse.csr_matrix:
+    """Return the APOGEE Gaussian LSF matrix used by the local Korg bridge."""
+    return compute_korg_lsf_matrix(
+        synthesis_grid.synthesis_wavelengths,
+        synthesis_grid.apogee_wavelengths,
+        synthesis_grid.resolution,
+        window_size=window_size,
+    )
+
+
+def convolve_to_apogee_grid(
+    values: Sequence[float] | np.ndarray,
+    synthesis_grid: SynthesisGrid = SynthesisGrid(),
+    *,
+    lsf_matrix: sparse.csr_matrix | None = None,
+) -> np.ndarray:
+    """Apply the Korg-style APOGEE Gaussian LSF and resample onto the APOGEE grid."""
+    vector = np.asarray(values, dtype=np.float64)
+    expected = synthesis_grid.synthesis_wavelengths.shape[0]
+    if vector.ndim != 1:
+        raise ValueError("values must be 1-D.")
+    if vector.shape[0] != expected:
+        raise ValueError(f"Expected {expected} input pixels, got {vector.shape[0]}.")
+    matrix = lsf_matrix
+    if matrix is None:
+        matrix = compute_apogee_lsf_matrix(synthesis_grid)
+    return np.asarray(matrix @ vector, dtype=np.float64)
 
 
 def _run_subprocess(cmd: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:

@@ -61,16 +61,25 @@ def he_minus_ff_absorption(
     return K_he_proper * n_he_i_ground * P_e
 
 
-# Global interpolation tables for John (1994) data - initialized on first use
-_john1994_lambda = None
-_john1994_theta = None
-_john1994_table = None
+# Global host-only interpolation tables for John (1994) data.
+# Keep these as NumPy arrays so traced JAX values cannot leak into globals.
+_john1994_lambda_np = None
+_john1994_theta_np = None
+_john1994_table_np = None
+
+
+def clear_helium_cache() -> None:
+    """Clear cached John (1994) host tables."""
+    global _john1994_lambda_np, _john1994_theta_np, _john1994_table_np
+    _john1994_lambda_np = None
+    _john1994_theta_np = None
+    _john1994_table_np = None
 
 
 def _ensure_john1994_tables():
     """Initialize John (1994) tabulated grid once."""
-    global _john1994_lambda, _john1994_theta, _john1994_table
-    if _john1994_table is not None:
+    global _john1994_lambda_np, _john1994_theta_np, _john1994_table_np
+    if _john1994_table_np is not None:
         return
 
     theta_ff_absorption_interp = np.array([0.5, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.8, 3.6], dtype=np.float64)
@@ -121,9 +130,12 @@ def _ensure_john1994_tables():
         dtype=np.float64,
     )
 
-    _john1994_lambda = jnp.asarray(lambda_ff_absorption_interp, dtype=jnp.float64)
-    _john1994_theta = jnp.asarray(theta_ff_absorption_interp, dtype=jnp.float64)
-    _john1994_table = jnp.asarray(ff_absorption, dtype=jnp.float64)
+    _john1994_lambda_np = np.ascontiguousarray(lambda_ff_absorption_interp, dtype=np.float64)
+    _john1994_theta_np = np.ascontiguousarray(theta_ff_absorption_interp, dtype=np.float64)
+    _john1994_table_np = np.ascontiguousarray(ff_absorption, dtype=np.float64)
+    _john1994_lambda_np.setflags(write=False)
+    _john1994_theta_np.setflags(write=False)
+    _john1994_table_np.setflags(write=False)
 
 
 def _helium_free_free_john1994(wavelength_A: float, theta: float) -> float:
@@ -155,9 +167,9 @@ def _helium_free_free_john1994(wavelength_A: float, theta: float) -> float:
     k_interp = interp2_linear_clamped(
         wl_arr,
         th_arr,
-        _john1994_lambda,
-        _john1994_theta,
-        _john1994_table,
+        _john1994_lambda_np,
+        _john1994_theta_np,
+        _john1994_table_np,
         x_mode="zero",
         y_mode="zero",
     )
@@ -167,3 +179,28 @@ def _helium_free_free_john1994(wavelength_A: float, theta: float) -> float:
     if k_he.size == 1:
         return float(k_he.reshape(-1)[0])
     return k_he.reshape(wl_arr.shape)
+
+
+def _helium_free_free_john1994_jax(wavelength_A: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
+    """
+    JAX-native John (1994) He^- free-free interpolation.
+
+    Unlike `_helium_free_free_john1994`, this keeps values on-device and is
+    safe inside autodiff/JIT traces.
+    """
+    _ensure_john1994_tables()
+
+    wl_arr = jnp.asarray(wavelength_A, dtype=jnp.float64)
+    th_arr = jnp.asarray(theta, dtype=jnp.float64)
+    wl_arr, th_arr = jnp.broadcast_arrays(wl_arr, th_arr)
+
+    k_interp = interp2_linear_clamped(
+        wl_arr,
+        th_arr,
+        jnp.asarray(_john1994_lambda_np, dtype=jnp.float64),
+        jnp.asarray(_john1994_theta_np, dtype=jnp.float64),
+        jnp.asarray(_john1994_table_np, dtype=jnp.float64),
+        x_mode="zero",
+        y_mode="zero",
+    )
+    return jnp.asarray(1e-26 * k_interp, dtype=jnp.float64)

@@ -67,5 +67,15 @@ class SynthesisGrid:
     resolution: int = APOGEE_RESOLUTION
 
     @property
+    def synthesis_wavelengths(self) -> np.ndarray:
+        step = float(self.synthesis_step)
+        return np.arange(
+            float(self.synthesis_start),
+            float(self.synthesis_stop) + 0.5 * step,
+            step,
+            dtype=np.float64,
+        )
+
+    @property
     def apogee_wavelengths(self) -> np.ndarray:
         return apogee_wavelength_grid()

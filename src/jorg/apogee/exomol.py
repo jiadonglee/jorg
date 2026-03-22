@@ -55,7 +55,7 @@ def default_exomol_added_lines_path(root: Path) -> Path:
 
 
 def default_exomol_assets() -> dict[str, ExoMolAsset]:
-    """Return the default FeH/CaH augmentation assets."""
+    """Return the default APOGEE ExoMol augmentation assets."""
     return {
         "CaH": ExoMolAsset(
             species_name="CaH",
@@ -70,6 +70,13 @@ def default_exomol_assets() -> dict[str, ExoMolAsset]:
             transitions_url="https://exomol.com/db/FeH/56Fe-1H/MoLLIST/56Fe-1H__MoLLIST.trans.bz2",
             states_filename="56Fe-1H__MoLLIST.states.bz2",
             transitions_filename="56Fe-1H__MoLLIST.trans.bz2",
+        ),
+        "MgH": ExoMolAsset(
+            species_name="MgH",
+            states_url="https://exomol.com/db/MgH/24Mg-1H/XAB/24Mg-1H__XAB.states.bz2",
+            transitions_url="https://exomol.com/db/MgH/24Mg-1H/XAB/24Mg-1H__XAB.trans.bz2",
+            states_filename="24Mg-1H__XAB.states.bz2",
+            transitions_filename="24Mg-1H__XAB.trans.bz2",
         ),
     }
 

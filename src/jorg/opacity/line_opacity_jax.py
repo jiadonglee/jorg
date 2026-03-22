@@ -7,12 +7,13 @@ using a static Python/NumPy preprocessing pass to pack linelist objects.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import gamma as jax_gamma
 import numpy as np
 
 from ..constants import (
@@ -30,7 +31,9 @@ from ..lines.profiles import line_profile
 from ..statmech.species import Species
 
 
-_PARTITION_LOGU_CACHE: Dict[Tuple[int, Tuple[Tuple[int, int], ...]], "SpeciesPartitionLogUTable"] = {}
+_PARTITION_LOGU_CACHE: Dict[Tuple[int, Tuple[str, ...]], "SpeciesPartitionLogUTable"] = {}
+_LINE_TENSOR_PACK_CACHE = OrderedDict()
+_LINE_TENSOR_PACK_CACHE_MAX = 32
 
 
 @dataclass(frozen=True)
@@ -63,8 +66,10 @@ class LineTensorPack:
 class SpeciesPartitionLogUTable:
     """Partition-function lookup tables on a shared log(T) grid."""
 
-    logT_grid: jnp.ndarray
-    logU_by_species: jnp.ndarray  # [n_species, n_logT]
+    # Keep cache payload NumPy-only so traced JAX values never escape into
+    # global state (which can trigger UnexpectedTracerError on reuse).
+    logT_grid: np.ndarray
+    logU_by_species: np.ndarray  # [n_species, n_logT]
 
 
 def _line_wavelength_cm(line: Any) -> Optional[float]:
@@ -117,6 +122,12 @@ def _infer_species_identity(species: Any) -> Optional[Tuple[int, int]]:
         return None
 
 
+def _species_layout_cache_key(
+    species_layout: DenseSpeciesLayout,
+) -> Tuple[str, ...]:
+    return tuple(str(species) for species in species_layout.species)
+
+
 def _interp_table_jax(x: jnp.ndarray, grid: jnp.ndarray, table: jnp.ndarray) -> jnp.ndarray:
     """
     Piecewise-linear interpolation on the last axis of `table`.
@@ -145,6 +156,22 @@ def pack_line_tensors(
     if linelist is None:
         return None
 
+    if isinstance(linelist, (list, tuple)):
+        line_sequence = linelist
+    else:
+        line_sequence = tuple(linelist)
+
+    cache_key = (id(line_sequence), _species_layout_cache_key(species_layout))
+    cached = _LINE_TENSOR_PACK_CACHE.get(cache_key)
+    if cached is not None:
+        # Older cache entries may contain JAX arrays captured during tracing.
+        # Rebuild those entries so traced values never escape into global state.
+        if not isinstance(cached.source_line_index, np.ndarray):
+            _LINE_TENSOR_PACK_CACHE.pop(cache_key, None)
+        else:
+            _LINE_TENSOR_PACK_CACHE.move_to_end(cache_key)
+            return cached
+
     sigma_line_const = PI * electron_charge_cgs**2 / (electron_mass_cgs * c_cgs**2)
 
     wavelength = []
@@ -164,7 +191,7 @@ def pack_line_tensors(
     cross_section = []
     source_line_index = []
 
-    for line_i, line in enumerate(linelist):
+    for line_i, line in enumerate(line_sequence):
         wl_val = _line_wavelength_cm(line)
         if wl_val is None:
             continue
@@ -208,7 +235,7 @@ def pack_line_tensors(
         gamma_stark.append(gamma_stark_val)
         vdw_sigma.append(vdws)
         vdw_alpha.append(vdwa)
-        gamma_factor.append(float(jax_gamma((4.0 - vdwa) / 2.0)))
+        gamma_factor.append(float(math.gamma((4.0 - vdwa) / 2.0)))
         vdw_base_gamma.append(vdw_base)
         species_idx.append(int(idx))
         atomic_mass.append(mass_cgs)
@@ -219,24 +246,28 @@ def pack_line_tensors(
     if not wavelength:
         return None
 
-    return LineTensorPack(
-        wavelength=jnp.asarray(np.asarray(wavelength, dtype=np.float64)),
-        gf=jnp.asarray(np.asarray(gf, dtype=np.float64)),
-        log_gf_base=jnp.asarray(np.asarray(log_gf_base, dtype=np.float64)),
-        E_lower=jnp.asarray(np.asarray(E_lower, dtype=np.float64)),
-        delta_E=jnp.asarray(np.asarray(delta_E, dtype=np.float64)),
-        gamma_rad=jnp.asarray(np.asarray(gamma_rad, dtype=np.float64)),
-        gamma_stark=jnp.asarray(np.asarray(gamma_stark, dtype=np.float64)),
-        vdw_sigma=jnp.asarray(np.asarray(vdw_sigma, dtype=np.float64)),
-        vdw_alpha=jnp.asarray(np.asarray(vdw_alpha, dtype=np.float64)),
-        gamma_factor=jnp.asarray(np.asarray(gamma_factor, dtype=np.float64)),
-        vdw_base_gamma=jnp.asarray(np.asarray(vdw_base_gamma, dtype=np.float64)),
-        species_idx=jnp.asarray(np.asarray(species_idx, dtype=np.int32)),
-        atomic_mass=jnp.asarray(np.asarray(atomic_mass, dtype=np.float64)),
-        is_molecule=jnp.asarray(np.asarray(is_molecule, dtype=np.float64)),
-        cross_section=jnp.asarray(np.asarray(cross_section, dtype=np.float64)),
-        source_line_index=jnp.asarray(np.asarray(source_line_index, dtype=np.int32)),
+    pack = LineTensorPack(
+        wavelength=np.asarray(wavelength, dtype=np.float64),
+        gf=np.asarray(gf, dtype=np.float64),
+        log_gf_base=np.asarray(log_gf_base, dtype=np.float64),
+        E_lower=np.asarray(E_lower, dtype=np.float64),
+        delta_E=np.asarray(delta_E, dtype=np.float64),
+        gamma_rad=np.asarray(gamma_rad, dtype=np.float64),
+        gamma_stark=np.asarray(gamma_stark, dtype=np.float64),
+        vdw_sigma=np.asarray(vdw_sigma, dtype=np.float64),
+        vdw_alpha=np.asarray(vdw_alpha, dtype=np.float64),
+        gamma_factor=np.asarray(gamma_factor, dtype=np.float64),
+        vdw_base_gamma=np.asarray(vdw_base_gamma, dtype=np.float64),
+        species_idx=np.asarray(species_idx, dtype=np.int32),
+        atomic_mass=np.asarray(atomic_mass, dtype=np.float64),
+        is_molecule=np.asarray(is_molecule, dtype=np.float64),
+        cross_section=np.asarray(cross_section, dtype=np.float64),
+        source_line_index=np.asarray(source_line_index, dtype=np.int32),
     )
+    _LINE_TENSOR_PACK_CACHE[cache_key] = pack
+    if len(_LINE_TENSOR_PACK_CACHE) > _LINE_TENSOR_PACK_CACHE_MAX:
+        _LINE_TENSOR_PACK_CACHE.popitem(last=False)
+    return pack
 
 
 def _continuum_at_line_centers(
@@ -302,8 +333,8 @@ def _build_species_partition_logu_table(
                 logU[idx, :] = np.asarray(pf_tables.logU_III_table[z_idx], dtype=np.float64)
 
     return SpeciesPartitionLogUTable(
-        logT_grid=jnp.asarray(logT_grid, dtype=jnp.float64),
-        logU_by_species=jnp.asarray(logU, dtype=jnp.float64),
+        logT_grid=np.asarray(logT_grid, dtype=np.float64),
+        logU_by_species=np.asarray(logU, dtype=np.float64),
     )
 
 
@@ -315,10 +346,7 @@ def _get_species_partition_logu_table(
     """
     Return cached species-aligned partition-function log(U) table.
     """
-    species_key = tuple(
-        _infer_species_identity(species) or (-1, 0)
-        for species in species_layout.species
-    )
+    species_key = _species_layout_cache_key(species_layout)
     cache_key = (id(partition_funcs), species_key)
     cached = _PARTITION_LOGU_CACHE.get(cache_key)
     if cached is not None:
@@ -382,33 +410,52 @@ def compute_line_opacity_jax(
     if pack is None or pack.n_lines == 0:
         return jnp.zeros_like(continuum_opacity)
 
+    pack_n_lines = int(pack.n_lines)
+    pack_source_line_index = jnp.asarray(pack.source_line_index, dtype=jnp.int32)
+    pack_species_idx = jnp.asarray(pack.species_idx, dtype=jnp.int32)
+    pack_wavelength = jnp.asarray(pack.wavelength, dtype=jnp.float64)
+    pack_atomic_mass = jnp.asarray(pack.atomic_mass, dtype=jnp.float64)
+    pack_is_molecule = jnp.asarray(pack.is_molecule, dtype=jnp.float64)
+    pack_gamma_rad = jnp.asarray(pack.gamma_rad, dtype=jnp.float64)
+    pack_gamma_stark = jnp.asarray(pack.gamma_stark, dtype=jnp.float64)
+    pack_vdw_alpha = jnp.asarray(pack.vdw_alpha, dtype=jnp.float64)
+    pack_gamma_factor = jnp.asarray(pack.gamma_factor, dtype=jnp.float64)
+    pack_vdw_sigma = jnp.asarray(pack.vdw_sigma, dtype=jnp.float64)
+    pack_vdw_base_gamma = jnp.asarray(pack.vdw_base_gamma, dtype=jnp.float64)
+    pack_E_lower = jnp.asarray(pack.E_lower, dtype=jnp.float64)
+    pack_delta_E = jnp.asarray(pack.delta_E, dtype=jnp.float64)
+    pack_log_gf_base = jnp.asarray(pack.log_gf_base, dtype=jnp.float64)
+    pack_cross_section = jnp.asarray(pack.cross_section, dtype=jnp.float64)
+
     if line_loggf_deltas is None:
-        packed_loggf_deltas = jnp.zeros((pack.n_lines,), dtype=jnp.float64)
+        packed_loggf_deltas = jnp.zeros((pack_n_lines,), dtype=jnp.float64)
     else:
-        packed_loggf_deltas = jnp.take(line_loggf_deltas, pack.source_line_index, axis=0)
+        packed_loggf_deltas = jnp.take(line_loggf_deltas, pack_source_line_index, axis=0)
 
     partition_table = _get_species_partition_logu_table(
         partition_funcs=partition_funcs,
         species_layout=species_layout,
     )
+    logT_grid = jnp.asarray(partition_table.logT_grid, dtype=jnp.float64)
+    logU_by_species = jnp.asarray(partition_table.logU_by_species, dtype=jnp.float64)
     logT = jnp.log(jnp.clip(temps, 1e-300, None))
     logU_dense = jax.vmap(
-        lambda logTi: _interp_table_jax(logTi, partition_table.logT_grid, partition_table.logU_by_species),
+        lambda logTi: _interp_table_jax(logTi, logT_grid, logU_by_species),
         in_axes=0,
         out_axes=1,
     )(logT)
 
     # n/U by line and layer: [n_lines, n_layers]
-    line_density = jnp.take(number_density_dense, pack.species_idx, axis=1).T
-    line_logU = jnp.take(logU_dense, pack.species_idx, axis=0)
+    line_density = jnp.take(number_density_dense, pack_species_idx, axis=1).T
+    line_logU = jnp.take(logU_dense, pack_species_idx, axis=0)
     line_pf = jnp.exp(jnp.clip(line_logU, -700.0, 700.0))
     n_div_u = line_density / jnp.maximum(line_pf, 1e-30)
 
     beta = 1.0 / (kboltz_eV * temps)
     vmic_cm_s = jnp.asarray(microturbulence_kms, dtype=jnp.float64) * 1e5
 
-    sigma = pack.wavelength[:, None] * jnp.sqrt(
-        kboltz_cgs * temps[None, :] / jnp.maximum(pack.atomic_mass[:, None], 1e-30)
+    sigma = pack_wavelength[:, None] * jnp.sqrt(
+        kboltz_cgs * temps[None, :] / jnp.maximum(pack_atomic_mass[:, None], 1e-30)
         + (vmic_cm_s**2) / 2.0
     ) / c_cgs
     sigma = jnp.maximum(sigma, 1e-30)
@@ -417,9 +464,9 @@ def compute_line_opacity_jax(
     temp_vdw = (temps / 10000.0) ** 0.3
     temp_vbar = jnp.sqrt(8.0 * kboltz_cgs * temps / PI)
 
-    is_atom = 1.0 - pack.is_molecule
-    gamma_total = pack.gamma_rad[:, None] + (
-        electron_densities[None, :] * (pack.gamma_stark[:, None] * temp_stark[None, :]) * is_atom[:, None]
+    is_atom = 1.0 - pack_is_molecule
+    gamma_total = pack_gamma_rad[:, None] + (
+        electron_densities[None, :] * (pack_gamma_stark[:, None] * temp_stark[None, :]) * is_atom[:, None]
     )
 
     h_neutral_idx = species_layout.index.get(Species.from_atomic_number(1, 0))
@@ -429,39 +476,39 @@ def compute_line_opacity_jax(
         n_h_neutral = number_density_dense[:, int(h_neutral_idx)]
 
     inv_mu_const = 1.0 / (1.008 * amu_cgs)
-    inv_mu = inv_mu_const + 1.0 / jnp.maximum(pack.atomic_mass, 1e-30)
+    inv_mu = inv_mu_const + 1.0 / jnp.maximum(pack_atomic_mass, 1e-30)
     vbar = temp_vbar[None, :] * jnp.sqrt(inv_mu[:, None])
     v0 = 1e6
 
     vdw_abo = (
         2.0
-        * (4.0 / PI) ** (pack.vdw_alpha[:, None] / 2.0)
-        * pack.gamma_factor[:, None]
+        * (4.0 / PI) ** (pack_vdw_alpha[:, None] / 2.0)
+        * pack_gamma_factor[:, None]
         * v0
-        * pack.vdw_sigma[:, None]
-        * (vbar / v0) ** (1.0 - pack.vdw_alpha[:, None])
+        * pack_vdw_sigma[:, None]
+        * (vbar / v0) ** (1.0 - pack_vdw_alpha[:, None])
     )
-    vdw_simple = pack.vdw_sigma[:, None] * temp_vdw[None, :]
-    vdw_unsold = pack.vdw_sigma[:, None] * pack.vdw_base_gamma[:, None] * temp_vdw[None, :]
+    vdw_simple = pack_vdw_sigma[:, None] * temp_vdw[None, :]
+    vdw_unsold = pack_vdw_sigma[:, None] * pack_vdw_base_gamma[:, None] * temp_vdw[None, :]
     vdw_gamma = jnp.where(
-        pack.vdw_alpha[:, None] == -1.0,
+        pack_vdw_alpha[:, None] == -1.0,
         vdw_simple,
-        jnp.where(pack.vdw_alpha[:, None] == -2.0, vdw_unsold, vdw_abo),
+        jnp.where(pack_vdw_alpha[:, None] == -2.0, vdw_unsold, vdw_abo),
     )
     gamma_total = gamma_total + (n_h_neutral[None, :] * vdw_gamma) * is_atom[:, None]
 
-    gamma = gamma_total * pack.wavelength[:, None] ** 2 / (4.0 * PI * c_cgs)
+    gamma = gamma_total * pack_wavelength[:, None] ** 2 / (4.0 * PI * c_cgs)
     gamma = jnp.maximum(gamma, 1e-30)
 
-    E_upper = pack.E_lower + pack.delta_E
-    levels_factor = jnp.exp(-beta[None, :] * pack.E_lower[:, None]) - jnp.exp(
+    E_upper = pack_E_lower + pack_delta_E
+    levels_factor = jnp.exp(-beta[None, :] * pack_E_lower[:, None]) - jnp.exp(
         -beta[None, :] * E_upper[:, None]
     )
-    loggf_eff = jnp.clip(pack.log_gf_base + packed_loggf_deltas, -300.0, 300.0)
+    loggf_eff = jnp.clip(pack_log_gf_base + packed_loggf_deltas, -300.0, 300.0)
     gf_eff = jnp.exp(jnp.log(10.0) * loggf_eff)
-    amplitude = gf_eff[:, None] * pack.cross_section[:, None] * levels_factor * n_div_u
+    amplitude = gf_eff[:, None] * pack_cross_section[:, None] * levels_factor * n_div_u
 
-    continuum_line = _continuum_at_line_centers(wl_array_cm, pack.wavelength, continuum_opacity)
+    continuum_line = _continuum_at_line_centers(wl_array_cm, pack_wavelength, continuum_opacity)
     rho_crit = (continuum_line * cutoff_threshold) / jnp.maximum(jnp.abs(amplitude), 1e-50)
 
     sqrt_2pi = jnp.sqrt(2.0 * PI)
@@ -483,14 +530,14 @@ def compute_line_opacity_jax(
 
     sigma_ref = jnp.mean(sigma, axis=1)
     gate_scale = jnp.maximum(soft_window_temperature * sigma_ref, 1e-30)
-    distance = jnp.abs(wl_array_cm[None, :] - pack.wavelength[:, None])
+    distance = jnp.abs(wl_array_cm[None, :] - pack_wavelength[:, None])
     soft_gate = jax.nn.sigmoid((window_size[:, None] - distance) / gate_scale[:, None])
 
     def _add_one_line(alpha_acc: jnp.ndarray, line_idx: jnp.ndarray):
         amp_i = amplitude[line_idx]
         sigma_i = sigma[line_idx]
         gamma_i = gamma[line_idx]
-        wl0 = pack.wavelength[line_idx]
+        wl0 = pack_wavelength[line_idx]
         gate = soft_gate[line_idx]
 
         line_alpha = jax.vmap(
@@ -509,7 +556,7 @@ def compute_line_opacity_jax(
         return alpha_next, None
 
     alpha0 = jnp.zeros_like(continuum_opacity)
-    alpha_matrix, _ = jax.lax.scan(_add_one_line, alpha0, jnp.arange(pack.n_lines))
+    alpha_matrix, _ = jax.lax.scan(_add_one_line, alpha0, jnp.arange(pack_n_lines))
     return alpha_matrix
 
 

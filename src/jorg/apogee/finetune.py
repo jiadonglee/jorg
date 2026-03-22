@@ -23,6 +23,8 @@ from .contracts import load_synthetic_dataset
 from .transformer_payne import (
     TPCompactLabelAdapter,
     TransformerPayneDefinition,
+    load_transformer_payne_checkpoint,
+    normalize_tp_labels,
     transfer_matching_parameters,
 )
 
@@ -130,10 +132,11 @@ def create_finetune_model(
     checkout_dir: Path | str,
 ):
     """Instantiate the original TP model and return (definition, model, params)."""
-    definition = TransformerPayneDefinition.from_checkpoint(checkpoint_path)
+    payload = load_transformer_payne_checkpoint(checkpoint_path)
+    definition = TransformerPayneDefinition.from_payload(payload)
     module = import_transformer_payne(checkout_dir)
     model = module.TransformerPayneModel(**definition.architecture_parameters)
-    params = freeze(joblib.load(checkpoint_path)["emulator_weights"])
+    params = freeze(payload["emulator_weights"])
     return definition, model, params
 
 
@@ -217,10 +220,25 @@ def create_train_state(
     )
 
 
-def batched_tp_apply(model, params, log_wavelengths: np.ndarray, tp_labels: np.ndarray, *, train: bool):
+def batched_tp_apply(
+    model,
+    params,
+    log_wavelengths: np.ndarray,
+    tp_labels: np.ndarray,
+    *,
+    train: bool,
+    tp_definition: TransformerPayneDefinition | None = None,
+):
     """Apply the original TP model over a batch of 95-D labels."""
     log_wavelengths_j = jnp.asarray(log_wavelengths, dtype=jnp.float32)
-    labels_j = jnp.asarray(tp_labels, dtype=jnp.float32)
+    labels_arr = np.asarray(tp_labels, dtype=np.float32)
+    if tp_definition is not None:
+        labels_arr = normalize_tp_labels(tp_definition, labels_arr)
+    elif labels_arr.size and (np.nanmin(labels_arr) < 0.0 or np.nanmax(labels_arr) > 1.0):
+        raise ValueError(
+            "batched_tp_apply expects normalized TP labels unless tp_definition is provided."
+        )
+    labels_j = jnp.asarray(labels_arr, dtype=jnp.float32)
 
     def apply_one(label_vec):
         return model.apply({"params": params}, (log_wavelengths_j, label_vec), train=train)
@@ -228,11 +246,18 @@ def batched_tp_apply(model, params, log_wavelengths: np.ndarray, tp_labels: np.n
     return jax.vmap(apply_one, in_axes=0, out_axes=0)(labels_j)
 
 
-def _train_step(state: TrainState, model, log_wavelengths, labels, targets):
+def _train_step(state: TrainState, model, tp_definition, log_wavelengths, labels, targets):
     targets_j = jnp.asarray(targets, dtype=jnp.float32)
 
     def loss_fn(params):
-        predictions = batched_tp_apply(model, params, log_wavelengths, labels, train=True)
+        predictions = batched_tp_apply(
+            model,
+            params,
+            log_wavelengths,
+            labels,
+            train=True,
+            tp_definition=tp_definition,
+        )
         residual = predictions - targets_j
         loss = jnp.mean(residual * residual)
         rmse = jnp.sqrt(loss)
@@ -249,9 +274,16 @@ def _train_step(state: TrainState, model, log_wavelengths, labels, targets):
     return state
 
 
-def _eval_step(params, model, log_wavelengths, labels, targets):
+def _eval_step(params, model, tp_definition, log_wavelengths, labels, targets):
     targets_j = jnp.asarray(targets, dtype=jnp.float32)
-    predictions = batched_tp_apply(model, params, log_wavelengths, labels, train=False)
+    predictions = batched_tp_apply(
+        model,
+        params,
+        log_wavelengths,
+        labels,
+        train=False,
+        tp_definition=tp_definition,
+    )
     residual = predictions - targets_j
     loss = jnp.mean(residual * residual)
     rmse = jnp.sqrt(loss)
@@ -352,6 +384,7 @@ def run_finetune(
                 state = _train_step(
                     state,
                     model,
+                    definition,
                     dataset.log_wavelengths,
                     dataset.tp_labels[batch],
                     dataset.targets[batch],
@@ -359,6 +392,7 @@ def run_finetune(
             val_metrics = _eval_step(
                 state.params,
                 model,
+                definition,
                 dataset.log_wavelengths,
                 dataset.tp_labels[val_indices],
                 dataset.targets[val_indices],

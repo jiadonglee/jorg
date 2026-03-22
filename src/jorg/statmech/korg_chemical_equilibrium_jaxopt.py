@@ -87,12 +87,12 @@ def _build_cached_molecule_structure(log_equilibrium_constants: Dict):
                 if len(atom_indices) < 2:
                     continue
                 charged_entries.append(
-                    (int(atom_indices[0]), int(atom_indices[1]), n_atoms_minus_one, log_K_func)
+                    (mol_species, int(atom_indices[0]), int(atom_indices[1]), n_atoms_minus_one, log_K_func)
                 )
             else:
                 uniq, counts = np.unique(atom_indices, return_counts=True)
                 neutral_entries.append(
-                    (uniq.astype(np.int32), counts.astype(np.float64), n_atoms_minus_one, log_K_func)
+                    (mol_species, uniq.astype(np.int32), counts.astype(np.float64), n_atoms_minus_one, log_K_func)
                 )
         except Exception:
             continue
@@ -106,14 +106,17 @@ def _build_cached_molecule_structure(log_equilibrium_constants: Dict):
         neutral_stoich = np.zeros((n_neutral, MAX_ATOMIC_NUMBER), dtype=np.float64)
         neutral_n_atoms_minus_one = np.zeros(n_neutral, dtype=np.float64)
         neutral_funcs = []
-        for i, (uniq, counts, n_atoms_minus_one, func) in enumerate(neutral_entries):
+        neutral_species = []
+        for i, (species, uniq, counts, n_atoms_minus_one, func) in enumerate(neutral_entries):
             neutral_stoich[i, uniq] = counts
             neutral_n_atoms_minus_one[i] = n_atoms_minus_one
             neutral_funcs.append(func)
+            neutral_species.append(species)
 
         result["neutral_stoich"] = neutral_stoich
         result["neutral_n_atoms_minus_one"] = neutral_n_atoms_minus_one
         result["neutral_funcs"] = tuple(neutral_funcs)
+        result["neutral_species"] = tuple(neutral_species)
 
     if charged_entries:
         n_charged = len(charged_entries)
@@ -122,19 +125,22 @@ def _build_cached_molecule_structure(log_equilibrium_constants: Dict):
         charged_stoich = np.zeros((n_charged, MAX_ATOMIC_NUMBER), dtype=np.float64)
         charged_n_atoms_minus_one = np.zeros(n_charged, dtype=np.float64)
         charged_funcs = []
-        for i, (idx1, idx2, n_atoms_minus_one, func) in enumerate(charged_entries):
+        charged_species = []
+        for i, (species, idx1, idx2, n_atoms_minus_one, func) in enumerate(charged_entries):
             charged_idx1[i] = idx1
             charged_idx2[i] = idx2
             charged_stoich[i, idx1] += 1.0
             charged_stoich[i, idx2] += 1.0
             charged_n_atoms_minus_one[i] = n_atoms_minus_one
             charged_funcs.append(func)
+            charged_species.append(species)
 
         result["charged_idx1"] = charged_idx1
         result["charged_idx2"] = charged_idx2
         result["charged_stoich"] = charged_stoich
         result["charged_n_atoms_minus_one"] = charged_n_atoms_minus_one
         result["charged_funcs"] = tuple(charged_funcs)
+        result["charged_species"] = tuple(charged_species)
 
     return result or None
 
@@ -180,6 +186,7 @@ def _prepare_molecule_arrays(temperature: float, log_equilibrium_constants: Opti
                 continue
         result["neutral_stoich"] = neutral_stoich
         result["neutral_log_nK"] = neutral_log_nK
+        result["neutral_species"] = structure["neutral_species"]
 
     charged_idx1 = structure.get("charged_idx1")
     if charged_idx1 is not None:
@@ -198,6 +205,7 @@ def _prepare_molecule_arrays(temperature: float, log_equilibrium_constants: Opti
         result["charged_idx2"] = structure["charged_idx2"]
         result["charged_log_nK"] = charged_log_nK
         result["charged_stoich"] = structure["charged_stoich"]
+        result["charged_species"] = structure["charged_species"]
 
     return result or None
 
@@ -668,15 +676,16 @@ def chemical_equilibrium_jaxopt(
     implicit_diff: bool = False,
     newton_damping: float = 0.0,
     residual_stop_tol: Optional[float] = None,
-    hybrid_newton_maxiter: int = 12,
+    hybrid_newton_maxiter: int = 8,
     hybrid_newton_damping: float = 1e-6,
-    hybrid_newton_restarts: int = 3,
+    hybrid_newton_restarts: int = 2,
     hybrid_newton_damping_growth: float = 100.0,
     hybrid_line_search_max_steps: int = 6,
     hybrid_line_search_backtrack: float = 0.5,
     hybrid_line_search_armijo_c: float = 1e-4,
     hybrid_trigger_residual: float = 1e-1,
     initial_x: Optional[np.ndarray] = None,
+    return_species: bool = True,
     return_x: bool = False,
     stats_out: Optional[Dict] = None,
 ):
@@ -693,8 +702,8 @@ def chemical_equilibrium_jaxopt(
     lm_solver:
       - "auto": try cholesky, then lu, then qr.
       - explicit choices: cholesky, lu, qr, inv, svd.
-    Returns (ne, species_densities) by default; if return_x=True, returns
-    (ne, species_densities, x_solution).
+    Returns `(ne, species_densities)` by default. If `return_species=False`,
+    returns only `ne` (or `(ne, x_solution)` when `return_x=True`).
     """
     abs_abund_array = _coerce_absolute_abundance_array(absolute_abundances)
 
@@ -1001,13 +1010,48 @@ def chemical_equilibrium_jaxopt(
     wII_sol = wII_ne * inv_ne
     wIII_sol = wIII_ne2 * (inv_ne * inv_ne)
 
-    species_densities: Dict[Species, float] = {}
-    for Z in range(1, MAX_ATOMIC_NUMBER + 1):
-        n_neutral = float(n0[Z - 1])
-        species_densities[_SPECIES_NEUTRAL[Z - 1]] = n_neutral
-        if Z in ionization_energies:
-            species_densities[_SPECIES_ION_1[Z - 1]] = float(wII_sol[Z - 1] * n_neutral)
-            species_densities[_SPECIES_ION_2[Z - 1]] = float(wIII_sol[Z - 1] * n_neutral)
+    species_densities: Optional[Dict[Species, float]] = None
+    if return_species:
+        species_densities = {}
+        for Z in range(1, MAX_ATOMIC_NUMBER + 1):
+            n_neutral = float(n0[Z - 1])
+            species_densities[_SPECIES_NEUTRAL[Z - 1]] = n_neutral
+            if Z in ionization_energies:
+                species_densities[_SPECIES_ION_1[Z - 1]] = float(wII_sol[Z - 1] * n_neutral)
+                species_densities[_SPECIES_ION_2[Z - 1]] = float(wIII_sol[Z - 1] * n_neutral)
+
+        if mol_data is not None:
+            log_n0 = np.log10(np.clip(n0, 1e-300, None))
+
+            neutral_species = tuple(mol_data.get("neutral_species", ()))
+            if neutral_species:
+                neutral_log_nK = np.asarray(mol_data["neutral_log_nK"], dtype=np.float64)
+                neutral_stoich = np.asarray(mol_data["neutral_stoich"], dtype=np.float64)
+                neutral_log_n_mol = neutral_stoich @ log_n0 - neutral_log_nK
+                finite_mask = np.isfinite(neutral_log_n_mol)
+                neutral_vals = np.zeros_like(neutral_log_n_mol)
+                neutral_vals[finite_mask] = np.power(
+                    10.0,
+                    np.clip(neutral_log_n_mol[finite_mask], _LOG10_MIN, _LOG10_MAX),
+                )
+                for spec, value in zip(neutral_species, neutral_vals):
+                    species_densities[spec] = float(value)
+
+            charged_species = tuple(mol_data.get("charged_species", ()))
+            if charged_species:
+                charged_log_nK = np.asarray(mol_data["charged_log_nK"], dtype=np.float64)
+                charged_idx1 = np.asarray(mol_data["charged_idx1"], dtype=np.int32)
+                charged_idx2 = np.asarray(mol_data["charged_idx2"], dtype=np.int32)
+                log_wII = np.log10(np.clip(wII_sol, 1e-300, None))
+                charged_log_n_mol = log_n0[charged_idx1] + log_wII[charged_idx1] + log_n0[charged_idx2] - charged_log_nK
+                finite_mask = np.isfinite(charged_log_n_mol)
+                charged_vals = np.zeros_like(charged_log_n_mol)
+                charged_vals[finite_mask] = np.power(
+                    10.0,
+                    np.clip(charged_log_n_mol[finite_mask], _LOG10_MIN, _LOG10_MAX),
+                )
+                for spec, value in zip(charged_species, charged_vals):
+                    species_densities[spec] = float(value)
 
     if isinstance(stats_out, dict):
         stats_out.clear()
@@ -1048,8 +1092,12 @@ def chemical_equilibrium_jaxopt(
         )
 
     if return_x:
-        return ne, species_densities, x.copy()
-    return ne, species_densities
+        if return_species:
+            return ne, species_densities, x.copy()
+        return ne, x.copy()
+    if return_species:
+        return ne, species_densities
+    return ne
 
 
 def chemical_equilibrium_jaxopt_layers(

@@ -50,6 +50,16 @@ _INTERPOLATOR_CACHE = {}
 _CUBIC_INTERPOLATOR_CACHE = {}
 
 
+def clear_interpolator_caches() -> None:
+    """
+    Clear cached interpolator callables.
+
+    Useful after failed tracing attempts so leaked tracer state cannot be reused.
+    """
+    _INTERPOLATOR_CACHE.clear()
+    _CUBIC_INTERPOLATOR_CACHE.clear()
+
+
 @dataclass
 class AtmosphereLayer:
     """
@@ -98,21 +108,24 @@ def load_marcs_grid(grid_path: str):
         
     Returns:
         Tuple of (grid, nodes, param_names) where:
-        - grid: JAX array with atmosphere data
-        - nodes: List of parameter node arrays  
+        - grid: immutable NumPy host array with atmosphere data
+        - nodes: immutable NumPy host arrays for each parameter axis
         - param_names: List of parameter names
     """
     with h5py.File(grid_path, 'r') as f:
-        grid = jnp.array(f['grid'][:])
+        grid = np.ascontiguousarray(f['grid'][:])
+        grid.setflags(write=False)
         nodes = []
         for i in range(1, 6):  # grid_values/1 through grid_values/5
             if f'grid_values/{i}' in f:
-                nodes.append(jnp.array(f[f'grid_values/{i}'][:]))
+                node = np.ascontiguousarray(f[f'grid_values/{i}'][:])
+                node.setflags(write=False)
+                nodes.append(node)
         
         param_names = [name.decode('utf-8') if isinstance(name, bytes) else name 
                       for name in f['grid_parameter_names'][:]]
     
-    return grid, nodes, param_names
+    return grid, tuple(nodes), tuple(param_names)
 
 
 @lru_cache(maxsize=4)
@@ -184,6 +197,16 @@ def _resolve_marcs_grid_path_cached(grid_data_dir: Optional[Union[str, Path]], f
     Cached path resolution for MARCS grids.
     """
     return _resolve_marcs_grid_path(grid_data_dir, filename)
+
+
+def _as_python_float_or_none(value: Union[float, jnp.ndarray]) -> Optional[float]:
+    """
+    Best-effort conversion for warning/branch logic that should only run on concrete values.
+    """
+    try:
+        return float(np.asarray(value))
+    except Exception:
+        return None
 
 
 def multilinear_interpolation(params: jnp.ndarray, 
@@ -262,26 +285,38 @@ def multilinear_interpolation(params: jnp.ndarray,
     return result
 
 
-def _get_multilinear_interpolator(grid_path: str, nodes: List[jnp.ndarray],
-                                  grid: jnp.ndarray, n_params: int):
+def _get_multilinear_interpolator(
+    grid_path: str,
+    nodes: List[np.ndarray],
+    grid: np.ndarray,
+    n_params: int,
+    *,
+    use_jit: bool = True,
+):
     """
     Return a cached JIT-compiled multilinear interpolator for a grid.
     """
-    key = (str(grid_path), int(n_params))
+    key = (str(grid_path), int(n_params), bool(use_jit))
     cached = _INTERPOLATOR_CACHE.get(key)
     if cached is not None:
         return cached
 
+    grid_jax = jnp.asarray(grid)
+    nodes_jax = tuple(jnp.asarray(node) for node in nodes)
+
     def _interp(params):
-        params = jnp.asarray(params, dtype=grid.dtype)
-        return multilinear_interpolation(params, nodes, grid)
+        params = jnp.asarray(params, dtype=grid_jax.dtype)
+        return multilinear_interpolation(params, nodes_jax, grid_jax)
 
-    compiled = jax.jit(_interp)
-    _INTERPOLATOR_CACHE[key] = compiled
-    return compiled
+    if use_jit:
+        interpolator = jax.jit(_interp)
+    else:
+        interpolator = _interp
+    _INTERPOLATOR_CACHE[key] = interpolator
+    return interpolator
 
 
-def _get_cool_dwarf_interpolator(grid_path: str, axis_nodes: List[np.ndarray], grid: jnp.ndarray):
+def _get_cool_dwarf_interpolator(grid_path: str, axis_nodes: List[np.ndarray], grid: np.ndarray):
     """
     Return a cached JIT-compiled cool dwarf cubic interpolator for a grid.
     """
@@ -291,9 +326,10 @@ def _get_cool_dwarf_interpolator(grid_path: str, axis_nodes: List[np.ndarray], g
         return cached
 
     axis_nodes_jax = [jnp.asarray(node, dtype=jnp.float64) for node in axis_nodes]
+    grid_jax = jnp.asarray(grid, dtype=jnp.float64)
 
     def _interp(axis_params):
-        data = jnp.asarray(grid, dtype=jnp.float64)
+        data = grid_jax
         for node, value in zip(axis_nodes_jax, axis_params):
             data = cubic_spline_nd(node, data, axis=0, x_query=value)
         return data.T
@@ -304,8 +340,8 @@ def _get_cool_dwarf_interpolator(grid_path: str, axis_nodes: List[np.ndarray], g
 
 
 def _cubic_interpolation_cool_dwarf(params: np.ndarray,
-                                    nodes: List[jnp.ndarray],
-                                    grid: jnp.ndarray,
+                                    nodes: List[np.ndarray],
+                                    grid: np.ndarray,
                                     param_names: List[str],
                                     use_jax: bool = True,
                                     grid_path: Optional[str] = None) -> np.ndarray:
@@ -321,9 +357,9 @@ def _cubic_interpolation_cool_dwarf(params: np.ndarray,
     ----------
     params : np.ndarray
         Parameter values to interpolate at [Teff, logg, mH, alpha, C]
-    nodes : List[jnp.ndarray]
+    nodes : List[np.ndarray]
         Grid node values for each parameter
-    grid : jnp.ndarray
+    grid : np.ndarray
         Atmosphere grid data
     param_names : List[str]
         Names of parameters (for error messages)
@@ -423,13 +459,53 @@ def create_atmosphere_from_quantities(atm_quants: jnp.ndarray,
     return ModelAtmosphere(layers=layers, spherical=spherical, R=R)
 
 
-def interpolate_marcs(Teff: float, 
+def create_dense_atmosphere_from_quantities(
+    atm_quants: jnp.ndarray,
+    *,
+    spherical: bool = False,
+    logg: float = 4.44,
+) -> Dict[str, jnp.ndarray]:
+    """
+    Create a dense, tracer-safe atmosphere dict from interpolated MARCS quantities.
+    """
+    atm_quants = jnp.asarray(atm_quants, dtype=jnp.float64)
+    temp = jnp.nan_to_num(atm_quants[:, 0], nan=5000.0, posinf=50000.0, neginf=500.0)
+    log_ne = jnp.nan_to_num(atm_quants[:, 1], nan=0.0)
+    log_nt = jnp.nan_to_num(atm_quants[:, 2], nan=0.0)
+    tau_5000 = jnp.maximum(
+        jnp.nan_to_num(atm_quants[:, 3], nan=1e-6, posinf=1e2, neginf=1e-6),
+        1e-12,
+    )
+    sinh_z = jnp.nan_to_num(atm_quants[:, 4], nan=0.0)
+
+    electron_density = jnp.maximum(jnp.exp(log_ne), 1e-40)
+    number_density = jnp.maximum(jnp.exp(log_nt), 1e-40)
+    height = jnp.sinh(sinh_z)
+    pressure = number_density * kboltz_cgs * temp
+
+    out: Dict[str, jnp.ndarray] = {
+        "temperature": temp,
+        "electron_density": electron_density,
+        "number_density": number_density,
+        "tau_5000": tau_5000,
+        "height": height,
+        "pressure": pressure,
+    }
+    if spherical:
+        out["R"] = jnp.sqrt(G_cgs * solar_mass_cgs / (10 ** jnp.asarray(logg, dtype=jnp.float64)))
+    return out
+
+
+def interpolate_marcs(Teff: float,
                      logg: float,
                      m_H: float = 0.0,
-                     alpha_m: float = 0.0, 
+                     alpha_m: float = 0.0,
                      C_m: float = 0.0,
                      spherical: Optional[bool] = None,
-                     grid_data_dir: Optional[str] = None) -> ModelAtmosphere:
+                     grid_data_dir: Optional[str] = None,
+                     grid_mode: Optional[str] = None,
+                     return_dense: bool = False,
+                     interpolator_jit: bool = True) -> Union[ModelAtmosphere, Dict[str, jnp.ndarray]]:
     """
     Interpolate MARCS stellar atmosphere using JAX.
     
@@ -444,6 +520,9 @@ def interpolate_marcs(Teff: float,
         C_m: Carbon enhancement [C/M] (default: 0.0)
         spherical: Force spherical/planar (default: auto from logg < 3.5)
         grid_data_dir: Directory containing MARCS grid files (default: auto)
+        grid_mode: Force grid selection ("standard", "low_z", "cool_dwarf")
+        return_dense: Return a dense JAX dict instead of ModelAtmosphere.
+        interpolator_jit: If True, JIT-compile MARCS interpolator.
         
     Returns:
         ModelAtmosphere object with interpolated atmospheric structure
@@ -461,72 +540,101 @@ def interpolate_marcs(Teff: float,
         >>> # Alpha-enhanced star
         >>> atmosphere = interpolate_marcs(5000.0, 4.0, -0.5, alpha_m=0.4)
     """
-    # Set default spherical based on surface gravity
-    if spherical is None:
-        spherical = logg < 3.5
-    
-    # Validate parameters
-    if not (2000 <= Teff <= 8000):
-        warnings.warn(f"Teff {Teff}K outside typical range [2000, 8000]K")
-    if not (0.0 <= logg <= 5.5):
-        warnings.warn(f"logg {logg} outside typical range [0.0, 5.5]")
-    if not (-5.0 <= m_H <= 1.0):
-        warnings.warn(f"[M/H] {m_H} outside typical range [-5.0, 1.0]")
-    
-    # Prepare parameters for interpolation
-    params = jnp.array([Teff, logg, m_H, alpha_m, C_m])
-    
-    # Choose which grid to use based on stellar parameters
-    if m_H < -2.5:
-        # Low metallicity grid
-        if abs(alpha_m - 0.4) > 0.01 or abs(C_m) > 0.01:
-            raise AtmosphereInterpolationError(
-                "For low metallicities ([M/H] < -2.5), alpha_M must be 0.4 and C_M must be 0"
-            )
-        
-        grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "MARCS_metal_poor_atmospheres.h5")
-        grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
-        
-        # Use only Teff, logg, m_H for low-Z grid
-        params_low_z = params[:3]
-        interp = _get_multilinear_interpolator(grid_path, nodes, grid, n_params=3)
-        atm_quants = interp(params_low_z)
-        
-    elif (Teff <= 4000 and logg >= 3.5 and m_H >= -2.5):
-        # Cool dwarf grid (uses cubic spline interpolation in Korg, multilinear here)
-        try:
-            grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "resampled_cool_dwarf_atmospheres.h5")
-            grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
+    teff_scalar = _as_python_float_or_none(Teff)
+    logg_scalar = _as_python_float_or_none(logg)
+    mh_scalar = _as_python_float_or_none(m_H)
+    alpha_scalar = _as_python_float_or_none(alpha_m)
+    c_scalar = _as_python_float_or_none(C_m)
 
-            atm_quants = _cubic_interpolation_cool_dwarf(
-                np.array(params, dtype=float), nodes, grid, param_names, grid_path=grid_path
+    # Set default spherical based on surface gravity when concrete.
+    if spherical is None:
+        spherical = (logg_scalar < 3.5) if logg_scalar is not None else False
+
+    # Validate parameters only when concrete values are available.
+    if teff_scalar is not None and not (2000 <= teff_scalar <= 8000):
+        warnings.warn(f"Teff {teff_scalar}K outside typical range [2000, 8000]K")
+    if logg_scalar is not None and not (0.0 <= logg_scalar <= 5.5):
+        warnings.warn(f"logg {logg_scalar} outside typical range [0.0, 5.5]")
+    if mh_scalar is not None and not (-5.0 <= mh_scalar <= 1.0):
+        warnings.warn(f"[M/H] {mh_scalar} outside typical range [-5.0, 1.0]")
+
+    params = jnp.asarray([Teff, logg, m_H, alpha_m, C_m], dtype=jnp.float64)
+
+    mode = grid_mode
+    if mode is None:
+        if mh_scalar is None or teff_scalar is None or logg_scalar is None:
+            mode = "standard"
+        elif mh_scalar < -2.5:
+            mode = "low_z"
+        elif teff_scalar <= 4000 and logg_scalar >= 3.5 and mh_scalar >= -2.5:
+            mode = "cool_dwarf"
+        else:
+            mode = "standard"
+
+    mode_norm = str(mode).strip().lower()
+    if mode_norm not in {"standard", "low_z", "cool_dwarf"}:
+        raise ValueError(
+            f"grid_mode must be one of ('standard', 'low_z', 'cool_dwarf'), got {mode!r}"
+        )
+
+    if mode_norm == "low_z":
+        if alpha_scalar is not None and c_scalar is not None:
+            if abs(alpha_scalar - 0.4) > 0.01 or abs(c_scalar) > 0.01:
+                raise AtmosphereInterpolationError(
+                    "For low metallicities ([M/H] < -2.5), alpha_M must be 0.4 and C_M must be 0"
+                )
+        grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "MARCS_metal_poor_atmospheres.h5")
+        grid, nodes, _ = _load_marcs_grid_cached(grid_path)
+        interp = _get_multilinear_interpolator(
+            grid_path, nodes, grid, n_params=3, use_jit=interpolator_jit
+        )
+        atm_quants = interp(params[:3])
+    elif mode_norm == "cool_dwarf":
+        if return_dense:
+            raise AtmosphereInterpolationError(
+                "cool_dwarf interpolation is not tracer-safe for return_dense=True. "
+                "Use grid_mode='standard' for autodiff-safe dense atmospheres, "
+                "or call with return_dense=False."
             )
-            
-        except FileNotFoundError:
-            # Fallback to standard grid if cool dwarf grid not available
-            warnings.warn("Cool dwarf grid not found, using standard grid")
-            grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "SDSS_MARCS_atmospheres.h5")
-            grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
-            interp = _get_multilinear_interpolator(grid_path, nodes, grid, n_params=5)
-            atm_quants = interp(params)
-    
-    else:
-        # Standard SDSS grid
+        else:
+            try:
+                grid_path = _resolve_marcs_grid_path_cached(
+                    grid_data_dir,
+                    "resampled_cool_dwarf_atmospheres.h5",
+                )
+                grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
+                atm_quants = _cubic_interpolation_cool_dwarf(
+                    np.array(params, dtype=float), nodes, grid, param_names, grid_path=grid_path
+                )
+            except FileNotFoundError:
+                warnings.warn("Cool dwarf grid not found, using standard grid")
+                mode_norm = "standard"
+
+    if mode_norm == "standard":
         grid_path = _resolve_marcs_grid_path_cached(grid_data_dir, "SDSS_MARCS_atmospheres.h5")
-        grid, nodes, param_names = _load_marcs_grid_cached(grid_path)
-        interp = _get_multilinear_interpolator(grid_path, nodes, grid, n_params=5)
+        grid, nodes, _ = _load_marcs_grid_cached(grid_path)
+        interp = _get_multilinear_interpolator(
+            grid_path, nodes, grid, n_params=5, use_jit=interpolator_jit
+        )
         atm_quants = interp(params)
-    
-    # Create atmosphere from interpolated quantities
-    atmosphere = create_atmosphere_from_quantities(atm_quants, spherical, logg)
-    
-    # Validate optical depths are positive
+
+    if return_dense:
+        return create_dense_atmosphere_from_quantities(
+            jnp.asarray(atm_quants, dtype=jnp.float64),
+            spherical=bool(spherical),
+            logg=logg,
+        )
+
+    atmosphere = create_atmosphere_from_quantities(
+        jnp.asarray(atm_quants, dtype=jnp.float64),
+        bool(spherical),
+        float(logg_scalar if logg_scalar is not None else 4.44),
+    )
     tau_values = [layer.tau_5000 for layer in atmosphere.layers]
     if any(tau < 0 for tau in tau_values):
         raise AtmosphereInterpolationError(
             "Interpolated atmosphere has negative optical depths and is not reliable"
         )
-    
     return atmosphere
 
 

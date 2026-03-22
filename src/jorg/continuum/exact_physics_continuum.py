@@ -31,7 +31,7 @@ from .mclaughlin_hminus import mclaughlin_hminus_bf_absorption
 from .metals_bf import metal_bf_absorption, metal_bf_absorption_dense_batch
 from .h_i_bf_api import H_I_bf, H_I_bf_fast, H_I_bf_fast_batch
 from .hydrogen import h_minus_ff_absorption, h2_plus_bf_ff_absorption
-from .helium import he_minus_ff_absorption, _helium_free_free_john1994
+from .helium import he_minus_ff_absorption, _helium_free_free_john1994_jax
 from .positive_ion_ff import (
     positive_ion_ff_absorption,
     positive_ion_ff_absorption_dense_batch,
@@ -55,6 +55,7 @@ _H_II_SPECIES = Species.from_atomic_number(1, 1)
 _HE_I_SPECIES = Species.from_atomic_number(2, 0)
 _HE_II_SPECIES = Species.from_atomic_number(2, 1)
 _H2_SPECIES = Species.from_string("H2")
+_PARTITION_LOGU_H_HE_CACHE: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
 @dataclass(frozen=True)
@@ -460,18 +461,41 @@ def _build_dense_number_densities(
     return dense
 
 
-def _evaluate_partition_fn_over_temps(partition_fn: Any, log_temps: np.ndarray) -> np.ndarray:
-    """Evaluate partition function over a temperature vector with safe fallback."""
-    try:
-        values = np.asarray(partition_fn(log_temps), dtype=np.float64)
-        if values.shape == log_temps.shape:
-            return values
-    except Exception:
-        pass
-    return np.asarray(
-        [float(partition_fn(float(log_t))) for log_t in log_temps],
-        dtype=np.float64,
-    )
+def _interp_table_jax(x: jnp.ndarray, grid: jnp.ndarray, values: jnp.ndarray) -> jnp.ndarray:
+    x = jnp.clip(x, grid[0], grid[-1])
+    idx = jnp.searchsorted(grid, x, side="right") - 1
+    idx = jnp.clip(idx, 0, grid.shape[0] - 2)
+    x0 = grid[idx]
+    x1 = grid[idx + 1]
+    t = (x - x0) / (x1 - x0)
+    y0 = values[idx]
+    y1 = values[idx + 1]
+    return y0 + t * (y1 - y0)
+
+
+def _get_partition_logu_h_he_tables(partition_funcs: Dict[Any, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Resolve/caches logU tables (H I / He I) on a shared logT grid for JAX interpolation.
+    """
+    if hasattr(partition_funcs, "partition_funcs"):
+        partition_funcs = partition_funcs.partition_funcs
+
+    key = id(partition_funcs)
+    cached = _PARTITION_LOGU_H_HE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    from ..statmech.chem_eq_jax import prepare_partition_function_tables
+
+    pf_tables = prepare_partition_function_tables(partition_funcs, oversample=1)
+    logT_grid = np.asarray(pf_tables.logT_grid, dtype=np.float64)
+    # logU_I_table rows are indexed by atomic number - 1.
+    logU_h = np.asarray(pf_tables.logU_I_table[_H_I_SPECIES.get_atoms()[0] - 1], dtype=np.float64)
+    logU_he = np.asarray(pf_tables.logU_I_table[_HE_I_SPECIES.get_atoms()[0] - 1], dtype=np.float64)
+
+    out = (logT_grid, logU_h, logU_he)
+    _PARTITION_LOGU_H_HE_CACHE[key] = out
+    return out
 
 
 def _total_continuum_absorption_dense_batch_fast(
@@ -517,12 +541,15 @@ def _total_continuum_absorption_dense_batch_fast(
     n_he_i = _dense_col(_HE_I_SPECIES)
     n_h2 = _dense_col(_H2_SPECIES)
 
-    temps_np = np.asarray(temps_j, dtype=np.float64)
-    log_temps = np.log(np.maximum(temps_np, 1e-300))
-    u_h = _evaluate_partition_fn_over_temps(partition_funcs[_H_I_SPECIES], log_temps)
-    u_he = _evaluate_partition_fn_over_temps(partition_funcs[_HE_I_SPECIES], log_temps)
-    u_h_j = jnp.asarray(u_h, dtype=jnp.float64)
-    u_he_j = jnp.asarray(u_he, dtype=jnp.float64)
+    logT_grid_np, logU_h_np, logU_he_np = _get_partition_logu_h_he_tables(partition_funcs)
+    logT_grid_j = jnp.asarray(logT_grid_np, dtype=jnp.float64)
+    logU_h_j_table = jnp.asarray(logU_h_np, dtype=jnp.float64)
+    logU_he_j_table = jnp.asarray(logU_he_np, dtype=jnp.float64)
+    log_temps_j = jnp.log(jnp.clip(temps_j, 1e-300, None))
+    logU_h_j = jax.vmap(lambda log_t: _interp_table_jax(log_t, logT_grid_j, logU_h_j_table))(log_temps_j)
+    logU_he_j = jax.vmap(lambda log_t: _interp_table_jax(log_t, logT_grid_j, logU_he_j_table))(log_temps_j)
+    u_h_j = jnp.exp(logU_h_j)
+    u_he_j = jnp.exp(logU_he_j)
     inv_u_h = 1.0 / jnp.maximum(u_h_j, 1e-300)
     n_h_i_div_u = n_h_i / jnp.maximum(u_h_j, 1e-300)
     n_he_i_div_u = n_he_i / jnp.maximum(u_he_j, 1e-300)
@@ -557,14 +584,13 @@ def _total_continuum_absorption_dense_batch_fast(
         )
     )(temps_j, n_h_i, n_h_ii)
 
-    wavelengths_angstrom = c_cgs * 1e8 / np.asarray(freqs, dtype=np.float64)
-    theta = 5040.0 / np.maximum(temps_np, 1e-300)
-    he_ff_k = _helium_free_free_john1994(
-        wavelengths_angstrom[None, :],
-        theta[:, None],
+    wavelengths_angstrom_j = c_cgs * 1e8 / jnp.clip(freqs, 1e-300, None)
+    theta_j = 5040.0 / jnp.clip(temps_j, 1e-300, None)
+    he_ff_k_j = _helium_free_free_john1994_jax(
+        wavelengths_angstrom_j[None, :],
+        theta_j[:, None],
     )
-    he_ff_k_j = jnp.asarray(he_ff_k, dtype=jnp.float64)
-    p_e = ne_j * kboltz_cgs * jnp.asarray(temps_np, dtype=jnp.float64)
+    p_e = ne_j * kboltz_cgs * temps_j
     alpha_he_minus_ff = he_ff_k_j * p_e[:, None] * n_he_i_div_u[:, None]
     alpha_total = alpha_total + alpha_he_minus_ff
 

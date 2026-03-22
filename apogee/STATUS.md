@@ -18,7 +18,7 @@ Completed:
 
 - baseline APOGEE synthesis through local Julia/Korg bridge
 - APOGEE H2O cross-section generation from local POKAZATEL input
-- optional `exomol_aug` path using `CaH` and `FeH`
+- optional `exomol_aug` path using `CaH`, `FeH`, and `MgH`
 - automatic ExoMol asset download and decompression to Korg-readable `.states` / `.trans`
 - notebook demonstration for `Teff`, `logg`, and `[M/H]` sweeps
 - notebook comparison between `baseline` and `exomol_aug`
@@ -57,6 +57,7 @@ Downloaded ExoMol assets:
 
 - [CaH states/trans](/Users/jdli/Project/jorg/jorg/apogee/external/exomol/CaH)
 - [FeH states/trans](/Users/jdli/Project/jorg/jorg/apogee/external/exomol/FeH)
+- [MgH states/trans](/Users/jdli/Project/jorg/jorg/apogee/external/exomol/MgH)
 
 Main code paths:
 
@@ -71,12 +72,14 @@ Current default augmentation species:
 
 - `CaH`
 - `FeH`
+- `MgH`
 
 Current added-line report:
 
-- total added lines: `11441`
+- total added lines: `12023`
 - `CaH`: `2528`
 - `FeH`: `8913`
+- `MgH`: `582`
 
 The canonical machine-readable record of lines added by `exomol_aug` is:
 
@@ -94,6 +97,10 @@ Each row records:
 - line-strength temperature
 
 This CSV is refreshed automatically whenever `ensure_default_exomol_assets(...)` is called.
+
+Note:
+
+- the benchmark plots and comparison summary farther below were generated before `MgH` was added to the default augmentation set and should be rerun for a current default-vs-baseline comparison
 
 ## Notebook Result Snapshot
 
@@ -153,6 +160,55 @@ Result:
   - diagnostic wavelength windows
   - stellar-parameter sampling strategy for cool stars
 
+## Species Recommendation for Korg ExoMol Augmentation
+
+The current code path passes the ExoMol molecule label straight through to Julia/Korg, so the
+species string should be a plain neutral molecular formula such as:
+
+- `CaH`
+- `MgH`
+- `FeH`
+- `OH`
+- `CO`
+- `H2O`
+
+Important implementation note:
+
+- no special Korg-only species encoding is needed in the Python manifest
+- Korg may normalize formula ordering internally, so `OH` may display as `HO` and `MgH` as `HMg`
+- for now, prefer main-isotopologue ExoMol assets first
+
+Stock APOGEE DR17 coverage already includes molecular content beyond atoms:
+
+- `CN`
+- `CO` isotopologues
+- `OH`
+- `C2`
+- `FeH`
+- `H2O` via the separate APOGEE water cross-section path
+
+This means the best ExoMol augmentation targets are molecules that are missing from stock DR17, or
+clear upgrades to weak/incomplete cool-star molecular coverage, rather than molecules already
+represented in the baseline line list.
+
+Recommended priority order:
+
+1. Keep `CaH` in the default augmentation set.
+2. Add `MgH` next as the most natural follow-up hydride for cool-star H-band tests.
+3. Keep `FeH` as an augmentation/upgrade experiment, but note that DR17 already contains `FeH`.
+4. Treat `OH` as an optional replacement-benchmark experiment rather than a default additive molecule, because DR17 already includes `OH`.
+5. Defer `CrH` and `SiO` until testing moves to colder or more molecule-dominated regimes.
+
+Practical implication:
+
+- do not prioritize `CO`, `CN`, or `H2O` as additive ExoMol defaults for APOGEE H-band, because they overlap strongly with the current DR17 baseline
+- for the present v1 workflow, `CaH + MgH` is the cleanest next default pair to test against `CaH + FeH`
+
+Current synthetic evidence is broadly consistent with this prioritization:
+
+- the currently flagged `16245.7-16285.7 A` sensitivity window is populated mostly by added `FeH` lines, with a smaller but non-negligible `CaH` contribution
+- this suggests the present augmentation is probing hydride-sensitive structure rather than uncovering a missing `CO/OH/H2O` regime
+
 ## Recommended Next Step
 
 The next phase should be literature-guided rather than purely implementation-driven.
@@ -160,7 +216,7 @@ The next phase should be literature-guided rather than purely implementation-dri
 Recommended order:
 
 1. Review APOGEE cool-star and late-type literature to identify which molecular systems materially improve H-band fits for M dwarfs and M giants.
-2. Check whether the literature favors additional molecules, different ExoMol releases, or different filtering thresholds beyond the current `CaH/FeH` default.
+2. Check whether the literature favors additional molecules, different ExoMol releases, or different filtering thresholds beyond the current `CaH/FeH/MgH` default.
 3. Identify the specific APOGEE H-band windows most sensitive to cool-star molecules, especially around the currently flagged `16245.7-16285.7 A` region.
 4. Expand the synthetic comparison to colder, higher-metallicity, and higher-pressure points where molecular effects are more likely to matter.
 5. Only after that, run an observed-spectrum benchmark to decide whether `exomol_aug` should become the default training linelist.
